@@ -18,3 +18,5 @@ main{max-width:1630px;margin:0 auto;padding:27px 30px 36px}.page-title{display:f
 .auth-card .form{padding:20px 0 0;gap:15px}
 .auth-card .actions{margin-top:4px}
 .auth-card .actions .primary{min-width:112px}
+.bot-session-link:hover{background:#182332}.bot-name{color:var(--mint);text-decoration:underline;text-underline-offset:3px}.bot-filters+div tbody tr:has(.bot-name){cursor:pointer}.bot-filters+div tbody tr:has(.bot-name):hover{background:#182332}
+.watch-list{max-height:313px;overflow:auto}

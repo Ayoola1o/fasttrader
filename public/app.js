@@ -1,4 +1,4 @@
-const pages={dashboard:'Dashboard',trading:'Live Trading',screener:'Screener',strategies:'Strategy Editor',backtesting:'Backtesting',portfolio:'Portfolio',settings:'Settings',profile:'Profile'};
+const pages={dashboard:'Dashboard',trading:'Live Trading',session:'Bot Session',screener:'Screener',strategies:'Strategy Editor',backtesting:'Backtesting',portfolio:'Portfolio',settings:'Settings',profile:'Profile'};
 const paths={
 dashboard:'M3 3h7v7H3zm11 0h7v7h-7zM3 14h7v7H3zm11 0h7v7h-7z',screener:'M3 4h18v4l-7 6v5l-4 2v-7L3 8z',
 strategies:'M4 7h16M4 17h16M8 4v6m8 4v6',backtesting:'M3 12a9 9 0 1 0 3-6m-3-2v5h5m4-2v5l3 2',
@@ -11,6 +11,7 @@ const $=s=>document.querySelector(s);
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
 const usd=v=>Number.isFinite(v)?new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(v):'—';
 const num=v=>Number.isFinite(v)?v.toLocaleString('en-US',{maximumFractionDigits:2}):'—';
+const qtyText=v=>Number.isFinite(v)?v.toLocaleString('en-US',{maximumFractionDigits:9}):'—';
 const pct=v=>Number.isFinite(v)?(v>0?'+':'')+v.toFixed(2)+'%':'—';
 const stamp=(v,opts)=>v?new Date(v).toLocaleString(undefined,opts??{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
 const date=v=>new Date(v).toISOString().slice(0,10);
@@ -25,7 +26,7 @@ const panel=(title,desc,contents,action='',style='')=>`<section class="panel ${s
 const table=(cols,rows,err)=>rows.length?`<div class="table-wrap"><table><thead><tr>${cols.map(c=>'<th scope="col">'+c+'</th>').join('')}</tr></thead><tbody>${rows.map(row=>'<tr>'+row.map(c=>'<td>'+c+'</td>').join('')+'</tr>').join('')}</tbody></table></div>`:empty(err);
 const field=(label,k,v,attr='')=>`<label class="field">${label}<input name="${k}" value="${esc(v)}" ${attr}></label>`;
 const numeric=(label,k,v,min,max,step=.01)=>field(label,k,v,`type="number" required min="${min}" max="${max}" step="${step}"`);
-const select=(label,k,options,v)=>`<label class="field">${label}<select name="${k}">${options.map(([id,name])=>`<option value="${esc(id)}" ${String(v)===String(id)?'selected':''}>${esc(name)}</option>`).join('')}</select></label>`;
+const select=(label,k,options,v,required=false)=>`<label class="field">${label}<select name="${k}" ${required?'required':''}>${options.map(([id,name])=>`<option value="${esc(id)}" ${String(v)===String(id)?'selected':''}>${esc(name)}</option>`).join('')}</select></label>`;
 const check=(label,k,v)=>`<label class="check"><input type="checkbox" name="${k}" ${v?'checked':''}>${label}</label>`;
 const submit=(label,disabled=false)=>`<div><button class="button primary" ${disabled?'disabled':''}>${label}</button></div>`;
 const form=(id,fields,tail)=>`<form class="form" id="${id}"><div class="fields">${fields}</div>${tail}</form>`;
@@ -33,10 +34,11 @@ function read(k){try{return JSON.parse(localStorage.getItem(k))}catch{return nul
 function write(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch{}}
 const localWorkspace=['127.0.0.1','localhost'].includes(location.hostname);
 let authInfo=null,authMode='login',authRevision=0;
-let state=null,online=false,active='',selected='SPY',chartMode='Price',range='1H',assetClass='Stocks',editor=null,runA='',runB=null,pending=false,syncing=false,toastTimer;
+let state=null,online=false,active='',selected='',chartMode='Price',range='1H',assetClass='Stocks',editor=null,editorRoute='',runA='',runB=null,pending=false,syncing=false,toastTimer;
 const ranges={'15M':15,'1H':60,'4H':240,'1D':1440};
 const screen={search:'',volume:0,volatility:0};
-let botFilter='all', launchVersion='';
+const cryptoScreen={search:'',volume:0,volatility:0};
+let botFilter='all', launchVersion=null;
 const historyFilter={asset:'',strategy:'',start:'',end:''};
 const key=s=>s.id+'@'+s.version;
 const version=k=>state.strategies.find(s=>key(s)===k);
@@ -49,7 +51,7 @@ function chrome(){
  const groups=[['WORKSPACE',['dashboard','trading','screener','strategies','backtesting','portfolio']],['PREFERENCES',['settings','profile']]];
  const nav=$('#nav');
  if(nav.dataset.page!==active){
-   nav.innerHTML=groups.map(([label,items])=>`<span class="nav-label">${label}</span>`+items.map(k=>`<a href="#${k}" class="nav-link ${k===active?'active':''}" ${k===active?'aria-current="page"':''}>${icon(k)}${pages[k]}</a>`).join('')).join('');
+   nav.innerHTML=groups.map(([label,items])=>`<span class="nav-label">${label}</span>`+items.map(k=>`<a href="#${k}" class="nav-link ${k===active||k==='trading'&&active==='session'?'active':''}" ${k===active?'aria-current="page"':''}>${icon(k)}${pages[k]}</a>`).join('')).join('');
    nav.dataset.page=active;
  }
  $('#crumb').innerHTML='Workspace <span>/</span> <strong>'+pages[active]+'</strong>';
@@ -88,23 +90,25 @@ function inspect(node,i){
 }
 const metric=(label,v,note,k,mint=false)=>`<section class="panel metric"><div class="metric-head">${label}<span class="card-icon ${mint?'mint':''}">${icon(k)}</span></div><div class="metric-value">${v}</div><div class="metric-foot">${note}</div></section>`;
 const mark=(s,i=0)=>`<span class="ticker-mark" data-color="${i%5}">${esc(s.slice(0,2))}</span>`;
-const orders=(items,limit=100)=>table(['Asset','Side','Filled / quantity','Fill price','Status','Time'],items.slice(0,limit).map(o=>[esc(o.symbol),badge(o.side),num(o.filled)+' / '+num(o.qty),usd(o.price),badge(o.status),stamp(o.t)]),'Orders will appear after a bot submits a signal.');
-const botRows=()=>Object.values(state.bots).map(b=>`<div class="bot-row"><div><b>${esc(b.name)}</b><small>${b.symbol} · v${b.version}</small></div>${badge(botStatus(b))}</div>`).join('')||empty('No bots started. Start a saved strategy in the editor.');
+const orders=(items,limit=100)=>table(['Asset','Side','Filled / quantity','Fill price','Status','Time'],items.slice(0,limit).map(o=>[esc(o.symbol),badge(o.side),qtyText(o.filled)+' / '+qtyText(o.qty),usd(o.price),badge(o.status),stamp(o.t)]),'Orders will appear after a bot submits a signal.');
+const sessionRoute=b=>'session?id='+encodeURIComponent(b.id);
+const botRows=()=>Object.values(state.bots).map(b=>`<a class="bot-row bot-session-link" href="#${sessionRoute(b)}"><span><b>${esc(b.name)}</b><small>${b.symbol} · v${b.version}</small></span>${badge(botStatus(b))}</a>`).join('')||empty('No bots started. Launch a saved strategy in Live Trading.');
 function dashboard(){
- const a=state.account,m=state.market.find(i=>i.symbol===selected),enabled=Object.values(state.bots).filter(b=>b.desired==='running'),running=enabled.filter(b=>b.status==='Running');
+ const a=state.account,m=state.market.find(i=>i.symbol===selected)??state.market[0],enabled=Object.values(state.bots).filter(b=>b.desired==='running'),running=enabled.filter(b=>b.status==='Running');
+ const chartSymbol=m?.symbol??'';
  const change=a.dayStart?100*(a.equity/a.dayStart-1):null, hasAccount=state.mode==='demo'||state.equity.length>0;
- const all=chartMode==='Price'?(state.bars[selected]??[]).map(b=>({t:b.t,value:b.c})):state.equity;
+ const all=chartMode==='Price'?(state.bars[chartSymbol]??[]).map(b=>({t:b.t,value:b.c})):state.equity;
  if(chartMode==='Price'&&Number.isFinite(m?.price)&&m.t>all.at(-1)?.t)all.push({t:m.t,value:m.price});
  const since=Date.parse(all.at(-1)?.t)-ranges[range]*60000;
  const segmented=(values,action,current)=>`<div class="segmented">${values.map(v=>`<button type="button" class="${v===current?'selected':''}" data-action="${action}" data-value="${v}" aria-pressed="${v===current}">${v}</button>`).join('')}</div>`;
- const title=chartMode==='Price'?`<span class="trade-hero">${mark(selected)}<span>${selected} <span class="mono">${usd(m?.price)}</span></span></span>`:'Account equity';
- const desc=chartMode==='Price'?esc(state.feedName)+' · '+esc(online?m?.freshness:'cached')+' · '+stamp(m?.t):'Paper account · '+esc(online?state.broker:'cached')+' · '+stamp(all.at(-1)?.t);
+ const title=chartMode==='Equity'?'Account equity':m?`<span class="trade-hero">${mark(chartSymbol)}<span>${esc(chartSymbol)} <span class="mono">${usd(m.price)}</span></span></span>`:'Market price';
+ const desc=chartMode==='Price'?esc(m?.source??state.feedName)+' · '+esc(online?m?.freshness:'cached')+' · '+stamp(m?.t):'Paper account · '+esc(online?state.broker:'cached')+' · '+stamp(all.at(-1)?.t);
  const price=panel(title,desc,plot(all.filter(p=>Date.parse(p.t)>=since)),`<div class="actions">${segmented(['Price','Equity'],'chart',chartMode)}${segmented(Object.keys(ranges),'range',range)}</div>`,'chart-panel');
- const watch=panel('Watchlist','Recent movement · '+esc(state.feedName),`<div class="watch-list">${state.market.map((m,i)=>`<button class="watch-row" data-action="watch" data-value="${m.symbol}">${mark(m.symbol,i)}<span><b>${m.symbol}</b><small>${esc(m.name)}</small></span><span class="watch-right"><b>${usd(m.price)}</b><small class="${color(m.change)}">${pct(m.change)}</small></span></button>`).join('')}</div><a class="watch-footer" href="#screener">Open screener →</a>`);
+ const watch=panel('Watchlist','Recent stock and crypto movement',`<div class="watch-list">${state.market.map((m,i)=>`<button class="watch-row" data-action="watch" data-value="${m.symbol}">${mark(m.symbol,i)}<span><b>${m.symbol}</b><small>${esc(m.name)}</small></span><span class="watch-right"><b>${usd(m.price)}</b><small class="${color(m.change)}">${pct(m.change)}</small></span></button>`).join('')}</div><a class="watch-footer" href="#screener">Open screener →</a>`);
  const signals=state.signals.length?`<div class="activity">${state.signals.slice(0,4).map(s=>`<div class="activity-item"><div class="inline"><b>${esc(s.symbol)}</b>${badge(s.direction)}</div><p>${esc(s.rationale)}</p><small>${esc(s.strategy)} v${s.version} · ${esc(s.source)} · ${stamp(s.t)}</small></div>`).join('')}</div>`:empty('Signals will appear when a running strategy finds a setup.');
- const holdings=table(['Asset','Shares','Mark','Unrealized P&L'],state.positions.map(p=>{
+ const holdings=table(['Asset','Units','Mark','Unrealized P&L'],state.positions.map(p=>{
    const pnl=p.qty*(p.price-p.entry);
-   return [esc(p.symbol),num(p.qty),usd(p.price),`<span class="${color(pnl)}">${usd(pnl)}</span>`];
+   return [esc(p.symbol),qtyText(p.qty),usd(p.price),`<span class="${color(pnl)}">${usd(pnl)}</span>`];
  }),'Filled entry orders will appear here.');
  return page('Trading overview','Dashboard','Monitor your paper account, market data, and automated strategies.',link(icon('plus')+' New strategy','strategies?new',true))+
  (!online?`<div class="notice">Showing cached workspace data · ${syncLabel()}</div>`:'')+
@@ -119,16 +123,19 @@ function trading(){
  const filters=`<div class="tabs" role="group" aria-label="Filter bots">${groups.map(([k,label])=>btn(label+' '+counts[k],'bot-filter',k,false,`aria-pressed="${botFilter===k}"`)).join('')}</div>`;
  const options=state.strategies.slice().reverse().filter(s=>!state.bots[s.id]&&state.market.some(m=>m.symbol===s.symbol&&m.eligible)&&(!s.ai||state.aiConfigured))
    .map(s=>[key(s),s.name+' · '+s.symbol+' · v'+s.version]);
+ const requested=launchVersion??params().get('version');
+ const chosen=options.some(([id])=>id===requested)?requested:'';
+ const unavailable=requested&&!chosen?'<small>The requested strategy is unavailable for launch. Select another version or open its existing bot session.</small>':'';
  const disabled=!online?'disabled':'';
  const rows=bots.filter(b=>botFilter==='all'||b.desired===botFilter).map(b=>{
    const command=(label,action,primary=false)=>btn(label,'bot-command',action,primary,`data-bot="${esc(b.id)}" data-version="${b.version}" ${disabled}`);
-   const controls=b.desired==='running'?command('Pause','paused'):command(b.desired==='paused'?'Resume':'Restart','running',true);
+   const controls=b.desired==='running'?command('Pause','paused'):b.budget?command(b.desired==='paused'?'Resume':'Restart','running',true):link('Set budget',sessionRoute(b));
    const latestOrder=state.orders.find(o=>o.strategyId===b.id);
    const detail=b.desired==='running'&&b.status.toLowerCase()!=='running'?'<small>'+esc(b.status)+'</small>':'';
    return [
-     '<b>'+esc(b.name)+'</b>',esc(b.symbol)+' · v'+b.version,
+     `<a class="bot-name" href="#${sessionRoute(b)}"><b>${esc(b.name)}</b></a>`,esc(b.symbol)+' · v'+b.version,
      badge({running:'Active',paused:'Paused',stopped:'Stopped'}[b.desired],b.desired==='running'&&b.status.toLowerCase()==='running'?'good':'')+detail,
-     stamp(b.lastBar),latestOrder?badge(latestOrder.status)+' <small>'+stamp(latestOrder.t)+'</small>':'—',
+     b.budget?usd(b.budget):badge('Budget required'),stamp(b.lastBar),latestOrder?badge(latestOrder.status)+' <small>'+stamp(latestOrder.t)+'</small>':'—',
      '<div class="actions">'+controls+(b.desired!=='stopped'?command('Stop','stopped'):'')+'</div>'
    ];
  });
@@ -138,31 +145,83 @@ function trading(){
    '<div class="metrics">'+metric('Active bots',counts.running,counts.running?bots.filter(b=>b.status==='Running'&&b.desired==='running').length+' processing signals':'No active bots','bot',true)+
    metric('Paused bots',counts.paused,'Available to resume','strategies')+metric('Stopped bots',counts.stopped,'Available to restart','portfolio')+
    metric('Paper broker',esc(online?state.broker:'cached'),esc(state.feedName)+' · '+esc(online?state.feed:'cached'),'equity')+'</div>'+
-   '<div class="stack">'+panel('Launch a bot','Each bot uses the selected saved version.',
-     options.length?form('launch-bot',select('Strategy version','version',options,launchVersion),submit('Launch bot',!online)):
+   '<div class="stack">'+panel('Launch a bot','Set the maximum USD budget for this bot. Buy orders still follow your strategy and account risk limits.',
+     options.length?form('launch-bot',select('Strategy version','version',[['','Choose a strategy version'],...options],chosen,true)+numeric('Bot budget (USD)','budget','',1,1e9),unavailable+submit('Launch bot',!online)):
      empty('Save a strategy for an eligible instrument to launch another bot.'),link('Strategy Editor','strategies'))+
    panel('Bots','Pause or stop to prevent new submissions. Existing orders stay at the broker.',
-     '<div class="bot-filters">'+filters+'</div>'+table(['Bot','Instrument / version','Status','Last evaluated bar','Latest order','Controls'],rows,'No bots in this view.'))+'</div>';
+     '<div class="bot-filters">'+filters+'</div>'+table(['Bot','Instrument / version','Status','Budget','Last evaluated bar','Latest order','Controls'],rows,'No bots in this view.'))+'</div>';
+}
+function session(){
+ const bot=state.bots[params().get('id')];
+ const back=link('Back to Live Trading','trading');
+ if(!bot)return page('Automated execution','Bot Session','This bot could not be found.',back);
+ const book=state.botSessions?.[bot.id]??{};
+ const botOrders=state.orders.filter(order=>order.owned&&order.strategyId===bot.id);
+ const signals=state.signals.filter(signal=>signal.strategyId===bot.id);
+ const open=botOrders.filter(order=>!['filled','canceled','expired','rejected','replaced'].includes(order.status));
+ const holding=book.qty>0;
+ const positionStatus=open.some(order=>order.side==='sell')?'Sell pending':holding?'Holding':open.some(order=>order.side==='buy')?'Buy pending':book.sellFills?'Sold':'Flat';
+ const realized=book.complete?book.realized:null;
+ const versions=state.strategies.filter(s=>s.id===bot.id).toReversed().map(s=>[s.version,s.symbol+' · v'+s.version]);
+ const requestedVersion=params().get('version')??bot.version;
+ const selectedVersion=versions.some(([v])=>String(v)===String(requestedVersion))?requestedVersion:'';
+ const moneyChange=value=>`<span class="${color(value)}">${usd(value)}</span>`;
+ const command=(label,action)=>btn(label,'bot-command',action,false,`data-bot="${esc(bot.id)}" data-version="${bot.version}" ${!online?'disabled':''}`);
+ const controls=bot.desired==='running'?'<div class="form"><div class="actions">'+command('Pause','paused')+command('Stop','stopped')+'</div></div>':
+   bot.desired==='paused'?'<div class="form">'+command('Stop','stopped')+'</div>':'';
+ const risk=bot.desired==='running'&&bot.budget?'':form('fund-bot',select('Strategy version','version',[['','Choose a strategy version'],...versions],selectedVersion,true)+numeric('Bot budget (USD)','budget',bot.budget??'',1,1e9),
+       submit(bot.desired==='running'?'Set budget':bot.desired==='paused'?'Resume bot':'Restart bot',!online));
+ const positionRows=holding?[[esc(bot.symbol),qtyText(book.qty),book.complete?usd(book.cost/book.qty):'—',usd(book.mark),
+   Number.isFinite(book.mark)?usd(book.qty*book.mark):'—',moneyChange(book.unrealized)]]:[];
+ const filled=botOrders.filter(order=>order.filled>0);
+ return page('Paper bot session',esc(bot.name),esc(bot.symbol)+' · Strategy v'+bot.version+' · '+esc(state.mode==='demo'?'Demo paper trading':'Alpaca Paper'),back)+
+   (!online?'<div class="notice">Showing cached bot activity · '+syncLabel()+'</div>':'')+
+   '<div class="metrics">'+metric('Allocated budget',usd(bot.budget),usd(book.available)+' available for new buys','wallet')+
+   metric('Amount invested',book.complete?usd(book.invested):'—','Cost basis of the open position','portfolio')+
+   metric('Realized P&L',moneyChange(realized),num(book.sellFills)+' sell fills · before fees','equity',true)+
+   metric('Unrealized P&L',moneyChange(book.unrealized),positionStatus,'equity',true)+'</div>'+
+   '<div class="grid equal">'+panel('Position',positionStatus,table(['Asset','Units held','Average cost','Mark','Market value','Open P&L'],positionRows,'No open position held by this bot.'))+
+   panel('Bot controls','Last evaluated '+stamp(bot.lastBar)+' · '+open.length+' open orders',
+     '<div class="form"><div class="actions">'+badge(botStatus(bot))+'<small>Started '+stamp(bot.started)+'</small></div>'+
+     '<small>'+usd(book.reserved)+' reserved for pending buys</small></div>'+controls+risk)+'</div>'+
+   '<div class="stack">'+panel('Latest evaluation',bot.lastEvaluation?stamp(bot.lastEvaluation.t)+' · '+usd(bot.lastEvaluation.price):'Waiting for an evaluated bar',
+     bot.lastEvaluation?'<div class="bot-row"><span>'+esc(bot.lastEvaluation.rationale)+'</span>'+badge(bot.lastEvaluation.direction)+'</div>':empty(botStatus(bot)))+
+   panel('Orders and executions',`${filled.length} filled or partially filled orders · ${usd(book.bought)} bought · ${usd(book.sold)} sold`,
+     table(['Submitted','Asset','Side','Filled / requested','Average fill','Filled value','Status'],botOrders.map(o=>[
+       stamp(o.t),esc(o.symbol),badge(o.side),qtyText(o.filled)+' / '+qtyText(o.qty),usd(o.price),o.filled>0&&Number.isFinite(o.price)?usd(o.filled*o.price):'—',badge(o.status)
+     ]),'No orders yet.'))+
+   panel('Signal history','Trade decisions and AI holds for this bot.',
+     table(['Time','Direction','Rationale','Source'],signals.map(signal=>[
+       stamp(signal.t),badge(signal.direction),esc(signal.rationale),esc(signal.source)
+     ]),'No signals recorded for this bot yet.'))+'</div>';
 }
 function screener(){
  const tabs=`<div class="tabs" role="tablist" aria-label="Asset class">${['Stocks','Crypto','Forex'].map(v=>btn(v,'asset',v,false,`role="tab" aria-selected="${v===assetClass}"`)).join('')}</div>`;
  const heading=page('Market research','Screener','Find instruments by liquidity, volatility, and price movement.')+tabs;
- if(assetClass!=='Stocks')return heading+panel(assetClass+' universe',assetClass==='Crypto'?'Market cap, exchange volume, and price trend':'Spread, available leverage, and momentum',empty('This asset class requires a provider integration.'),link('View integrations','settings'));
- const matching=state.market.filter(m=>(m.symbol+' '+m.name).toLowerCase().includes(screen.search.toLowerCase())&&(!screen.volume||m.volume>=screen.volume)&&(!screen.volatility||m.volatility>=screen.volatility));
- const rows=matching.map((m,i)=>[`<div class="inline">${mark(m.symbol,i)}<span><b>${m.symbol}</b><br><small>${esc(m.name)}</small></span></div>`,usd(m.price),`<span class="${color(m.change)}">${pct(m.change)}</span>`,pct(m.volatility),num(m.volume),esc(state.feedName)+' · '+badge(online?m.freshness:'cached')+' <small>Price '+stamp(m.t)+'<br>Bars '+stamp(m.metricsAt)+'</small>',m.eligible?link('Build strategy','strategies?symbol='+m.symbol):badge('Screen only')]);
- return heading+panel('Stock universe','Price, range volatility, and share volume over the latest 60 bars.',
- form('screen',field('Search','search',screen.search,'type="search" placeholder="Symbol or company"')+numeric('Minimum volume','volume',screen.volume,0,1e12,1)+numeric('Minimum volatility (%)','volatility',screen.volatility,0,100),submit('Apply filters'))+
- table(['Asset','Price','Change','Volatility','Volume','Source / freshness',''],rows,'No stock matches these filters.'));
+ if(assetClass==='Forex')return heading+panel('Forex universe','Spread, available leverage, and momentum',empty('This asset class requires a provider integration.'),link('View integrations','settings'));
+ const crypto=assetClass==='Crypto', filter=crypto?cryptoScreen:screen, kind=crypto?'crypto':'stock';
+ const matching=state.market.filter(m=>(m.assetClass??'stock')===kind&&(m.symbol+' '+m.name).toLowerCase().includes(filter.search.toLowerCase())&&(!filter.volume||m.volume>=filter.volume)&&(!filter.volatility||m.volatility>=filter.volatility));
+ const rows=matching.map((m,i)=>[`<div class="inline">${mark(m.symbol,i)}<span><b>${esc(m.symbol)}</b><br><small>${esc(m.name)}</small></span></div>`,usd(m.price),`<span class="${color(m.change)}">${pct(m.change)}</span>`,pct(m.volatility),crypto?usd(m.volume):num(m.volume),esc(m.source??state.feedName)+' · '+badge(online?m.freshness:'cached')+' <small>Price '+stamp(m.t)+'<br>Bars '+stamp(m.metricsAt)+'</small>',m.eligible?link('Build strategy','strategies?symbol='+encodeURIComponent(m.symbol)):badge('Screen only')]);
+ return heading+panel(crypto?'USD crypto pairs':'Stock universe',crypto?'Price, range volatility, and estimated USD turnover over the latest 60 bars.':'Price, range volatility, and share volume over the latest 60 bars.',
+ form('screen',field('Search','search',filter.search,'type="search" placeholder="Search symbols or names"')+numeric(crypto?'Minimum turnover (USD)':'Minimum volume','volume',filter.volume,0,1e12,1)+numeric('Minimum volatility (%)','volatility',filter.volatility,0,100),submit('Apply filters'))+
+ table(['Asset','Price','Change','Volatility',crypto?'USD turnover':'Volume','Source / freshness',''],rows,'No instruments match these filters.'));
 }
 const fields=[['Lookback (1-minute bars)','period',2,60,1],['Entry above average (%)','entry',0,25],['Exit below average (%)','exit',-25,0],['Position size (% equity)','size',.1,100],['Maximum exposure (% equity)','exposure',.1,100],['Maximum daily loss (%)','dailyLoss',.1,50],['Stop-loss (%)','stop',.1,50],['Take-profit (%)','take',.1,100]];
-const fresh=(symbol=selected)=>({...latest()[0],id:'',version:0,name:'',symbol});
+const fresh=(symbol='')=>({...latest()[0],id:'',version:0,name:'',symbol});
 function strategies(){
- editor??=params().has('new')||params().has('symbol')?fresh(params().get('symbol')??selected):{...latest()[0]};
+ const route=location.hash, requested=params().get('symbol');
+ if(editorRoute!==route){
+   if(requested!==null&&(editor?.id||editor?.symbol!==requested))editor=fresh(requested);
+   if(params().has('new')&&requested===null&&editor?.id)editor=fresh();
+   editorRoute=route;
+ }
+ editor??=fresh(requested??'');
  const saved=editor.id&&version(key(editor)),bot=saved&&state.bots[editor.id];
- const options=state.strategies.slice().reverse().map(s=>[key(s),s.name+' · v'+s.version]);
- const inputs=field('Strategy name','name',editor.name,'required maxlength="60"')+select('Universe','symbol',state.market.map(m=>[m.symbol,m.symbol+' · '+m.name]),editor.symbol)+
+ const options=state.strategies.slice().reverse().map(s=>[key(s),s.name+' · '+s.symbol+' · v'+s.version]);
+ const asset=state.market.find(m=>m.symbol===editor.symbol);
+ const inputs=field('Strategy name','name',editor.name,'required maxlength="60"')+select('Instrument or pair','symbol',[['','Choose an instrument'],...state.market.map(m=>[m.symbol,m.symbol+' · '+m.name])],asset?.symbol??'',true)+
  select('Saved version','version',[['','New draft'],...options],saved?key(saved):'')+fields.map(([label,k,min,max,step])=>numeric(label,k,editor[k],min,max,step)).join('');
- const botActions=saved?`<div class="actions">${link('Backtest v'+saved.version,'backtesting?version='+key(saved))}${btn('Start bot','bot','running',true,!online||!state.market.some(m=>m.symbol===saved.symbol&&m.eligible)||bot?.desired==='running'&&bot.version===saved.version?'disabled':'')}${bot?link('Manage bot','trading'):''}</div>`:'';
+ const botActions=saved?`<div class="actions">${link('Backtest v'+saved.version,'backtesting?version='+key(saved))}${bot?link('Open bot session',sessionRoute(bot)+'&version='+saved.version,true):link('Set budget and launch','trading?version='+encodeURIComponent(key(saved)),true)}</div>`:'';
  return page('Automated trading','Strategy Editor','Configure a minute-bar strategy and control its paper bot.',btn(icon('plus')+' New strategy','new','',true))+
  `<div class="grid">${panel('Strategy configuration','Long-only moving-average momentum · 1-minute bars',form('strategy',inputs,check('Require AI confirmation for non-protective signals','ai',editor.ai)+
  '<small>'+(state.aiConfigured?esc(state.aiProvider ?? 'AI provider')+' configured. Historical replay uses deterministic strategy versions.':'Configure a Gemini or OpenAI key in the server environment to enable AI confirmation.')+'</small>'+
@@ -172,12 +231,13 @@ function strategies(){
  ${panel('Saved strategies','Latest versions',latest().map(s=>`<div class="bot-row"><div><b>${esc(s.name)}</b><small>${s.symbol} · v${s.version}</small></div>${btn('Edit','edit',key(s))}</div>`).join(''))}</div></div>`;
 }
 function backtesting(){
- const runs=state.runs,eligible=state.strategies.filter(s=>!s.ai).reverse(),chosen=params().get('version')??key(latest()[0]);
+ const runs=state.runs,eligible=state.strategies.filter(s=>!s.ai).reverse(),requested=params().get('version');
+ const chosen=eligible.some(s=>key(s)===requested)?requested:'';
  const option=run=>[run.id,run.name+' v'+run.version+' · '+run.symbol+' · '+stamp(run.t)];
  if(!runs.some(r=>r.id===runA))runA=runs[0]?.id??'';
  if(runB===null&&runs.length>1)runB=runs[1].id;
  const a=runs.find(r=>r.id===runA),b=runs.find(r=>r.id===runB);
- const inputs=select('Saved strategy','version',eligible.map(s=>[key(s),s.name+' v'+s.version+' · '+s.symbol]),chosen)+
+ const inputs=select('Saved strategy','version',[['','Choose a saved strategy'],...eligible.map(s=>[key(s),s.name+' v'+s.version+' · '+s.symbol])],chosen,true)+
  field('Start date','start',date(Date.now()-86400000*2),'type="date" required')+field('End date','end',date(Date.now()),'type="date" required')+
  numeric('Starting capital ($)','capital',100000,100,1e9,1)+numeric('Fees (bps)','fees',1,0,500)+numeric('Slippage (bps)','slippage',2,0,500);
  const summary=r=>r?panel(esc(r.name)+' v'+r.version,esc(r.source)+' · '+esc(r.start)+' to '+esc(r.end),
@@ -186,7 +246,7 @@ function backtesting(){
  `<div class="stack">${panel('Run configuration','Signals use completed minute bars. The next available open determines simulated execution.',form('backtest',inputs,submit('Run backtest',!online||!eligible.length)))}
  ${a?panel('Run comparison','Compare equity and execution results.',`<div id="run-select" class="form"><div class="fields">${select('First run','runA',runs.map(option),runA)}${select('Second run','runB',[['','Select run'],...runs.map(option)],runB)}</div></div><div class="form comparison">${summary(a)}${summary(b)}</div>`):''}
  ${a?panel('Drawdown','First run · decline from the equity high-water mark',plot(a.curve.map(p=>({t:p.t,value:p.drawdown})),'percent')):''}
- ${a?panel('Trade log','First run · latest 250 modeled fills and fees',table(['Time','Side','Quantity','Fill price','Fees','Realized P&L'],a.trades.slice(-250).reverse().map(t=>[stamp(t.t),badge(t.side),num(t.qty),usd(t.price),usd(t.fee),usd(t.pnl)]),'No executions in this run.')):''}</div>`;
+ ${a?panel('Trade log','First run · latest 250 modeled fills and fees',table(['Time','Side','Quantity','Fill price','Fees','Realized P&L'],a.trades.slice(-250).reverse().map(t=>[stamp(t.t),badge(t.side),qtyText(t.qty),usd(t.price),usd(t.fee),usd(t.pnl)]),'No executions in this run.')):''}</div>`;
 }
 function portfolio(){
  const {positions,equity,account}=state;
@@ -196,18 +256,18 @@ function portfolio(){
  const o=state.orders.filter(item=>(!historyFilter.asset||item.symbol===historyFilter.asset)&&(!historyFilter.strategy||item.strategy===historyFilter.strategy)&&(!historyFilter.start||item.t?.slice(0,10)>=historyFilter.start)&&(!historyFilter.end||item.t?.slice(0,10)<=historyFilter.end));
  const options=(k,label)=>[['',label],...Array.from(new Set(state.orders.map(o=>o[k]).filter(Boolean))).map(v=>[v,v])];
  const filter=select('Asset','asset',options('symbol','All assets'),historyFilter.asset)+select('Strategy','strategy',options('strategy','All strategies'),historyFilter.strategy)+field('From','start',historyFilter.start,'type="date"')+field('To','end',historyFilter.end,'type="date"');
- const holding=positions.map(p=>[esc(p.symbol),num(p.qty),usd(p.entry),usd(p.price),usd(p.qty*p.price),pct(account.equity?100*p.qty*p.price/account.equity:null),`<span class="${color(p.qty*(p.price-p.entry))}">${usd(p.qty*(p.price-p.entry))}</span>`]);
+ const holding=positions.map(p=>[esc(p.symbol),qtyText(p.qty),usd(p.entry),usd(p.price),usd(p.qty*p.price),pct(account.equity?100*p.qty*p.price/account.equity:null),`<span class="${color(p.qty*(p.price-p.entry))}">${usd(p.qty*(p.price-p.entry))}</span>`]);
  return page('Account analytics','Portfolio','Review holdings, exposure, historical orders, and paper account performance.')+
  `<div class="metrics">${metric('Unrealized P&L',usd(unrealized),'Open positions','equity',true)}${metric('Realized P&L',state.mode==='demo'?usd(o.reduce((sum,item)=>sum+(item.pnl??0),0)):'—',state.mode==='demo'?'Filtered demo executions':'Alpaca realized P&L pending','wallet')}
  ${metric('Tracked return',pct(start?100*(account.equity/start-1):null),'Since first account snapshot','equity')}${metric('Max drawdown',pct(start?drawdown:null),'From tracked equity peak','portfolio')}</div><div class="stack">
- ${panel('Holdings','Allocation uses current account equity.',table(['Asset','Shares','Average entry','Mark','Market value','Allocation','Unrealized P&L'],holding,'No open positions.'))}
+ ${panel('Holdings','Allocation uses current account equity.',table(['Asset','Units','Average entry','Mark','Market value','Allocation','Unrealized P&L'],holding,'No open positions.'))}
  ${panel('Order history','Filter executions by asset, strategy, and date.',form('history',filter,submit('Apply filters'))+orders(o))}</div>`;
 }
 function settings(){
  const row=(label,desc,status)=>`<div class="bot-row"><div><b>${label}</b><small>${desc}</small></div>${badge(status)}</div>`;
  const events=state.events.map(e=>`<div class="activity-item">${esc(e.message)}<small>${stamp(e.t)}</small></div>`).join('');
  return page('Workspace preferences','Settings','Review data providers, paper connectivity, and in-app notifications.')+
- `<div class="grid equal"><div class="stack">${panel('Integrations','Credentials are configured in the server environment.',row('Market data',esc(state.feedName),state.feed)+row('Paper broker',state.mode==='demo'?'Local simulated fills':'Alpaca Paper API',state.broker)+row('AI signal confirmation',esc(state.aiProvider ?? 'Gemini or OpenAI'),state.aiConfigured?'configured':'unconfigured')+row('Crypto provider','Provider pending','unconfigured')+row('Forex provider','Provider pending','unconfigured'))}
+ `<div class="grid equal"><div class="stack">${panel('Integrations','Credentials are configured in the server environment.',row('Stock data',esc(state.feedName),state.feed)+row('Paper broker',state.mode==='demo'?'Local simulated fills':'Alpaca Paper API',state.broker)+row('AI signal confirmation',esc(state.aiProvider ?? 'Gemini or OpenAI'),state.aiConfigured?'configured':'unconfigured')+row('Crypto data',state.mode==='demo'?'Synthetic market':'Alpaca Crypto US',state.cryptoFeed??'connecting')+row('Forex provider','Provider pending','unconfigured'))}
  ${state.mode==='demo'?panel('Connection simulator','Exercise bot behavior during feed or broker outages.',`<div class="form"><div class="actions">${btn('Disconnect feed','outage','feed')}${btn('Disconnect broker','outage','broker')}${btn('Reconnect both','outage','clear',true)}</div></div>`):''}</div>
  <div class="stack">${panel('Notifications','Choose which events appear in the workspace.',`<form id="settings" class="form">${Object.entries({signals:'Trade signals',fills:'Order fills',risk:'Risk limits',connections:'Connection failures'}).map(([k,v])=>check(v,k,state.alerts[k])).join('')}${submit('Save preferences',!online)}</form>`)}
  ${panel('Recent notifications',syncLabel(),events?'<div class="activity">'+events+'</div>':empty('No notifications yet.'))}</div></div>`;
@@ -218,7 +278,7 @@ function profile(){
  field('Email','email',state.profile.email,'type="email"'),(authInfo?.required?'<small>Signed-in workspace data and drafts are kept in this tab during a disconnect.</small>':check('Cache workspace data in this browser','offlineSync',state.profile.offlineSync))+submit('Save profile',!online)))}
  ${panel('Subscription','Current workspace tier','<div class="bot-row"><b>Paper trading</b>'+badge('Local workspace','good')+'</div>'+empty(syncLabel()))}</div>`;
 }
-const renderers={dashboard,trading,screener,strategies,backtesting,portfolio,settings,profile};
+const renderers={dashboard,trading,session,screener,strategies,backtesting,portfolio,settings,profile};
 function clearWorkspace(){
  state=null;editor=null;runA='';runB=null;online=false;
  write('ft-cache',null);write('ft-draft',null);
@@ -338,7 +398,12 @@ async function refresh(force=false){
 }
 document.addEventListener('click',async event=>{
  const el=event.target.closest('[data-action]');
- if(!el)return;
+ if(!el){
+   const row=event.target.closest('tr');
+   const botLink=row?.querySelector('.bot-name');
+   if(botLink&&!event.target.closest('a,button,input,select'))location.hash=botLink.hash;
+   return;
+ }
  const {action,value}=el.dataset;
  if(action==='auth-mode'&&!pending){authMode=value;render(true);return}
  if(action==='sign-out'&&!pending){
@@ -357,11 +422,10 @@ document.addEventListener('click',async event=>{
  if(action==='bot-filter')botFilter=value;
  if(action==='edit')editor={...version(value)};
  if(action==='new')editor=fresh();
- if(action==='bot'||action==='bot-command'||action==='outage'){
+ if(action==='bot-command'||action==='outage'){
    if(!online||pending){toast('The workspace is reconnecting.');return}
    pending=true;el.disabled=true;
    try{
-     if(action==='bot')await api('bot',{id:editor.id,version:editor.version,action:value});
      if(action==='bot-command')await api('bot',{id:el.dataset.bot,version:+el.dataset.version,action:value});
      if(action==='outage')await api('demo',{feed:value==='feed',broker:value==='broker'});
      toast(action==='outage'?'Connectivity updated.':'Bot command saved.');
@@ -394,7 +458,7 @@ document.addEventListener('submit',async event=>{
  if(pending||syncing)return;
  const data=values(form),control=event.submitter;
  if(form.id==='screen'){
-   Object.assign(screen,data,{volume:+data.volume,volatility:+data.volatility});
+   Object.assign(assetClass==='Crypto'?cryptoScreen:screen,data,{volume:+data.volume,volatility:+data.volatility});
    render(true);return;
  }
  if(form.id==='history'){Object.assign(historyFilter,data);render(true);return}
@@ -409,9 +473,18 @@ document.addEventListener('submit',async event=>{
    }
    if(form.id==='launch-bot'){
      const selected=version(data.version);
-     await api('bot',{id:selected.id,version:selected.version,action:'running',create:true});
-     launchVersion='';botFilter='all';
+     if(!selected)throw Error('Choose a saved strategy version.');
+     const launched=await api('bot',{id:selected.id,version:selected.version,symbol:selected.symbol,action:'running',budget:+data.budget,create:true});
+     launchVersion=null;botFilter='all';
      toast(selected.name+' launched.');
+     location.hash=sessionRoute(launched);
+   }
+   if(form.id==='fund-bot'){
+     const bot=state.bots[params().get('id')];
+     const selected=bot&&version(bot.id+'@'+data.version);
+     if(!selected)throw Error('Choose a saved strategy version.');
+     await api('bot',{id:selected.id,version:selected.version,symbol:selected.symbol,action:'running',budget:+data.budget});
+     toast('Bot budget saved.');
    }
    if(form.id==='strategy'){
      capture(form);
@@ -449,7 +522,9 @@ document.addEventListener('keydown',event=>{
  event.preventDefault();inspect(node,(node.index??0)+(event.key==='ArrowRight'?1:-1));
 });
 window.addEventListener('hashchange',()=>{
- if(state&&location.hash.startsWith('#strategies')&&(params().has('new')||params().has('symbol')))editor=fresh(params().get('symbol')??selected);
+ const route=location.hash.split('?')[0];
+ if(route==='#trading')launchVersion=null;
+ if(state&&route==='#strategies'&&params().has('new')&&!params().has('symbol'))editor=fresh();
  render(true);
 });
 window.addEventListener('online',()=>refresh(true));

@@ -9,7 +9,7 @@ import { runInNewContext } from 'node:vm';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { defaults, decision, replay } from './engine.mjs';
+import { defaults, decision, replay, botLedger } from './engine.mjs';
 import { handleBridge } from './api/bridge.js';
 
 test('replay decides at the close and fills at the next open with costs and sizing limits', () => {
@@ -29,6 +29,18 @@ test('replay decides at the close and fills at the next open with costs and sizi
   assert.ok(result.trades[1].pnl < 0);
   assert.ok(result.drawdown < 0);
   assert.equal(decision(rules, [100,110], { equity: 9500, dayStart: 10000, cash: 9500, exposure: 0 }, null, 110), null);
+});
+
+test('bot budget tracks fills and reduces buying capacity after a realized loss', () => {
+  const fill = (side, filled, price, time) => ({ symbol:'SPY', side, filled, price, t:'2026-10-01T12:0'+time+':00Z' });
+  const buy = fill('buy', 4, 100, 0);
+  const sell = fill('sell', 2, 70, 1);
+  const book = botLedger([sell, buy], 'SPY', 500);
+  assert.deepEqual({ qty:book.qty, invested:book.invested, realized:book.realized, available:book.available },
+    { qty:2, invested:200, realized:-60, available:240 });
+  assert.equal(botLedger([buy, fill('sell', 4, 110, 1)], 'SPY', 500).available, 500);
+  assert.equal(botLedger([{ ...buy, price:null }], 'SPY', 500).available, 0);
+  assert.equal(botLedger([], 'SPY', undefined).available, 0);
 });
 
 async function withDemo(run, mockAI, env = {}) {
@@ -89,7 +101,8 @@ test('screen, version, replay and execute a demo strategy, then pause safely thr
     const run = await api('backtest',{id:version.id,version:version.version,start,end,capital:100000,fees:1,slippage:2});
     assert.ok((await api('state')).runs.find(r=>r.id===run.id).trades.length > 0);
     await api('demo',{feed:true});
-    await api('bot',{id:version.id,version:version.version,action:'running'});
+    await assert.rejects(api('bot',{id:version.id,version:version.version,action:'running'}), /Set a bot budget/);
+    await api('bot',{id:version.id,version:version.version,action:'running',budget:650});
     let snapshot = await until(async () => {const s=await api('state');return s.feed==='offline'&&s.bots.default.status.startsWith('Waiting')&&s;});
     assert.equal(snapshot.orders.length,0);
     await api('demo',{broker:true});
@@ -103,6 +116,10 @@ test('screen, version, replay and execute a demo strategy, then pause safely thr
     assert.ok(snapshot.signals.length > 0);
     assert.ok(snapshot.orders.length > 1 || snapshot.positions.some(p=>p.symbol==='SPY'));
     assert.notEqual(snapshot.account.cash, initial.account.cash);
+    assert.equal(snapshot.bots.default.budget,650);
+    assert.ok(snapshot.orders.filter(order=>order.side==='buy').every(order=>order.filled===1&&order.price<=650));
+    assert.ok(snapshot.botSessions.default.bought>0);
+    assert.ok(snapshot.botSessions.default.invested<=650);
     assert.equal(new Set(snapshot.orders.map(o=>o.client)).size,snapshot.orders.length);
     await api('bot',{id:version.id,version:version.version,action:'stopped'});
     assert.equal((await api('state')).bots.default.desired,'stopped');
@@ -111,10 +128,10 @@ test('screen, version, replay and execute a demo strategy, then pause safely thr
     const qqq = await api('strategy',{...defaults,name:'QQQ Momentum',symbol:'QQQ'});
     const spy = await api('strategy',{...defaults,name:'Second SPY'});
     await api('bot',{id:version.id,version:version.version,action:'running'});
-    const launch = {id:qqq.id,version:qqq.version,action:'running',create:true};
+    const launch = {id:qqq.id,version:qqq.version,action:'running',create:true,budget:650};
     await api('bot',launch);
     await assert.rejects(api('bot',launch), /already has a bot/);
-    await assert.rejects(api('bot',{id:spy.id,version:spy.version,action:'running',create:true}), /existing SPY bot/);
+    await assert.rejects(api('bot',{id:spy.id,version:spy.version,action:'running',create:true,budget:650}), /existing SPY bot/);
     snapshot = await api('state');
     assert.equal(Object.values(snapshot.bots).filter(bot => bot.desired === 'running').length, 2);
     const qqqCommand = {id:qqq.id,version:qqq.version};
@@ -125,6 +142,43 @@ test('screen, version, replay and execute a demo strategy, then pause safely thr
     snapshot = await api('state');
     assert.equal(snapshot.bots[qqq.id].desired,'stopped');
     assert.equal(snapshot.bots.default.desired,'running');
+  });
+});
+
+test('crypto is screened separately and a small USD budget drives a fractional bot fill', { timeout: 70000 }, async () => {
+  await withDemo(async (api, until) => {
+    const initial = await api('state');
+    const pair = initial.market.find(item => item.symbol === 'BTC/USD');
+    assert.equal(pair.assetClass,'crypto');
+    assert.equal(pair.freshness,'simulated');
+    assert.ok(pair.volume > 0 && pair.eligible);
+    const strategy = await api('strategy',{...defaults,name:'SPY label with BTC instrument',symbol:'BTC/USD',period:2,entry:0});
+    const end = new Date(Date.now() - 86400000).toISOString().slice(0,10);
+    const start = new Date(Date.now() - 172800000).toISOString().slice(0,10);
+    const run = await api('backtest',{id:strategy.id,version:strategy.version,start,end,capital:1000,fees:1,slippage:2});
+    assert.ok((await api('state')).runs.find(item=>item.id===run.id).trades.some(trade=>trade.side==='buy'&&trade.qty>0&&trade.qty<1));
+    const input = {id:strategy.id,version:strategy.version};
+    await assert.rejects(api('bot',{...input,action:'running',symbol:'SPY',budget:120}), /does not match/);
+    await api('bot',{...input,action:'running',budget:5});
+    const waiting = await until(async()=>{
+      const s=await api('state');
+      return s.bots[strategy.id].lastEvaluation?.direction==='hold'&&s;
+    });
+    assert.match(waiting.bots[strategy.id].lastEvaluation.rationale,/minimum order/);
+    assert.equal(waiting.orders.length,0);
+    await api('bot',{...input,action:'paused'});
+    const launched = await api('bot',{...input,action:'running',symbol:'BTC/USD',budget:120});
+    assert.equal(launched.symbol,'BTC/USD');
+    const snapshot = await until(async()=>{
+      const s=await api('state');
+      return s.orders.some(o=>o.symbol==='BTC/USD'&&o.status==='filled'&&o.side==='buy')&&s;
+    },45000);
+    const buy = snapshot.orders.find(o=>o.symbol==='BTC/USD'&&o.side==='buy');
+    assert.ok(buy.qty>0&&buy.qty<1);
+    assert.ok(buy.qty*buy.price<=120);
+    assert.ok(snapshot.botSessions[strategy.id].bought>0);
+    assert.ok(snapshot.signals.some(signal=>signal.strategyId===strategy.id&&signal.symbol==='BTC/USD'));
+    assert.ok(snapshot.orders.every(order=>order.symbol==='BTC/USD'));
   });
 });
 
@@ -148,7 +202,7 @@ test('AI bots send isolated confirmations concurrently and pausing discards an i
     await withDemo(async (api, until) => {
       const symbols = ['SPY', 'QQQ', 'AAPL', 'NVDA'];
       const bots = await Promise.all(symbols.map(symbol => api('strategy', { ...defaults, name: symbol, symbol, period: 2, entry: 0, ai: true })));
-      for (const bot of bots) await api('bot', { id: bot.id, version: bot.version, action: 'running' });
+      for (const bot of bots) await api('bot', { id: bot.id, version: bot.version, action: 'running', budget:650 });
       await until(() => requests.size >= 3, 45000);
       assert.equal(requests.size, 3);
       assert.deepEqual([...requests.keys()].sort(), symbols.slice(0, 3).sort());
@@ -225,8 +279,8 @@ test('the hosted bridge and worker enforce owner sign-up, authentication and sig
     const cookie = setCookie.split(';')[0];
     assert.deepEqual(await created.json(), { required:true, authenticated:true, canSignup:false });
     assert.equal((await send('auth', signup)).status, 403);
-    assert.equal((await send('bot', { id:'default', version:1, action:'running' })).status, 401);
-    assert.equal((await send('bot', { id:'default', version:1, action:'running' }, cookie)).status, 200);
+    assert.equal((await send('bot', { id:'default', version:1, action:'running', budget:650 })).status, 401);
+    assert.equal((await send('bot', { id:'default', version:1, action:'running', budget:650 }, cookie)).status, 200);
     const snapshot = await send('state', null, cookie);
     assert.equal(snapshot.headers.get('cache-control'), 'no-store');
     assert.equal((await snapshot.json()).bots.default.desired, 'running');

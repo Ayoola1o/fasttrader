@@ -4,13 +4,64 @@ export const instruments = {
   AAPL: ['Apple Inc.', 228.68, 0.62],
   NVDA: ['NVIDIA Corporation', 142.81, 2.34],
   MSFT: ['Microsoft Corporation', 425.52, -0.32],
-  TSLA: ['Tesla, Inc.', 347.91, -1.18]
+  TSLA: ['Tesla, Inc.', 347.91, -1.18],
+  'BTC/USD': ['Bitcoin / US Dollar', 96000, 1.40],
+  'ETH/USD': ['Ethereum / US Dollar', 3300, 0.95],
+  'SOL/USD': ['Solana / US Dollar', 185, 2.05],
+  'LTC/USD': ['Litecoin / US Dollar', 97, -0.45]
 };
+
+export const isCrypto = symbol => typeof symbol === 'string' && symbol.endsWith('/USD');
+export const cryptoReplayRules = { increment: 0.000001, minimum: 0.000001, minValue: 10, tick: 0.01 };
+
+export function roundDown(value, increment) {
+  const units = value / increment;
+  const steps = Math.floor(units + Math.abs(units) * Number.EPSILON);
+  return Number((steps * increment).toFixed(9));
+}
+
+function entryQty(budget, price, rules) {
+  if (budget <= 0) return 0;
+  if (!rules) return Math.floor(budget / price);
+  const qty = roundDown(budget / price, rules.increment);
+  return qty >= rules.minimum && qty * price >= rules.minValue ? qty : 0;
+}
 
 export const defaults = {
   name: 'Momentum Alpha', symbol: 'SPY', period: 12, entry: 0.1, exit: -0.1,
   size: 10, exposure: 20, dailyLoss: 3, stop: 2, take: 4, ai: false
 };
+
+export function botLedger(orders, symbol, budget) {
+  const holdings = new Map();
+  let bought = 0, sold = 0, realized = 0, buyFills = 0, sellFills = 0, complete = true;
+  const fills = orders.filter(order => order.filled > 0).toSorted((a, b) =>
+    Date.parse(a.filledAt ?? a.t) - Date.parse(b.filledAt ?? b.t));
+  for (const order of fills) {
+    const holding = holdings.get(order.symbol) ?? { qty: 0, cost: 0 };
+    holdings.set(order.symbol, holding);
+    if (!Number.isFinite(order.price) || order.price <= 0) complete = false;
+    const value = (order.price ?? 0) * order.filled;
+    if (order.side === 'buy') {
+      holding.qty += order.filled;
+      holding.cost += value;
+      bought += value;
+      buyFills++;
+    } else if (order.side === 'sell') {
+      if (order.filled - holding.qty > 0.000001) complete = false;
+      const cost = holding.qty > 0 ? holding.cost * Math.min(1, order.filled / holding.qty) : 0;
+      holding.qty -= order.filled;
+      holding.cost = Math.max(0, holding.cost - cost);
+      realized += value - cost;
+      sold += value;
+      sellFills++;
+    }
+  }
+  const { qty, cost } = holdings.get(symbol) ?? { qty: 0, cost: 0 };
+  const invested = Array.from(holdings.values()).reduce((sum, holding) => sum + holding.cost, 0);
+  const available = complete && Number.isFinite(budget) ? Math.max(0, budget + Math.min(0, realized) - invested) : 0;
+  return { qty, cost, invested, bought, sold, realized, buyFills, sellFills, available, complete };
+}
 
 export function strategy(input) {
   const result = { name: String(input.name ?? '').trim().slice(0, 60), symbol: input.symbol, ai: input.ai === true };
@@ -25,7 +76,7 @@ export function strategy(input) {
   return result;
 }
 
-export function decision(s, closes, account, position, price) {
+export function decision(s, closes, account, position, price, rules = isCrypto(s.symbol) ? cryptoReplayRules : null) {
   if (closes.length < s.period || !Number.isFinite(price) || price <= 0) return null;
   const window = closes.slice(-s.period);
   const average = window.reduce((sum, value) => sum + value, 0) / window.length;
@@ -41,7 +92,7 @@ export function decision(s, closes, account, position, price) {
   }
   if (limit || momentum <= s.entry) return null;
   const budget = Math.min(account.equity * s.size / 100, account.equity * s.exposure / 100 - account.exposure, account.cash);
-  const qty = Math.floor(budget / price);
+  const qty = entryQty(budget, price, rules);
   return qty > 0 ? { side: 'buy', qty, rationale: 'Price is ' + momentum.toFixed(2) + '% above its moving average' } : null;
 }
 
@@ -49,6 +100,7 @@ export function replay(s, bars, options) {
   let cash = options.capital, dayStart = cash, peak = cash, day, position, pending;
   const curve = [], trades = [];
   const closes = [];
+  const rules = isCrypto(s.symbol) ? cryptoReplayRules : null;
   for (const bar of bars) {
     const date = bar.t.slice(0, 10);
     if (date !== day) {
@@ -61,8 +113,8 @@ export function replay(s, bars, options) {
       const unitCost = price * (1 + options.fees / 10000);
       const equity = cash + (position?.qty ?? 0) * bar.o;
       const qty = buy ? equity <= dayStart * (1 - s.dailyLoss / 100) ? 0 :
-        Math.min(pending.qty, Math.floor(Math.min(cash, equity * s.exposure / 100, equity * s.size / 100) / unitCost)) : position.qty;
-      if (qty > 0) {
+        Math.min(pending.qty, entryQty(Math.min(cash, equity * s.exposure / 100, equity * s.size / 100), unitCost, rules)) : position.qty;
+      if (qty > 0 && (!buy || !rules || qty * price >= rules.minValue)) {
         const fee = qty * price * options.fees / 10000;
         const pnl = buy ? null : qty * (price - position.entry) - fee - position.fee;
         cash += (buy ? -1 : 1) * qty * price - fee;

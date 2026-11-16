@@ -12,7 +12,11 @@ Open http://127.0.0.1:3000. In **Screener**, find SPY and select **Build strateg
 
 In **Settings**, disconnect the feed or broker to test the bot's waiting state, then reconnect both. A browser that has loaded the workspace can reopen the cached shell, charts, holdings, and saved runs while the backend is unreachable. Strategy edits are stored as drafts. Select **Queue draft sync** offline to save a new version on reconnection. A version conflict leaves the local draft available for review. Closing the browser leaves the server worker running.
 
-Use **Live Trading** to launch a bot from a saved strategy version and filter the roster by active, paused, or stopped. Resume and Restart use the bot's pinned version. The workspace supports one bot per strategy and concurrent active bots on distinct instruments.
+Use **Live Trading** to launch a bot from a saved strategy version. Enter its USD budget before launch, then click a bot row to see its position, allocation, realized and unrealized P&L, signals, and orders. Resume and Restart from the roster reuse the saved budget. To change it, pause the bot and enter a new amount in its session. The workspace supports one bot per strategy and concurrent active bots on distinct instruments.
+
+The bot budget caps new purchases alongside account buying power and strategy risk limits. Open position costs, pending buy orders, and net realized losses count against that budget. Budgets are execution limits within the shared paper account. The engine continues to reconcile existing orders and holdings, and older bots without a budget can exit positions but cannot place new buys until a budget is set. Session P&L uses recorded fills and excludes fees. **Latest evaluation** shows the result of the last evaluated bar even when no order was submitted.
+
+The **Crypto** screener includes BTC/USD, ETH/USD, SOL/USD, and LTC/USD. Crypto strategies use a separate shared Alpaca Crypto US feed and historical data endpoint. In Alpaca mode, the bot checks the account and asset eligibility, broker-reported order increments, non-marginable buying power, and the bot's USD budget. Crypto backtests use modeled minimums and fee assumptions. Alpaca crypto fees or manual trades can change broker quantities. The engine blocks orders when the broker position cannot be reconciled with attributed fills.
 
 ## Connect Alpaca Paper
 
@@ -48,4 +52,4 @@ npm test
 
 The test suite covers next-bar execution, sizing, loss limits, strategy versioning, demo fills and portfolio impact, feed and broker outage gating, and resumption. Live Alpaca Paper and AI provider checks require configured credentials.
 
-Current scope includes six US stocks and ETFs, a minute-bar momentum strategy, basic portfolio analytics, and in-app notifications. Crypto and forex provider coverage, broker realized P&L, multi-user accounts and subscriptions, and hosting of the persistent worker remain follow-up work.
+Current scope includes six US stocks and ETFs, four USD crypto pairs, a minute-bar momentum strategy, basic portfolio analytics, and in-app notifications. Crypto market-cap data, forex coverage, broker-wide realized P&L, multi-user accounts and subscriptions, and hosting of the persistent worker remain follow-up work.
