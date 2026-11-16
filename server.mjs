@@ -3,6 +3,7 @@ import { readFile, mkdir, writeFile, rename } from 'node:fs/promises';
 import { randomUUID, createHash } from 'node:crypto';
 import { instruments, defaults, strategy, decision, replay, synthetic } from './engine.mjs';
 import { assessSignal, signalProvider } from './signal-ai.mjs';
+import { createAuth, sameSecret } from './auth.mjs';
 
 const mode = process.env.FASTTRADER_MODE || 'demo';
 const aiProvider = signalProvider(process.env);
@@ -12,7 +13,14 @@ const headers = { 'APCA-API-KEY-ID': process.env.ALPACA_KEY, 'APCA-API-SECRET-KE
 if (!demo && (mode !== 'alpaca' || !headers['APCA-API-KEY-ID'] || !headers['APCA-API-SECRET-KEY'] || !['iex','sip','delayed_sip'].includes(feed))) {
   throw Error('Set valid Alpaca Paper credentials and a supported feed in .env.');
 }
-const directory = '.fasttrader';
+const host = process.env.FASTTRADER_HOST || '127.0.0.1';
+const bridgeSecret = process.env.WORKER_SHARED_SECRET;
+if ((bridgeSecret && bridgeSecret.length < 32) || (host !== '127.0.0.1' && !bridgeSecret)) {
+  throw Error('A hosted worker requires a WORKER_SHARED_SECRET of at least 32 characters.');
+}
+const signupCode = process.env.FASTTRADER_SIGNUP_CODE;
+if (signupCode && signupCode.length < 24) throw Error('FASTTRADER_SIGNUP_CODE must have at least 24 characters.');
+const directory = process.env.FASTTRADER_DATA_DIR || '.fasttrader';
 const file = directory + '/' + (demo ? 'demo' : 'alpaca-' + createHash('sha256').update(headers['APCA-API-KEY-ID']).digest('hex').slice(0, 16)) + '.json';
 const terminal = new Set(['filled', 'canceled', 'expired', 'rejected', 'replaced']);
 const time = () => new Date().toISOString();
@@ -23,6 +31,11 @@ let state = {
   feed: 'connecting', broker: 'connecting', sessionOpen: demo, synced: null
 };
 await mkdir(directory, { recursive: true });
+const auth = await createAuth({
+  file: directory + '/auth.json', signupCode,
+  required: Boolean(bridgeSecret || signupCode || process.env.FASTTRADER_AUTH === 'required'),
+  secure: Boolean(bridgeSecret)
+});
 try { state = JSON.parse(await readFile(file, 'utf8')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
 state.feed = state.broker = 'connecting';
 const symbols = Object.keys(instruments);
@@ -488,16 +501,31 @@ async function backtest(input) {
   });
 }
 const server = createServer(async (req, res) => {
-  const url = new URL(req.url, 'http://localhost');
-  const respond = (status, value) => { res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(value)); };
+  const respond = (status, value, headers = {}) => { res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...headers }); res.end(JSON.stringify(value)); };
   try {
+    const url = new URL(req.url, 'http://localhost');
     const port = server.address().port;
-    if (!['127.0.0.1:' + port, 'localhost:' + port].includes(req.headers.host)) return respond(403, { error: 'Use the loopback workspace address.' });
+    if (bridgeSecret) {
+      if (!sameSecret(req.headers['x-fasttrader-worker-secret'], bridgeSecret)) return respond(403, { error: 'Worker authorization required.' });
+    } else if (!['127.0.0.1:' + port, 'localhost:' + port].includes(req.headers.host)) {
+      return respond(403, { error: 'Use the loopback workspace address.' });
+    }
+    if (req.method === 'POST' && url.pathname.startsWith('/api/') &&
+      (!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] ?? '') ||
+       (req.headers.origin && new URL(req.headers.origin).host !== req.headers.host))) {
+      return respond(403, { error: 'Use a same-origin JSON request.' });
+    }
+    if (req.method === 'GET' && url.pathname === '/api/auth') return respond(200, auth.status(req.headers.cookie));
+    if (req.method === 'POST' && url.pathname === '/api/auth') {
+      const result = await auth.change(await body(req), req.headers.cookie);
+      return respond(200, result.data, { 'Set-Cookie': result.cookie });
+    }
+    if (url.pathname.startsWith('/api/') && !auth.authenticated(req.headers.cookie)) return respond(401, { error: 'Sign in to FastTrader.' });
     if (req.method === 'GET' && url.pathname === '/api/state') return respond(200, snapshot());
     if (req.method === 'POST' && url.pathname.startsWith('/api/')) {
-      if (!req.headers['content-type']?.startsWith('application/json') || req.headers.origin && new URL(req.headers.origin).host !== req.headers.host) return respond(403, { error: 'Use a same-origin JSON request.' });
       const input = await body(req);
       const result = url.pathname === '/api/backtest' ? await backtest(input) : await serial(async () => {
+        if (!auth.authenticated(req.headers.cookie)) throw Object.assign(Error('Sign in to FastTrader.'), { status: 401 });
         const value = await change(url.pathname, input);
         await persist();
         return value;
@@ -509,6 +537,6 @@ const server = createServer(async (req, res) => {
     const contents = await readFile(new URL('./public/' + asset[0], import.meta.url));
     res.writeHead(200, { 'Content-Type': asset[1] + '; charset=utf-8', 'Cache-Control': 'no-cache', 'X-Content-Type-Options': 'nosniff' });
     res.end(contents);
-  } catch (error) { respond(400, { error: error instanceof SyntaxError ? 'Invalid JSON' : error.message }); }
+  } catch (error) { respond(error.status >= 400 && error.status < 600 ? error.status : 400, { error: error instanceof SyntaxError ? 'Invalid JSON' : error.message }); }
 });
-server.listen(Number(process.env.PORT || 3000), '127.0.0.1', () => console.log('FastTrader ' + mode + ' running at http://127.0.0.1:' + server.address().port));
+server.listen(Number(process.env.PORT || 3000), host, () => console.log('FastTrader ' + mode + ' running at http://' + host + ':' + server.address().port));

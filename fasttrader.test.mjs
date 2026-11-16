@@ -10,6 +10,7 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { defaults, decision, replay } from './engine.mjs';
+import { handleBridge } from './api/bridge.js';
 
 test('replay decides at the close and fills at the next open with costs and sizing limits', () => {
   const rules = { ...defaults, period: 2, entry: 0, stop: 2, take: 4 };
@@ -30,7 +31,7 @@ test('replay decides at the close and fills at the next open with costs and sizi
   assert.equal(decision(rules, [100,110], { equity: 9500, dayStart: 10000, cash: 9500, exposure: 0 }, null, 110), null);
 });
 
-async function withDemo(run, mockAI) {
+async function withDemo(run, mockAI, env = {}) {
   const cwd = await mkdtemp(join(tmpdir(), 'fasttrader-test-'));
   const preload = mockAI ? ['--import=data:text/javascript,' + encodeURIComponent(`
     const request = globalThis.fetch;
@@ -39,7 +40,8 @@ async function withDemo(run, mockAI) {
       : request(url, options);
   `)] : [];
   const child = spawn(process.execPath, [...preload, fileURLToPath(new URL('./server.mjs', import.meta.url))], {
-    cwd, env: { ...process.env, PORT: '0', FASTTRADER_MODE: 'demo', GEMINI_API_KEY: mockAI ? 'test-key' : '', OPENAI_API_KEY: '', MOCK_GEMINI_URL: mockAI ?? '' },
+    cwd, env: { ...process.env, PORT: '0', FASTTRADER_MODE: 'demo', GEMINI_API_KEY: mockAI ? 'test-key' : '', OPENAI_API_KEY: '', MOCK_GEMINI_URL: mockAI ?? '',
+      FASTTRADER_SIGNUP_CODE: '', WORKER_SHARED_SECRET: '', FASTTRADER_AUTH: '', FASTTRADER_HOST: '127.0.0.1', FASTTRADER_DATA_DIR: '.fasttrader', ...env },
     stdio: ['ignore','pipe','pipe']
   });
   const stopped = new Promise(resolve => child.once('close', resolve));
@@ -64,7 +66,7 @@ async function withDemo(run, mockAI) {
       assert.ok(res.ok, result.error);
       return result;
     };
-    await run(api, until);
+    await run(api, until, url);
   } finally {
     child.kill();
     await stopped;
@@ -185,4 +187,52 @@ test('offline navigation can reopen the cached shell while API data stays networ
   handlers.fetch({ request: request('/'), respondWith: promise => { response = promise; } });
   assert.equal(await (await response).text(), 'FastTrader shell');
   handlers.fetch({ request: {...request('/api/state'), mode:'cors'}, respondWith: () => assert.fail('API snapshots must bypass the shell cache') });
+  handlers.fetch({ request: request('/api/state'), respondWith: () => assert.fail('API navigations must bypass the shell cache') });
+});
+
+test('the hosted bridge and worker enforce owner sign-up, authentication and sign-out', { timeout: 20000 }, async () => {
+  const shared = randomUUID();
+  const setup = randomUUID();
+  const origin = 'https://fasttrader.example';
+  const env = { WORKER_SHARED_SECRET: shared, FASTTRADER_WORKER_URL: 'https://worker.example' };
+  await withDemo(async (_, _until, worker) => {
+    const send = (route, data, cookie, requestOrigin = origin) => {
+      const options = { headers: {} };
+      if (cookie) options.headers.Cookie = cookie;
+      if (data) {
+        options.method = 'POST';
+        options.headers.Origin = requestOrigin;
+        options.headers['Content-Type'] = 'application/json';
+        options.body = JSON.stringify(data);
+      }
+      return handleBridge(new Request(origin + '/api/bridge?route=' + route, options), env, (target, init) => {
+        assert.equal(target.origin, env.FASTTRADER_WORKER_URL);
+        assert.equal(init.headers.get('x-fasttrader-worker-secret'), shared);
+        return fetch(worker + target.pathname, init);
+      });
+    };
+    const owner = { email:'owner@example.com', password:'test-password-for-fasttrader' };
+    const signup = { ...owner, action:'signup', code:setup };
+    assert.equal((await fetch(worker + '/api/state')).status, 403);
+    assert.equal((await send('state')).status, 401);
+    assert.deepEqual(await (await send('auth')).json(), { required:true, authenticated:false, canSignup:true });
+    assert.equal((await send('auth', signup, null, 'https://another.example')).status, 403);
+    assert.equal((await send('auth', { ...signup, code:'wrong' })).status, 403);
+    const created = await send('auth', signup);
+    assert.equal(created.status, 200);
+    const setCookie = created.headers.get('set-cookie');
+    assert.match(setCookie, /HttpOnly; SameSite=Strict; Max-Age=43200; Secure$/);
+    const cookie = setCookie.split(';')[0];
+    assert.deepEqual(await created.json(), { required:true, authenticated:true, canSignup:false });
+    assert.equal((await send('auth', signup)).status, 403);
+    assert.equal((await send('bot', { id:'default', version:1, action:'running' })).status, 401);
+    assert.equal((await send('bot', { id:'default', version:1, action:'running' }, cookie)).status, 200);
+    const snapshot = await send('state', null, cookie);
+    assert.equal(snapshot.headers.get('cache-control'), 'no-store');
+    assert.equal((await snapshot.json()).bots.default.desired, 'running');
+    assert.equal((await send('auth', { action:'logout' }, cookie)).status, 200);
+    assert.equal((await send('state', null, cookie)).status, 401);
+    assert.equal((await send('auth', { ...owner, action:'login', password:'wrong' })).status, 401);
+    assert.equal((await send('auth', { ...owner, action:'login' })).status, 200);
+  }, null, { FASTTRADER_SIGNUP_CODE: setup, WORKER_SHARED_SECRET: shared });
 });

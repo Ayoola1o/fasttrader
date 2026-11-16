@@ -26,7 +26,19 @@ Bots share one feed and each reads its instrument's rolling bar window. The serv
 
 ## Vercel deployment
 
-The frontend assets in `public/` can be hosted on Vercel. Run the trading engine, Alpaca stream, and persistent storage on an always-on host. The current API binds to loopback and serves a single local workspace. A hosted frontend requires an authenticated API connection to that worker and persistent storage for workspace data. Keep the Alpaca and AI credentials in the worker's environment. [Vercel Functions duration limits](https://vercel.com/docs/functions/configuring-functions/duration)
+FastTrader supports a single owner account for the trading workspace. The first sign-up requires a setup code. Future visits use the owner's email and password. Passwords are hashed, sessions expire after 12 hours, and Sign out revokes the current session. Signing out leaves enabled bots running.
+
+1. Deploy the Node.js app on an always-on host with HTTPS and mount persistent storage for `FASTTRADER_DATA_DIR`. Use one worker instance. Set `FASTTRADER_HOST=0.0.0.0`, `FASTTRADER_DATA_DIR` to the mounted directory, and the Alpaca Paper and AI provider settings on that host.
+2. Generate two separate random values. Set `WORKER_SHARED_SECRET` on the worker and Vercel, and set `FASTTRADER_SIGNUP_CODE` only on the worker. Run the following command once per value in your terminal.
+
+   ```text
+   node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
+   ```
+
+3. Import the repo into Vercel with the included `vercel.json`. Set `FASTTRADER_WORKER_URL` to the worker's HTTPS origin and deploy. Vercel serves the frontend and forwards API requests to the worker. The worker verifies the bridge credential and the owner's session. [Vercel Node.js Functions](https://vercel.com/docs/functions/runtimes/node-js)
+4. On the Vercel site, choose **Create an account**, enter your email, a password of at least 12 characters, and the setup code. Once the account is created, remove `FASTTRADER_SIGNUP_CODE` from the worker's environment.
+
+For local sign-in, set `FASTTRADER_SIGNUP_CODE` in `.env` and restart with `npm start`. A fresh loopback demo without a setup code opens directly. Signed-in workspace data and drafts remain available in the current tab during a disconnect. The browser caches only the app shell across tab closures for signed-in workspaces.
 
 ## Verification
 

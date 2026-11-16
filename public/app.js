@@ -31,7 +31,9 @@ const submit=(label,disabled=false)=>`<div><button class="button primary" ${disa
 const form=(id,fields,tail)=>`<form class="form" id="${id}"><div class="fields">${fields}</div>${tail}</form>`;
 function read(k){try{return JSON.parse(localStorage.getItem(k))}catch{return null}}
 function write(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch{}}
-let state=read('ft-cache'),online=false,active='',selected='SPY',chartMode='Price',range='1H',assetClass='Stocks',editor=read('ft-draft'),runA='',runB=null,pending=false,syncing=false,toastTimer;
+const localWorkspace=['127.0.0.1','localhost'].includes(location.hostname);
+let authInfo=null,authMode='login',authRevision=0;
+let state=null,online=false,active='',selected='SPY',chartMode='Price',range='1H',assetClass='Stocks',editor=null,runA='',runB=null,pending=false,syncing=false,toastTimer;
 const ranges={'15M':15,'1H':60,'4H':240,'1D':1440};
 const screen={search:'',volume:0,volatility:0};
 let botFilter='all', launchVersion='';
@@ -213,16 +215,38 @@ function settings(){
 function profile(){
  return page('Workspace preferences','Profile','Manage local workspace details and offline data access.')+
  `<div class="grid">${panel('Account details','Local workspace profile',form('profile',field('Display name','name',state.profile.name,'required maxlength="80"')+
- field('Email','email',state.profile.email,'type="email"') ,check('Cache workspace data in this browser','offlineSync',state.profile.offlineSync)+submit('Save profile',!online)))}
+ field('Email','email',state.profile.email,'type="email"'),(authInfo?.required?'<small>Signed-in workspace data and drafts are kept in this tab during a disconnect.</small>':check('Cache workspace data in this browser','offlineSync',state.profile.offlineSync))+submit('Save profile',!online)))}
  ${panel('Subscription','Current workspace tier','<div class="bot-row"><b>Paper trading</b>'+badge('Local workspace','good')+'</div>'+empty(syncLabel()))}</div>`;
 }
 const renderers={dashboard,trading,screener,strategies,backtesting,portfolio,settings,profile};
+function clearWorkspace(){
+ state=null;editor=null;runA='';runB=null;online=false;
+ write('ft-cache',null);write('ft-draft',null);
+}
+function authenticationView(){
+ const signup=authMode==='signup'&&authInfo.canSignup;
+ const title=signup?'Create your account':'Sign in to FastTrader';
+ const fields=field('Email address','email','','type="email" required maxlength="254" autocomplete="email"')+
+   field('Password','password','','type="password" required maxlength="256" '+(signup?'minlength="12" autocomplete="new-password"':'autocomplete="current-password"'))+
+   (signup?field('Workspace setup code','code','','type="password" required autocomplete="off"'):'');
+ const switchMode=authInfo.canSignup?btn(signup?'Back to sign in':'Create an account','auth-mode',signup?'login':'signup'):'';
+ return `<section class="panel auth-card"><div class="auth-heading"><img src="/mark.svg" alt=""><h1>${title}</h1><p class="sub">${signup?'Use the setup code from your trading worker to claim this workspace.':'Access your paper trading workspace.'}</p></div>
+   <form class="form" id="authenticate" method="post" action="/api/auth">${fields}<div class="actions"><button class="button primary">${signup?'Create account':'Sign in'}</button>${switchMode}</div></form></section>`;
+}
 function render(force=false){
+ const signedOut=authInfo?.required&&!authInfo.authenticated;
+ document.body.classList.toggle('auth-screen',Boolean(signedOut));
+ $('#sign-out').hidden=!authInfo?.required||!authInfo.authenticated;
+ const main=$('#view');
+ if(signedOut){
+   const markup=authenticationView();
+   if(main.dataset.html!==markup){main.innerHTML=markup;main.dataset.html=markup}
+   return;
+ }
  const route=location.hash.slice(1).split('?')[0];
  const next=Object.hasOwn(pages,route)?route:'dashboard',changed=next!==active;
  active=next;chrome();
- const main=$('#view');
- if(!state){main.innerHTML=empty('Connect to FastTrader to load the workspace.');return}
+ if(!state){main.innerHTML=empty('Connect to FastTrader to load the workspace.');main.dataset.html='';return}
  if(!force&&!changed&&(pending||document.activeElement?.closest('form, .plot, #run-select')||main.querySelector('.plot:hover')))return;
  if(!force&&!changed&&['backtesting','profile'].includes(active))return;
  const markup=renderers[active]();
@@ -231,7 +255,10 @@ function render(force=false){
 async function api(path,data){
  const res=await fetch('/api/'+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data),signal:AbortSignal.timeout(path==='backtest'?70000:30000)});
  const result=await res.json();
- if(!res.ok)throw Error(result.error??'Request failed');
+ if(!res.ok){
+   if(res.status===401&&path!=='auth') signInRequired();
+   throw Error(result.error??'Request failed');
+ }
  return result;
 }
 const values=form=>Object.fromEntries(new FormData(form));
@@ -241,7 +268,7 @@ function capture(form){
  for(const [,k]of fields)data[k]=+data[k];
  const changed=Object.entries({...data,ai:form.elements.ai.checked}).some(([k,v])=>editor[k]!==v);
  editor={...editor,...data,ai:form.elements.ai.checked,dirty:true,mutation:changed||!editor.dirty?crypto.randomUUID():editor.mutation};
- write('ft-draft',editor);
+ if(!authInfo?.required)write('ft-draft',editor);
  $('#draft-status').textContent='Local draft';
 }
 async function save(){
@@ -252,19 +279,55 @@ async function save(){
  toast('Saved strategy version '+saved.version+'.');
 }
 let refreshing=false;
+function signInRequired(){
+ authRevision++;
+ clearWorkspace();
+ authMode='login';
+ authInfo={required:true,authenticated:false,canSignup:false};
+ render(true);
+}
 async function refresh(force=false){
  if(refreshing)return;
  refreshing=true;
  const prior=online;
+ const revision=authRevision;
  try{
    if(!navigator.onLine)throw Error('Offline');
+   if(!authInfo||authInfo.required&&!authInfo.authenticated){
+     const session=await fetch('/api/auth',{cache:'no-store',signal:AbortSignal.timeout(5500)});
+     if(!session.ok)throw Error('Unavailable');
+     const status=await session.json();
+     if(revision!==authRevision)return;
+     authInfo=status;
+     if(authInfo.required){
+       write('ft-secured',true);
+       if(!authInfo.authenticated){clearWorkspace();return}
+       write('ft-cache',null);write('ft-draft',null);
+     }else{
+       write('ft-secured',false);
+       editor??=read('ft-draft');
+     }
+   }
    const res=await fetch('/api/state',{cache:'no-store',signal:AbortSignal.timeout(4500)});
+   if(revision!==authRevision)return;
+   if(res.status===401){signInRequired();return}
    if(!res.ok)throw Error('Unavailable');
-   state=await res.json();
+   const snapshot=await res.json();
+   if(revision!==authRevision)return;
+   state=snapshot;
    online=true;
-   if(state.profile.offlineSync)write('ft-cache',state);
+   if(!authInfo.required&&state.profile.offlineSync)write('ft-cache',state);
    else write('ft-cache',null);
- }catch{online=false}
+ }catch{
+   if(revision!==authRevision)return;
+   online=false;
+   if(!state&&localWorkspace&&!authInfo?.required&&!read('ft-secured')){
+     state=read('ft-cache');editor??=read('ft-draft');
+   }
+ }finally{
+   refreshing=false;
+   render(force||prior!==online);
+ }
  if(online&&!prior&&editor?.queued&&!syncing&&!pending){
    syncing=true;
    try{await save();force=true}
@@ -272,13 +335,21 @@ async function refresh(force=false){
    finally{syncing=false;refreshing=false}
    if(force){await refresh(true);return}
  }
- refreshing=false;
- render(force||prior!==online);
 }
 document.addEventListener('click',async event=>{
  const el=event.target.closest('[data-action]');
- if(!el||!state)return;
+ if(!el)return;
  const {action,value}=el.dataset;
+ if(action==='auth-mode'&&!pending){authMode=value;render(true);return}
+ if(action==='sign-out'&&!pending){
+   pending=true;el.disabled=true;
+   authRevision++;
+   try{authInfo=await api('auth',{action:'logout'});clearWorkspace();authMode='login';render(true)}
+   catch(error){toast(error.message)}
+   finally{pending=false;el.disabled=false}
+   return;
+ }
+ if(!state)return;
  if(action==='watch'){selected=value;chartMode='Price'}
  if(action==='range')range=value;
  if(action==='chart')chartMode=value;
@@ -329,6 +400,13 @@ document.addEventListener('submit',async event=>{
  if(form.id==='history'){Object.assign(historyFilter,data);render(true);return}
  pending=true;if(control)control.disabled=true;
  try{
+   if(form.id==='authenticate'){
+     authRevision++;
+     authInfo=await api('auth',{...data,action:authMode==='signup'&&authInfo.canSignup?'signup':'login'});
+     form.reset();
+     await refresh(true);
+     return;
+   }
    if(form.id==='launch-bot'){
      const selected=version(data.version);
      await api('bot',{id:selected.id,version:selected.version,action:'running',create:true});
@@ -338,7 +416,7 @@ document.addEventListener('submit',async event=>{
    if(form.id==='strategy'){
      capture(form);
      if(online)await save();
-     else{editor.queued=true;write('ft-draft',editor);toast('Draft queued for reconnection.')}
+     else{editor.queued=true;if(!authInfo?.required)write('ft-draft',editor);toast('Draft queued for reconnection.')}
    }
    if(form.id==='backtest'){
      if(control)control.textContent='Running…';

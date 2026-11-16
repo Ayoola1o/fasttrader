@@ -1,0 +1,10 @@
+{
+  "framework": null,
+  "outputDirectory": "public",
+  "functions": {
+    "api/bridge.js": { "maxDuration": 70 }
+  },
+  "rewrites": [
+    { "source": "/api/:route(auth|state|strategy|bot|settings|profile|demo|backtest)", "destination": "/api/bridge?route=:route" }
+  ]
+}
