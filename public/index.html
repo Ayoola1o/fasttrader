@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0b1018">
+<title>FastTrader | Paper Trading Workspace</title>
+<link rel="icon" href="/mark.svg">
+<link rel="stylesheet" href="/style.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="#dashboard"><img src="/mark.svg" alt=""><span>Fast<span>Trader</span><small>TRADING WORKSPACE</small></span></a>
+  <nav id="nav" aria-label="Workspace"></nav>
+  <div class="sidebar-bottom">
+    <div class="environment"><span class="dot"></span><div><b id="workspace-mode">Paper Trading</b><small id="workspace-source">Loading workspace</small></div></div>
+    <a class="profile" href="#profile"><span class="avatar" id="avatar">PT</span><span><b id="profile-name">Paper Trader</b><small>Workspace profile</small></span></a>
+  </div>
+</aside>
+<div class="workspace">
+  <header class="topbar"><div id="crumb">Workspace <span>/</span> <strong>Dashboard</strong></div><div class="top-actions"><span class="connection" id="connection"><i class="dot"></i> Connecting</span><a class="icon-button" href="#settings" aria-label="Notifications" id="bell"></a></div></header>
+  <main id="view"><p class="muted">Loading workspace…</p></main>
+</div>
+<div id="toast" role="status" hidden></div>
+</body>
+</html>
