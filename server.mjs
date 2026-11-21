@@ -1,7 +1,7 @@
 import { createServer } from 'node:http';
 import { readFile, mkdir, writeFile, rename } from 'node:fs/promises';
 import { randomUUID, createHash } from 'node:crypto';
-import { instruments, defaults, strategy, decision, replay, synthetic, botLedger, isCrypto, cryptoReplayRules, roundDown, contiguousBars } from './engine.mjs';
+import { instruments, defaults, strategy, decision, replay, synthetic, botLedger, isCrypto, cryptoReplayRules, roundDown, contiguousBars, aggregateBars, computeATR, timeframes } from './engine.mjs';
 import { assessSignal, signalProvider } from './signal-ai.mjs';
 import { createAuth, sameSecret } from './auth.mjs';
 
@@ -64,6 +64,7 @@ const aiLifetime = 20000;
 const staleOrderMs = 120000;
 const cryptoSlippageBps = Math.max(0, Math.min(200, Number(process.env.ALPACA_CRYPTO_SLIPPAGE_BPS ?? 25) || 0));
 const pendingAI = new Map();
+const newsCache = new Map();
 let activeAI = 0;
 let queue = Promise.resolve();
 function serial(task) {
@@ -328,12 +329,30 @@ function positionMatchesLedger(position, ledger, rules) {
   return ledger.qty >= -tolerance && ledger.qty <= feeAllowance;
 }
 
+async function recentNews(symbol) {
+  if (demo) return [];
+  const cached = newsCache.get(symbol);
+  if (cached && Date.now() - cached.at < 300000) return cached.items;
+  try {
+    const query = isCrypto(symbol) ? symbol.replace('/', '') : symbol;
+    const data = await request('https://data.alpaca.markets', '/v1beta1/news?symbols=' + encodeURIComponent(query) + '&limit=3');
+    const items = (data?.news ?? []).map(n => ({ headline: n.headline, t: n.created_at }));
+    newsCache.set(symbol, { at: Date.now(), items });
+    return items;
+  } catch {
+    return [];
+  }
+}
+
 function orderContext(bot, s, bars) {
   const position = state.positions.find(p => p.symbol === s.symbol);
   const ledger = botLedger(botOrders(bot.id), s.symbol, hasBudget(bot.budget) ? bot.budget : null);
   const rules = isCrypto(s.symbol) ? cryptoRules.get(s.symbol) : null;
   if (!positionMatchesLedger(position, ledger, rules)) return null;
-  const bar = bars.at(-1);
+  const tf = s.timeframe ?? '1Min';
+  const tfMs = timeframes[tf] ?? 60000;
+  const series = aggregateBars(bars, tf);
+  const bar = series.at(-1) ?? bars.at(-1);
   const price = quotePrice(s.symbol, bar);
   const accountReserved = reservedBuys(state.orders);
   const freeCash = accountReserved === null ? 0 : Math.max(0, state.account.cash - accountReserved);
@@ -343,13 +362,14 @@ function orderContext(bot, s, bars) {
   const botReserved = reservedBuys(botOrders(bot.id)) ?? 0;
   const botExposure = (position ? position.qty * price : 0) + botReserved;
   const account = { ...state.account, cash, exposure: botExposure };
-  const window = contiguousBars(bars, s.period);
+  const window = contiguousBars(series, s.period, Math.max(180000, tfMs * 3));
   const warmedUp = window.length >= s.period;
   const cooldown = bot.cooldownBars ?? 0;
   const volume = Number.isFinite(bar?.v) ? bar.v : undefined;
+  const atr = s.atrStop > 0 ? computeATR(window, Math.min(14, s.period)) : null;
   return {
-    position, price, ledger, cash, rules, warmedUp, warmupCount: window.length, cooldown, volume,
-    proposal: decision(s, window.map(b => b.c), account, position, price, rules, { warmedUp, cooldown, volume })
+    position, price, ledger, cash, rules, warmedUp, warmupCount: window.length, cooldown, volume, atr, timeframe: tf,
+    proposal: decision(s, window.map(b => b.c), account, position, price, rules, { warmedUp, cooldown, volume, atr })
   };
 }
 
@@ -377,8 +397,10 @@ async function completeAI(job) {
   const { bot, s, proposal, bars, price, position } = job;
   let model, error;
   try {
+    const headlines = await recentNews(s.symbol);
     model = await assessSignal(aiProvider, s.symbol, proposal.side, bars, fetch, {
-      price, rationale: proposal.rationale, period: s.period,
+      price, rationale: proposal.rationale, period: s.period, mode: s.mode ?? 'momentum', timeframe: s.timeframe ?? '1Min',
+      ...(headlines.length ? { headlines } : {}),
       position: position ? { qty: position.qty, entry: position.entry, pnlPct: Number((100 * (price / position.entry - 1)).toFixed(2)) } : null
     });
   } catch (failure) { error = failure; }

@@ -9,7 +9,7 @@ import { runInNewContext } from 'node:vm';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { defaults, decision, replay, botLedger, contiguousBars } from './engine.mjs';
+import { defaults, decision, replay, botLedger, contiguousBars, aggregateBars, computeATR } from './engine.mjs';
 import { signalProvider } from './signal-ai.mjs';
 import { handleBridge } from './api/bridge.js';
 
@@ -89,6 +89,30 @@ test('contiguous candle warmup blocks gapped entries while allowing protective e
   const buys = replayed.trades.filter(t => t.side === 'buy');
   assert.equal(buys.length, 2);
   assert.equal(buys[1].t, bars[5].t);
+});
+
+test('timeframe aggregation, mean reversion, breakout, and ATR stops work deterministically', () => {
+  const mins = Array.from({ length: 10 }, (_, i) => ({
+    t: new Date(Date.parse('2026-10-01T12:00:00Z') + i * 60000).toISOString(),
+    o: 100 + i, h: 102 + i, l: 99 + i, c: 101 + i, v: 100
+  }));
+  const fiveMin = aggregateBars(mins, '5Min');
+  assert.equal(fiveMin.length, 2);
+  assert.equal(fiveMin[0].o, 100);
+  assert.equal(fiveMin[0].c, 105);
+  assert.equal(fiveMin[0].v, 500);
+  assert.ok(computeATR(mins, 5) > 0);
+  const account = { equity: 10000, cash: 10000, dayStart: 10000, exposure: 0 };
+  const mr = { ...defaults, mode: 'mean_reversion', period: 5, entry: 1.0 };
+  const mrBuy = decision(mr, [100, 100, 100, 100, 92], account, null, 92);
+  assert.equal(mrBuy?.side, 'buy');
+  const bo = { ...defaults, mode: 'breakout', period: 4, entry: 0 };
+  const boBuy = decision(bo, [100, 101, 102, 105], account, null, 105);
+  assert.equal(boBuy?.side, 'buy');
+  const atrRule = { ...defaults, stop: 10, atrStop: 1 };
+  const atrExit = decision(atrRule, [100, 98], account, { qty: 10, entry: 100 }, 98.5, null, { atr: 1 });
+  assert.equal(atrExit?.side, 'sell');
+  assert.equal(atrExit?.stopLoss, true);
 });
 
 async function withDemo(run, mockAI, env = {}) {

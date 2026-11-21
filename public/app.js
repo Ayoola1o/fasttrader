@@ -1,8 +1,8 @@
-const pages={dashboard:'Dashboard',trading:'Live Trading',session:'Bot Session',screener:'Screener',strategies:'Strategy Editor',backtesting:'Backtesting',portfolio:'Portfolio',settings:'Settings',profile:'Profile'};
+const pages={dashboard:'Dashboard',trading:'Live Trading',session:'Bot Session',screener:'Screener',strategies:'Strategy Editor',backtesting:'Backtesting',portfolio:'Portfolio',history:'History',settings:'Settings',profile:'Profile'};
 const paths={
 dashboard:'M3 3h7v7H3zm11 0h7v7h-7zM3 14h7v7H3zm11 0h7v7h-7z',screener:'M3 4h18v4l-7 6v5l-4 2v-7L3 8z',
 strategies:'M4 7h16M4 17h16M8 4v6m8 4v6',backtesting:'M3 12a9 9 0 1 0 3-6m-3-2v5h5m4-2v5l3 2',
-portfolio:'M4 8h16v12H4zm4 0V5h8v3M4 13h16m-9 0v2h2v-2',settings:'M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm0-5v2m0 14v2m9-9h-2M5 12H3m15-6-2 2m-8 8-2 2m12 0-2-2m-8-8-2-2',
+portfolio:'M4 8h16v12H4zm4 0V5h8v3M4 13h16m-9 0v2h2v-2',history:'M12 7v5l3 2m6-2a9 9 0 1 1-18 0 9 9 0 0 1 18 0z',settings:'M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm0-5v2m0 14v2m9-9h-2M5 12H3m15-6-2 2m-8 8-2 2m12 0-2-2m-8-8-2-2',
 profile:'M12 4a4 4 0 1 0 0 8 4 4 0 0 0 0-8zM4 21v-2a5 5 0 0 1 5-5h6a5 5 0 0 1 5 5v2',bell:'M5 17h14l-2-3v-4a5 5 0 0 0-10 0v4zm5 3h4',
 trading:'M3 12h4l3-7 4 14 3-7h4',
 equity:'m3 17 5-5 4 3 8-9m-5 0h5v5',wallet:'M3 6h17v13H3zm17 4h-6v5h6',bot:'M5 8h14v11H5zM12 4v4M2 12v3m20-3v3M9 12h.01M15 12h.01M9 16h6',plus:'M12 5v14M5 12h14'};
@@ -41,7 +41,9 @@ const screen={search:'',volume:0,volatility:0};
 const cryptoScreen={search:'',volume:0,volatility:0};
 let botFilter='all', launchVersion=null, launchInstrument=null, launchBudget='', fundBudget=null;
 let notifOpen=false, notifFilter='all', lastSeenNotif='';
-const historyFilter={asset:'',strategy:'',start:'',end:''};
+let tvStyle='Candles', tvRange='1H', tvBotId='';
+let historyTab='orders';
+const historyFilter={asset:'',strategy:'',side:'',status:'',start:'',end:''};
 const key=s=>s.id+'@'+s.version;
 const version=k=>state.strategies.find(s=>key(s)===k);
 const latest=()=>Object.values(Object.fromEntries(state.strategies.map(s=>[s.id,s])));
@@ -50,7 +52,7 @@ const botStatus=b=>b.desired==='running'?b.status:b.desired;
 const syncLabel=()=>state.synced?'Last sync '+stamp(state.synced):'Awaiting first sync';
 function toast(s){const n=$('#toast');n.textContent=s;n.hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>n.hidden=true,4500)}
 function chrome(){
- const groups=[['WORKSPACE',['dashboard','trading','screener','strategies','backtesting','portfolio']],['PREFERENCES',['settings','profile']]];
+ const groups=[['WORKSPACE',['dashboard','trading','screener','strategies','backtesting','portfolio','history']],['PREFERENCES',['settings','profile']]];
  const nav=$('#nav');
  if(nav.dataset.page!==active){
    nav.innerHTML=groups.map(([label,items])=>`<span class="nav-label">${label}</span>`+items.map(k=>`<a href="#${k}" class="nav-link ${k===active||k==='trading'&&active==='session'?'active':''}" ${k===active?'aria-current="page"':''}>${icon(k)}${pages[k]}</a>`).join('')).join('');
@@ -58,7 +60,7 @@ function chrome(){
  }
  const mobileNav=$('#mobile-nav');
  if(mobileNav&&mobileNav.dataset.page!==active){
-   const mobileTabs=[['dashboard','Home'],['trading','Bots'],['screener','Markets'],['strategies','Rules'],['portfolio','Assets']];
+   const mobileTabs=[['dashboard','Home'],['trading','Bots'],['screener','Markets'],['strategies','Rules'],['history','History']];
    mobileNav.innerHTML=mobileTabs.map(([k,label])=>`<a href="#${k}" class="mobile-tab ${k===active||k==='trading'&&active==='session'?'active':''}" ${k===active?'aria-current="page"':''}>${icon(k)}<span>${label}</span></a>`).join('');
    mobileNav.dataset.page=active;
  }
@@ -150,8 +152,63 @@ function dashboard(){
  <div class="grid">${price}${watch}</div><div class="grid equal">${panel('Recent orders','Paper execution activity',orders(state.orders,5),link('Portfolio','portfolio'))}${panel('Trade signals','Latest strategy decisions',signals)}</div>
  <div class="grid equal">${panel('Open holdings','Current paper positions',holdings,link('Portfolio','portfolio'))}${panel('Bot status','Backend execution',botRows(),link('Manage bots','trading'))}</div>`;
 }
+function tradingView(symbol, botOrders, position, label='Trading View'){
+ const allBars=state.bars[symbol]??[];
+ const latestTs=allBars.length?Date.parse(allBars.at(-1).t):Date.now();
+ const since=latestTs-ranges[tvRange]*60000;
+ const visible=allBars.filter(b=>Date.parse(b.t)>=since);
+ const slice=visible.length>=2?visible:allBars.slice(-60);
+ const seg=(values,action,current)=>`<div class="segmented">${values.map(v=>`<button type="button" class="${v===current?'selected':''}" data-action="${action}" data-value="${v}" aria-pressed="${v===current}">${v}</button>`).join('')}</div>`;
+ const controls=`<div class="actions">${seg(['Candles','Line'],'tv-style',tvStyle)}${seg(Object.keys(ranges),'tv-range',tvRange)}</div>`;
+ if(slice.length<2)return panel(label,esc(symbol)+' · Waiting for candle history',empty('Candles and Buy/Sell markers will appear as bars arrive.'),controls,'chart-panel');
+ const fills=botOrders.filter(o=>o.filled>0&&Number.isFinite(o.price)&&o.symbol===symbol);
+ const firstTs=Date.parse(slice[0].t), lastTs=Date.parse(slice.at(-1).t);
+ const inView=fills.filter(o=>{const ts=Date.parse(o.filledAt??o.t);return ts>=firstTs-60000&&ts<=lastTs+120000});
+ const highs=slice.map(b=>Number.isFinite(b.h)?b.h:Math.max(b.o,b.c));
+ const lows=slice.map(b=>Number.isFinite(b.l)?b.l:Math.min(b.o,b.c));
+ const extras=[...inView.map(o=>o.price),...(position?.qty>0&&Number.isFinite(position.entry)?[position.entry]:[])];
+ const max=Math.max(...highs,...extras), min=Math.min(...lows,...extras);
+ const pad=Math.max((max-min)*.15,Math.abs(max)*.0006,.01), low=min-pad, high=max+pad;
+ const x=i=>10+690*i/(slice.length-1), y=v=>230-218*(v-low)/(high-low);
+ const grids=Array.from({length:5},(_,i)=>{const row=12+i*54.5,v=high-(high-low)*i/4;return `<path d="M10 ${row}H700" stroke="#28364a" stroke-dasharray="3 5"/><text x="711" y="${row+4}">${num(v)}</text>`}).join('');
+ const ticks=Array.from({length:6},(_,i)=>{const j=Math.round((slice.length-1)*i/5),long=lastTs-firstTs>86400000;return `<text x="${x(j)}" y="253" text-anchor="${i===0?'start':i===5?'end':'middle'}">${esc(stamp(slice[j].t,long?{month:'short',day:'numeric'}:{hour:'2-digit',minute:'2-digit',hour12:false}))}</text>`}).join('');
+ const id='tvshade'+(++chartId);
+ let seriesSvg='';
+ if(tvStyle==='Candles'){
+   const cw=Math.max(2,Math.min(9,560/slice.length));
+   seriesSvg=slice.map((b,i)=>{
+     const cx=x(i), h=Number.isFinite(b.h)?b.h:Math.max(b.o,b.c), l=Number.isFinite(b.l)?b.l:Math.min(b.o,b.c);
+     const up=b.c>=b.o, col=up?'#48e1ad':'#ff8191';
+     const top=y(Math.max(b.o,b.c)), bot=y(Math.min(b.o,b.c)), bh=Math.max(1.5,bot-top);
+     return `<line x1="${cx.toFixed(1)}" x2="${cx.toFixed(1)}" y1="${y(h).toFixed(1)}" y2="${y(l).toFixed(1)}" stroke="${col}" stroke-width="1.2"/><rect x="${(cx-cw/2).toFixed(1)}" y="${top.toFixed(1)}" width="${cw.toFixed(1)}" height="${bh.toFixed(1)}" rx="1" fill="${col}"/>`;
+   }).join('');
+ } else {
+   const line=slice.map((b,i)=>(i?'L':'M')+x(i).toFixed(2)+' '+y(b.c).toFixed(2)).join(' ');
+   seriesSvg=`<path d="${line} L700 230 H10 Z" fill="url(#${id})"/><path d="${line}" fill="none" stroke="#4be4b2" stroke-width="2" vector-effect="non-scaling-stroke"/>`;
+ }
+ const entryLine=position?.qty>0&&Number.isFinite(position.entry)?`<line x1="10" x2="700" y1="${y(position.entry).toFixed(1)}" y2="${y(position.entry).toFixed(1)}" stroke="#8cb4ff" stroke-dasharray="5 4" stroke-width="1.3"/><text x="14" y="${Math.max(22,y(position.entry)-5).toFixed(1)}" fill="#8cb4ff" font-size="10">AVG ENTRY ${usd(position.entry)}</text>`:'';
+ const markers=inView.map(o=>{
+   const ts=Date.parse(o.filledAt??o.t);
+   let best=0, diff=Infinity;
+   for(let i=0;i<slice.length;i++){const d=Math.abs(Date.parse(slice[i].t)-ts);if(d<diff){diff=d;best=i}}
+   const cx=x(best), cy=y(o.price), buy=o.side==='buy', col=buy?'#48e1ad':'#ff8191';
+   return `<g class="tv-marker"><circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="9" fill="${col}" fill-opacity=".22"/><circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="6" fill="${col}" stroke="#0b1018" stroke-width="1.5"/><text x="${cx.toFixed(1)}" y="${(cy+3.2).toFixed(1)}" text-anchor="middle" fill="#08141c" font-size="8.5" font-weight="700">${buy?'B':'S'}</text></g>`;
+ }).join('');
+ const points=slice.map(b=>({t:b.t,value:b.c}));
+ const buys=inView.filter(o=>o.side==='buy').length, sells=inView.filter(o=>o.side==='sell').length;
+ const m=state.market.find(item=>item.symbol===symbol);
+ const desc=`${esc(symbol)} · ${usd(m?.price??slice.at(-1).c)} · ${buys} buy / ${sells} sell markers in view`;
+ const legend=`<div class="tv-legend"><span><i class="tv-dot buy"></i>Buy (${buys})</span><span><i class="tv-dot sell"></i>Sell (${sells})</span>${position?.qty>0?`<span><i class="tv-dot entry"></i>Avg entry ${usd(position.entry)}</span>`:''}</div>`;
+ return panel(label,desc,legend+`<div class="plot" tabindex="0" aria-label="Bot trading view chart" data-points="${esc(JSON.stringify(points))}" data-unit="price" data-low="${low}" data-high="${high}"><svg viewBox="0 0 790 265" role="img" aria-label="Trading view chart"><defs><linearGradient id="${id}" x1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#43e2ae" stop-opacity=".23"/><stop offset="100%" stop-color="#43e2ae" stop-opacity="0"/></linearGradient></defs>${grids}${ticks}${seriesSvg}${entryLine}${markers}<line class="crosshair" y1="12" y2="230" stroke="#7e98b5" stroke-dasharray="4 4" visibility="hidden"/><circle class="point" r="4" fill="#4be4b2" stroke="#0b1018" stroke-width="2" visibility="hidden"/></svg><div class="tooltip" role="status" hidden></div></div>`,controls,'chart-panel');
+}
 function trading(){
  const bots=Object.values(state.bots);
+ if(!bots.some(b=>b.id===tvBotId))tvBotId=bots.find(b=>b.desired==='running')?.id??bots[0]?.id??'';
+ const activeTvBot=bots.find(b=>b.id===tvBotId);
+ const tvBotOrders=activeTvBot?state.orders.filter(o=>o.owned&&o.strategyId===activeTvBot.id):[];
+ const tvPos=activeTvBot?state.positions.find(p=>p.symbol===activeTvBot.symbol):null;
+ const tvSwitch=bots.length>1?`<div class="tv-bot-tabs">${bots.map(b=>btn(esc(b.name)+' · '+esc(b.symbol),'tv-bot',b.id,false,`aria-pressed="${b.id===tvBotId}"`)).join('')}</div>`:'';
+ const tvPanel=activeTvBot?tvSwitch+tradingView(activeTvBot.symbol,tvBotOrders,tvPos,'Bot Trading View · '+esc(activeTvBot.name)):'';
  const groups=[['all','All bots'],['running','Active'],['paused','Paused'],['stopped','Stopped']];
  const counts=Object.fromEntries(groups.map(([k])=>[k,k==='all'?bots.length:bots.filter(b=>b.desired===k).length]));
  const filters=`<div class="tabs" role="group" aria-label="Filter bots">${groups.map(([k,label])=>btn(label+' '+counts[k],'bot-filter',k,false,`aria-pressed="${botFilter===k}"`)).join('')}</div>`;
@@ -182,7 +239,7 @@ function trading(){
    '<div class="metrics">'+metric('Active bots',counts.running,counts.running?bots.filter(b=>b.status==='Running'&&b.desired==='running').length+' processing signals':'No active bots','bot',true)+
    metric('Paused bots',counts.paused,'Available to resume','strategies')+metric('Stopped bots',counts.stopped,'Available to restart','portfolio')+
    metric('Paper broker',esc(online?state.broker:'cached'),esc(state.feedName)+' · '+esc(online?state.feed:'cached'),'equity')+'</div>'+
-   '<div class="stack">'+panel('Launch a bot','Choose the saved trading rules, the instrument to trade, and the maximum USD budget.',
+   '<div class="stack">'+tvPanel+panel('Launch a bot','Choose the saved trading rules, the instrument to trade, and the maximum USD budget.',
      options.length&&instruments.length?form('launch-bot',select('Strategy version','version',[['','Choose a strategy version'],...options],chosen,true)+
        select('Ticker or crypto pair','instrument',[['','Choose an instrument'],...instruments],target,true)+numeric('Bot budget (USD)','budget',launchBudget,1,1e9),
        unavailable+submit('Launch bot',!online)):
@@ -222,6 +279,7 @@ function session(){
    metric('Amount invested',book.complete?usd(book.invested):'—','Cost basis of the open position','portfolio')+
    metric('Realized P&L',moneyChange(realized),num(book.sellFills)+' sell fills · before fees','equity',true)+
    metric('Unrealized P&L',moneyChange(book.unrealized),positionStatus,'equity',true)+'</div>'+
+   '<div class="stack">'+tradingView(bot.symbol,botOrders,holding?{qty:book.qty,entry:book.complete?book.cost/book.qty:null}:null,'Bot Trading View · Buy & Sell Markers')+'</div>'+
    '<div class="grid equal">'+panel('Position',positionStatus,table(['Asset','Units held','Average cost','Mark','Market value','Open P&L'],positionRows,'No open position held by this bot.'))+
    panel('Bot controls','Last evaluated '+stamp(bot.lastBar)+' · '+open.length+' open orders',
      '<div class="form"><div class="actions">'+badge(botStatus(bot))+'<small>Started '+stamp(bot.started)+'</small></div>'+
@@ -248,9 +306,11 @@ function screener(){
  form('screen',field('Search','search',filter.search,'type="search" placeholder="Search symbols or names"')+numeric(crypto?'Minimum turnover (USD)':'Minimum volume','volume',filter.volume,0,1e12,1)+numeric('Minimum volatility (%)','volatility',filter.volatility,0,100),submit('Apply filters'))+
  table(['Asset','Price','Change','Volatility',crypto?'USD turnover':'Volume','Source / freshness',''],rows,'No instruments match these filters.'));
 }
-const fields=[['Lookback (1-minute bars)','period',2,60,1],['Entry above average (%)','entry',0,25],['Exit below average (%)','exit',-25,0],['Position size (% equity)','size',.1,100],['Maximum exposure (% equity)','exposure',.1,100],['Maximum daily loss (%)','dailyLoss',.1,50],['Stop-loss (%)','stop',.1,50],['Take-profit (%)','take',.1,100],['Stop-loss cooldown (bars)','cooldown',0,60,1]];
-const defaultParams={period:12,entry:0.1,exit:-0.1,size:10,exposure:20,dailyLoss:3,stop:2,take:4,cooldown:5,ai:false};
+const fields=[['Lookback (bars)','period',2,60,1],['Entry threshold (%)','entry',0,25],['Exit threshold (%)','exit',-25,0],['Position size (% equity)','size',.1,100],['Maximum exposure (% equity)','exposure',.1,100],['Maximum daily loss (%)','dailyLoss',.1,50],['Stop-loss (%)','stop',.1,50],['Take-profit (%)','take',.1,100],['ATR stop multiplier (0=off)','atrStop',0,10,.1],['Stop-loss cooldown (bars)','cooldown',0,60,1]];
+const defaultParams={mode:'momentum',timeframe:'1Min',period:12,entry:0.1,exit:-0.1,size:10,exposure:20,dailyLoss:3,stop:2,take:4,atrStop:0,cooldown:5,ai:false};
 const fresh=(symbol='')=>({...defaultParams,id:'',version:0,name:'',symbol});
+const modeLabels={momentum:'Momentum (SMA)',mean_reversion:'Mean Reversion (Bollinger + RSI)',breakout:'Breakout (Donchian Channel)'};
+const tfOptions=[['1Min','1 Minute'],['5Min','5 Minutes'],['15Min','15 Minutes'],['1Hour','1 Hour']];
 function strategies(){
  const route=location.hash, requested=params().get('symbol');
  if(editorRoute!==route){
@@ -263,7 +323,10 @@ function strategies(){
  const options=state.strategies.slice().reverse().map(s=>[key(s),s.name+' · '+s.symbol+' · v'+s.version]);
  const asset=state.market.find(m=>m.symbol===editor.symbol);
  const inputs=field('Strategy name','name',editor.name,'required maxlength="60"')+select('Instrument or pair','symbol',[['','Choose an instrument'],...state.market.map(m=>[m.symbol,m.symbol+' · '+m.name])],asset?.symbol??'',true)+
- select('Saved version','version',[['','New draft'],...options],saved?key(saved):'')+fields.map(([label,k,min,max,step])=>numeric(label,k,editor[k]??defaultParams[k],min,max,step)).join('');
+ select('Saved version','version',[['','New draft'],...options],saved?key(saved):'')+
+ select('Strategy mode','mode',Object.entries(modeLabels),editor.mode??'momentum',true)+
+ select('Candle timeframe','timeframe',tfOptions,editor.timeframe??'1Min',true)+
+ fields.map(([label,k,min,max,step])=>numeric(label,k,editor[k]??defaultParams[k],min,max,step)).join('');
  const startTrade=s=>link('Start trade','trading?version='+encodeURIComponent(key(s)),true);
  const botActions=saved?`<div class="actions">${link('Backtest v'+saved.version,'backtesting?version='+key(saved))}${bot?link('Open bot session',sessionRoute(bot)+'&version='+saved.version):''}${startTrade(saved)}</div>`:'';
  return page('Automated trading','Strategy Editor','Configure a minute-bar strategy and control its paper bot.',btn(icon('plus')+' New strategy','new','',true))+
@@ -322,7 +385,35 @@ function profile(){
  field('Email','email',state.profile.email,'type="email"'),(authInfo?.required?'<small>Signed-in workspace data and drafts are kept in this tab during a disconnect.</small>':check('Cache workspace data in this browser','offlineSync',state.profile.offlineSync))+submit('Save profile',!online)))}
  ${panel('Subscription','Current workspace tier','<div class="bot-row"><b>Paper trading</b>'+badge('Local workspace','good')+'</div>'+empty(syncLabel()))}</div>`;
 }
-const renderers={dashboard,trading,session,screener,strategies,backtesting,portfolio,settings,profile};
+function historyPage(){
+ const filteredOrders=state.orders.filter(item=>(!historyFilter.asset||item.symbol===historyFilter.asset)&&(!historyFilter.strategy||item.strategy===historyFilter.strategy)&&(!historyFilter.side||item.side===historyFilter.side)&&(!historyFilter.status||item.status===historyFilter.status)&&(!historyFilter.start||item.t?.slice(0,10)>=historyFilter.start)&&(!historyFilter.end||item.t?.slice(0,10)<=historyFilter.end));
+ const filteredSignals=state.signals.filter(item=>(!historyFilter.asset||item.symbol===historyFilter.asset)&&(!historyFilter.strategy||item.strategy===historyFilter.strategy)&&(!historyFilter.side||item.direction===historyFilter.side)&&(!historyFilter.start||item.t?.slice(0,10)>=historyFilter.start)&&(!historyFilter.end||item.t?.slice(0,10)<=historyFilter.end));
+ const filled=filteredOrders.filter(o=>o.filled>0&&Number.isFinite(o.price));
+ const buyVol=filled.filter(o=>o.side==='buy').reduce((sum,o)=>sum+o.filled*o.price,0);
+ const sellVol=filled.filter(o=>o.side==='sell').reduce((sum,o)=>sum+o.filled*o.price,0);
+ const opt=(list,label)=>[['',label],...Array.from(new Set(list.filter(Boolean))).map(v=>[v,v])];
+ const filterFields=select('Asset','asset',opt([...state.orders.map(o=>o.symbol),...state.signals.map(s=>s.symbol)],'All assets'),historyFilter.asset)+
+   select('Strategy','strategy',opt([...state.orders.map(o=>o.strategy),...state.signals.map(s=>s.strategy)],'All strategies'),historyFilter.strategy)+
+   select('Side','side',[['','All sides'],['buy','Buy'],['sell','Sell'],['hold','Hold']],historyFilter.side)+
+   select('Status','status',opt(state.orders.map(o=>o.status),'All statuses'),historyFilter.status)+
+   field('From','start',historyFilter.start,'type="date"')+field('To','end',historyFilter.end,'type="date"');
+ const tabs=`<div class="tabs" role="tablist">${[['orders','Orders & Fills ('+filteredOrders.length+')'],['signals','Signal Log ('+filteredSignals.length+')'],['runs','Backtest Runs ('+state.runs.length+')']].map(([k,label])=>btn(label,'history-tab',k,false,`role="tab" aria-selected="${historyTab===k}"`)).join('')}</div>`;
+ const content=historyTab==='orders'
+   ? panel('Execution history','All broker & bot orders matching your filters.',table(['Time','Asset','Strategy','Side','Filled / Qty','Fill Price','Value','Status'],filteredOrders.slice(0,250).map(o=>[
+       stamp(o.filledAt??o.t),esc(o.symbol),esc(o.strategy??'External'),badge(o.side),qtyText(o.filled)+' / '+qtyText(o.qty),usd(o.price),o.filled>0&&Number.isFinite(o.price)?usd(o.filled*o.price):'—',badge(o.status)
+     ]),'No orders match these filters.'),btn('Export CSV','export-history'))
+   : historyTab==='signals'
+   ? panel('Signal log','Deterministic and AI-confirmed trade decisions.',table(['Time','Asset','Strategy','Direction','Source','Rationale'],filteredSignals.map(s=>[
+       stamp(s.t),esc(s.symbol),esc(s.strategy)+' v'+s.version,badge(s.direction),esc(s.source),esc(s.rationale)
+     ]),'No signals match these filters.'))
+   : panel('Backtest runs','Historical replay snapshots.',table(['Run time','Strategy','Asset','Period','Capital','Final','Return','Max DD','Trades'],state.runs.map(r=>[
+       stamp(r.t),esc(r.name)+' v'+r.version,esc(r.symbol),esc(r.start)+' → '+esc(r.end),usd(r.capital),usd(r.final),`<span class="${color(r.final-r.capital)}">${pct(100*(r.final/r.capital-1))}</span>`,pct(r.drawdown),num(r.tradeCount??r.trades.length)
+     ]),'No backtest runs saved yet.'),link('Run backtest','backtesting',true));
+ return page('Execution audit','History','Inspect filled trades, strategy signals, and historical backtests.',btn('Export CSV','export-history'))+
+   `<div class="metrics">${metric('Filled orders',filled.length,filteredOrders.length+' total matching','portfolio')}${metric('Buy volume',usd(buyVol),'Filled purchases','wallet',true)}${metric('Sell volume',usd(sellVol),'Filled sales','equity')}${metric('Signals logged',filteredSignals.length,state.runs.length+' backtests saved','bot',true)}</div>`+
+   `<div class="stack">${panel('Filters','Slice executions and signals by asset, strategy, side, or date.',form('history',filterFields,submit('Apply filters')))}${tabs}${content}</div>`;
+}
+const renderers={dashboard,trading,session,screener,strategies,backtesting,portfolio,history:historyPage,settings,profile};
 function clearWorkspace(){
  state=null;editor=null;runA='';runB=null;online=false;
  write('ft-cache',null);write('ft-draft',null);
@@ -481,6 +572,16 @@ document.addEventListener('click',async event=>{
  if(action==='watch'){selected=value;chartMode='Price'}
  if(action==='range')range=value;
  if(action==='chart')chartMode=value;
+ if(action==='tv-style')tvStyle=value;
+ if(action==='tv-range')tvRange=value;
+ if(action==='tv-bot')tvBotId=value;
+ if(action==='history-tab')historyTab=value;
+ if(action==='export-history'){
+   const rows=[['Time','Asset','Strategy','Side','Qty','Filled','Price','Status'],...state.orders.map(o=>[o.filledAt??o.t??'',o.symbol??'',o.strategy??'External',o.side??'',o.qty??'',o.filled??'',o.price??'',o.status??''])];
+   const csv=rows.map(r=>r.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(',')).join('\n');
+   const a=document.createElement('a');a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(csv);a.download='fasttrader-history.csv';a.click();
+   toast('Exported trade history CSV.');return;
+ }
  if(action==='asset')assetClass=value;
  if(action==='bot-filter')botFilter=value;
  if(action==='edit')editor={...version(value)};

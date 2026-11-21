@@ -19,6 +19,12 @@ main{max-width:1630px;margin:0 auto;padding:27px 30px 36px}.page-title{display:f
 .auth-card .actions{margin-top:4px}
 .auth-card .actions .primary{min-width:112px}
 .bot-session-link:hover{background:#182332}.bot-name{color:var(--mint);text-decoration:underline;text-underline-offset:3px}.bot-filters+div tbody tr:has(.bot-name){cursor:pointer}.bot-filters+div tbody tr:has(.bot-name):hover{background:#182332}
+.tv-legend{display:flex;flex-wrap:wrap;gap:14px;padding:0 16px 8px;font-size:11px;color:var(--muted)}
+.tv-legend span{display:inline-flex;align-items:center;gap:6px}
+.tv-dot{display:inline-block;width:9px;height:9px;border-radius:50%}
+.tv-dot.buy{background:var(--mint)}.tv-dot.sell{background:var(--red)}.tv-dot.entry{background:var(--blue);border-radius:2px;height:3px;width:12px}
+.tv-bot-tabs{display:flex;flex-wrap:wrap;gap:7px}
+.tv-bot-tabs .button[aria-pressed=true]{border-color:#36806b;color:var(--mint);background:#17332d}
 .watch-list{max-height:313px;overflow:auto}
 .mobile-brand,.mobile-avatar,.mobile-nav{display:none}
 .bell-button{position:relative}

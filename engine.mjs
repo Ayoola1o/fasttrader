@@ -27,10 +27,65 @@ function entryQty(budget, price, rules) {
   return qty >= rules.minimum && qty * price >= rules.minValue ? qty : 0;
 }
 
+export const timeframes = { '1Min': 60000, '5Min': 300000, '15Min': 900000, '1Hour': 3600000 };
+export const strategyModes = ['momentum', 'mean_reversion', 'breakout'];
+
 export const defaults = {
-  name: 'Momentum Alpha', symbol: 'SPY', period: 12, entry: 0.1, exit: -0.1,
-  size: 10, exposure: 20, dailyLoss: 3, stop: 2, take: 4, cooldown: 5, ai: false
+  name: 'Momentum Alpha', symbol: 'SPY', mode: 'momentum', timeframe: '1Min', period: 12, entry: 0.1, exit: -0.1,
+  size: 10, exposure: 20, dailyLoss: 3, stop: 2, take: 4, atrStop: 0, cooldown: 5, ai: false
 };
+
+export function aggregateBars(bars, timeframe = '1Min') {
+  const ms = timeframes[timeframe] ?? 60000;
+  if (!Array.isArray(bars) || !bars.length || ms <= 60000) return bars ?? [];
+  const out = [];
+  for (const bar of bars) {
+    const ts = Date.parse(bar.t);
+    if (!Number.isFinite(ts)) continue;
+    const bucket = Math.floor(ts / ms) * ms;
+    const prev = out.at(-1);
+    const h = Number.isFinite(bar.h) ? bar.h : Math.max(bar.o, bar.c);
+    const l = Number.isFinite(bar.l) ? bar.l : Math.min(bar.o, bar.c);
+    if (prev && prev._bucket === bucket) {
+      prev.h = Math.max(prev.h, h);
+      prev.l = Math.min(prev.l, l);
+      prev.c = bar.c;
+      prev.v = (prev.v ?? 0) + (bar.v ?? 0);
+      prev.t = bar.t;
+    } else {
+      out.push({ _bucket: bucket, t: bar.t, o: bar.o, h, l, c: bar.c, v: bar.v ?? 0, vw: bar.vw ?? bar.c });
+    }
+  }
+  return out.map(({ _bucket, ...b }) => b);
+}
+
+export function computeATR(bars, period = 14) {
+  if (!Array.isArray(bars) || bars.length < 2) return null;
+  const trs = [];
+  const slice = bars.slice(-(period + 1));
+  for (let i = 1; i < slice.length; i++) {
+    const cur = slice[i], prev = slice[i - 1];
+    const h = Number.isFinite(cur.h) ? cur.h : Math.max(cur.o, cur.c);
+    const l = Number.isFinite(cur.l) ? cur.l : Math.min(cur.o, cur.c);
+    trs.push(Math.max(h - l, Math.abs(h - prev.c), Math.abs(l - prev.c)));
+  }
+  return trs.length ? trs.reduce((sum, v) => sum + v, 0) / trs.length : null;
+}
+
+export function computeRSI(closes, period = 14) {
+  if (!Array.isArray(closes) || closes.length < 2) return null;
+  const slice = closes.slice(-(period + 1));
+  let gains = 0, losses = 0;
+  for (let i = 1; i < slice.length; i++) {
+    const diff = slice[i] - slice[i - 1];
+    if (diff > 0) gains += diff;
+    else losses -= diff;
+  }
+  const n = slice.length - 1;
+  const avgGain = gains / n, avgLoss = losses / n;
+  if (avgLoss === 0) return avgGain === 0 ? 50 : 100;
+  return 100 - 100 / (1 + avgGain / avgLoss);
+}
 
 export function contiguousBars(bars, period, maxGapMs = 180000) {
   if (!Array.isArray(bars) || !bars.length) return [];
@@ -88,24 +143,53 @@ export function strategy(input) {
   const cooldown = input.cooldown === undefined ? 0 : input.cooldown;
   if (!Number.isInteger(cooldown) || cooldown < 0 || cooldown > 60) throw Error('Invalid value for cooldown');
   result.cooldown = cooldown;
+  const mode = input.mode ?? 'momentum';
+  if (!strategyModes.includes(mode)) throw Error('Invalid strategy mode.');
+  result.mode = mode;
+  const timeframe = input.timeframe ?? '1Min';
+  if (!Object.hasOwn(timeframes, timeframe)) throw Error('Invalid timeframe.');
+  result.timeframe = timeframe;
+  const atrStop = input.atrStop === undefined ? 0 : input.atrStop;
+  if (!Number.isFinite(atrStop) || atrStop < 0 || atrStop > 10) throw Error('Invalid value for atrStop');
+  result.atrStop = atrStop;
   return result;
 }
 
 export function decision(s, closes, account, position, price, rules = isCrypto(s.symbol) ? cryptoReplayRules : null, options = {}) {
   if (!Number.isFinite(price) || price <= 0) return null;
+  const mode = s.mode ?? 'momentum';
   const warmedUp = options.warmedUp !== false && closes.length >= s.period;
   const pnl = position?.qty > 0 ? 100 * (price / position.entry - 1) : 0;
   const limit = account.equity <= account.dayStart * (1 - s.dailyLoss / 100);
+  const effectiveStop = position?.qty > 0 && s.atrStop > 0 && Number.isFinite(options.atr) && options.atr > 0
+    ? Math.min(s.stop, 100 * (s.atrStop * options.atr) / position.entry)
+    : s.stop;
   if (position?.qty > 0) {
-    const protective = limit || pnl <= -s.stop || pnl >= s.take;
+    const protective = limit || pnl <= -effectiveStop || pnl >= s.take;
     if (protective) {
-      return { side: 'sell', qty: position.qty, protective: true, stopLoss: !limit && pnl <= -s.stop,
-        rationale: limit ? 'Maximum daily loss reached' : pnl <= -s.stop ? 'Stop-loss reached' : 'Take-profit reached' };
+      return { side: 'sell', qty: position.qty, protective: true, stopLoss: !limit && pnl <= -effectiveStop,
+        rationale: limit ? 'Maximum daily loss reached' : pnl <= -effectiveStop ? (s.atrStop > 0 ? `ATR stop-loss reached (-${effectiveStop.toFixed(2)}%)` : 'Stop-loss reached') : 'Take-profit reached' };
     }
     if (!warmedUp) return null;
     const window = closes.slice(-s.period);
     const average = window.reduce((sum, value) => sum + value, 0) / window.length;
-    const momentum = 100 * (closes.at(-1) / average - 1);
+    const latestClose = closes.at(-1);
+    if (mode === 'mean_reversion') {
+      const rsi = computeRSI(closes, Math.min(14, s.period));
+      if (latestClose >= average || (rsi !== null && rsi >= 65)) {
+        return { side: 'sell', qty: position.qty, protective: false, rationale: rsi !== null && rsi >= 65 ? `Mean reversion exit (RSI ${rsi.toFixed(1)})` : 'Price reverted to its moving average' };
+      }
+      return null;
+    }
+    if (mode === 'breakout') {
+      const prior = window.slice(0, -1);
+      const channelLow = prior.length ? Math.min(...prior) : average;
+      if (latestClose < channelLow) {
+        return { side: 'sell', qty: position.qty, protective: false, rationale: 'Price broke below the Donchian channel low' };
+      }
+      return null;
+    }
+    const momentum = 100 * (latestClose / average - 1);
     if (momentum < s.exit) {
       return { side: 'sell', qty: position.qty, protective: false, rationale: 'Price fell below the exit threshold' };
     }
@@ -114,11 +198,34 @@ export function decision(s, closes, account, position, price, rules = isCrypto(s
   if (!warmedUp || limit || options.cooldown > 0 || (!rules && options.volume === 0)) return null;
   const window = closes.slice(-s.period);
   const average = window.reduce((sum, value) => sum + value, 0) / window.length;
-  const momentum = 100 * (closes.at(-1) / average - 1);
-  if (momentum <= s.entry) return null;
+  const latestClose = closes.at(-1);
+  let rationale = null;
+  if (mode === 'mean_reversion') {
+    const variance = window.reduce((sum, v) => sum + (v - average) ** 2, 0) / window.length;
+    const std = Math.sqrt(variance);
+    const z = std > 0 ? (latestClose - average) / std : 0;
+    const threshold = Math.max(0.5, s.entry || 1.5);
+    const rsi = computeRSI(closes, Math.min(14, s.period));
+    if (z <= -threshold && (rsi === null || rsi <= 40)) {
+      rationale = `Mean reversion dip (Z ${z.toFixed(2)}, RSI ${(rsi ?? 0).toFixed(0)})`;
+    }
+  } else if (mode === 'breakout') {
+    const prior = window.slice(0, -1);
+    const channelHigh = prior.length ? Math.max(...prior) : average;
+    const breakoutPct = 100 * (latestClose / channelHigh - 1);
+    if (breakoutPct > s.entry) {
+      rationale = `Donchian breakout +${breakoutPct.toFixed(2)}% above ${s.period}-bar high`;
+    }
+  } else {
+    const momentum = 100 * (latestClose / average - 1);
+    if (momentum > s.entry) {
+      rationale = 'Price is ' + momentum.toFixed(2) + '% above its moving average';
+    }
+  }
+  if (!rationale) return null;
   const budget = Math.min(account.equity * s.size / 100, account.equity * s.exposure / 100 - account.exposure, account.cash);
   const qty = entryQty(budget, price, rules);
-  return qty > 0 ? { side: 'buy', qty, rationale: 'Price is ' + momentum.toFixed(2) + '% above its moving average' } : null;
+  return qty > 0 ? { side: 'buy', qty, rationale } : null;
 }
 
 export function replay(s, bars, options) {
@@ -127,8 +234,10 @@ export function replay(s, bars, options) {
   const historyBars = [];
   const rules = isCrypto(s.symbol) ? cryptoReplayRules : null;
   const budgetCap = Number.isFinite(options.budget) && options.budget > 0 ? options.budget : Infinity;
-  const maxGapMs = options.maxGapMs ?? 180000;
-  for (const bar of bars) {
+  const tfMs = timeframes[s.timeframe ?? '1Min'] ?? 60000;
+  const maxGapMs = options.maxGapMs ?? Math.max(180000, tfMs * 3);
+  const series = aggregateBars(bars, s.timeframe ?? '1Min');
+  for (const bar of series) {
     const date = bar.t.slice(0, 10);
     if (date !== day) {
       day = date;
@@ -152,7 +261,9 @@ export function replay(s, bars, options) {
       pending = null;
     }
     if (position && Number.isFinite(bar.l) && Number.isFinite(bar.h) && bar.l > 0 && bar.h >= bar.l) {
-      const stopPrice = position.entry * (1 - s.stop / 100);
+      const atr = s.atrStop > 0 ? computeATR(historyBars, Math.min(14, s.period)) : null;
+      const stopPct = s.atrStop > 0 && atr > 0 ? Math.min(s.stop, 100 * (s.atrStop * atr) / position.entry) : s.stop;
+      const stopPrice = position.entry * (1 - stopPct / 100);
       const takePrice = position.entry * (1 + s.take / 100);
       const stopped = bar.l <= stopPrice;
       const trigger = stopped ? Math.min(bar.o, stopPrice) : bar.h >= takePrice ? Math.max(bar.o, takePrice) : null;
@@ -173,9 +284,11 @@ export function replay(s, bars, options) {
     curve.push({ t: bar.t, value: equity, drawdown: 100 * (equity / peak - 1) });
     historyBars.push(bar);
     const window = contiguousBars(historyBars, s.period, maxGapMs);
+    const atr = s.atrStop > 0 ? computeATR(window, Math.min(14, s.period)) : null;
     pending = decision(s, window.map(b => b.c), { equity, cash: Math.min(cash, budgetCap), dayStart, exposure }, position, bar.c, rules, {
       warmedUp: window.length >= s.period,
       cooldown,
+      atr,
       volume: Number.isFinite(bar.v) ? bar.v : undefined
     });
     if (cooldown > 0) cooldown--;
