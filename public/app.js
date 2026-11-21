@@ -33,7 +33,7 @@ const form=(id,fields,tail)=>`<form class="form" id="${id}"><div class="fields">
 function read(k){try{return JSON.parse(localStorage.getItem(k))}catch{return null}}
 function write(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch{}}
 const localWorkspace=['127.0.0.1','localhost'].includes(location.hostname);
-let authInfo=null,authMode='login',authRevision=0;
+let authInfo=null,authMode='login',authRevision=0,authError='';
 let state=null,online=false,active='',selected='',chartMode='Price',range='1H',assetClass='Stocks',editor=null,editorRoute='',runA='',runB=null,pending=false,syncing=false,toastTimer;
 const ranges={'15M':15,'1H':60,'4H':240,'1D':1440};
 const screen={search:'',volume:0,volatility:0};
@@ -338,12 +338,19 @@ function authenticationView(){
 }
 function render(force=false){
  const signedOut=authInfo?.required&&!authInfo.authenticated;
- document.body.classList.toggle('auth-screen',Boolean(signedOut));
+ const hostedUnreachable=!localWorkspace&&!authInfo&&!state;
+ document.body.classList.toggle('auth-screen',Boolean(signedOut||hostedUnreachable));
  const signOut=$('#sign-out');
  if(signOut)signOut.hidden=!authInfo?.required||!authInfo.authenticated;
  const main=$('#view');
  if(signedOut){
    const markup=authenticationView();
+   if(main.dataset.html!==markup){main.innerHTML=markup;main.dataset.html=markup}
+   return;
+ }
+ if(hostedUnreachable){
+   const msg=authError||'Connecting to FastTrader worker…';
+   const markup=`<section class="panel auth-card"><div class="auth-heading"><img src="/mark.svg" alt=""><h1>FastTrader</h1><p class="sub">${esc(msg)}</p></div><div class="form"><button type="button" class="button primary" data-action="retry-connect">Retry connection</button></div></section>`;
    if(main.dataset.html!==markup){main.innerHTML=markup;main.dataset.html=markup}
    return;
  }
@@ -399,7 +406,13 @@ async function refresh(force=false){
    if(!navigator.onLine)throw Error('Offline');
    if(!authInfo||authInfo.required&&!authInfo.authenticated){
      const session=await fetch('/api/auth',{cache:'no-store',signal:AbortSignal.timeout(5500)});
-     if(!session.ok)throw Error('Unavailable');
+     if(!session.ok){
+       let err='Worker unavailable ('+session.status+').';
+       try{const j=await session.json();if(j?.error)err=j.error}catch{}
+       authError=err;
+       throw Error(err);
+     }
+     authError='';
      const status=await session.json();
      if(revision!==authRevision)return;
      authInfo=status;
@@ -450,6 +463,7 @@ document.addEventListener('click',async event=>{
  }
  const {action,value}=el.dataset;
  if(action==='auth-mode'&&!pending){authMode=value;render(true);return}
+ if(action==='retry-connect'&&!pending){authError='Retrying…';render(true);refresh(true);return}
  if(action==='sign-out'&&!pending){
    pending=true;el.disabled=true;
    authRevision++;
