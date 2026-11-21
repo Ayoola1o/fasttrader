@@ -8,6 +8,7 @@ trading:'M3 12h4l3-7 4 14 3-7h4',
 equity:'m3 17 5-5 4 3 8-9m-5 0h5v5',wallet:'M3 6h17v13H3zm17 4h-6v5h6',bot:'M5 8h14v11H5zM12 4v4M2 12v3m20-3v3M9 12h.01M15 12h.01M9 16h6',plus:'M12 5v14M5 12h14'};
 const icon=k=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${paths[k]}"/></svg>`;
 const $=s=>document.querySelector(s);
+function timeoutSignal(ms){if(typeof AbortSignal!=='undefined'&&AbortSignal.timeout)return AbortSignal.timeout(ms);if(typeof AbortController==='undefined')return undefined;const c=new AbortController();setTimeout(()=>c.abort(),ms);return c.signal}
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
 const usd=v=>Number.isFinite(v)?new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(v):'—';
 const num=v=>Number.isFinite(v)?v.toLocaleString('en-US',{maximumFractionDigits:2}):'—';
@@ -202,7 +203,7 @@ function session(){
  const holding=book.qty>0;
  const positionStatus=open.some(order=>order.side==='sell')?'Sell pending':holding?'Holding':open.some(order=>order.side==='buy')?'Buy pending':book.sellFills?'Sold':'Flat';
  const realized=book.complete?book.realized:null;
- const versions=state.strategies.filter(s=>s.id===bot.id).toReversed().map(s=>[s.version,s.symbol+' · v'+s.version]);
+ const versions=state.strategies.filter(s=>s.id===bot.id).slice().reverse().map(s=>[s.version,s.symbol+' · v'+s.version]);
  const requestedVersion=params().get('version')??bot.version;
  const selectedVersion=versions.some(([v])=>String(v)===String(requestedVersion))?requestedVersion:'';
  const moneyChange=value=>`<span class="${color(value)}">${usd(value)}</span>`;
@@ -355,7 +356,7 @@ function render(force=false){
    return;
  }
  const route=location.hash.slice(1).split('?')[0];
- const next=Object.hasOwn(pages,route)?route:'dashboard',changed=next!==active;
+ const next=Object.prototype.hasOwnProperty.call(pages,route)?route:'dashboard',changed=next!==active;
  active=next;chrome();
  if(!state){main.innerHTML=empty('Connect to FastTrader to load the workspace.');main.dataset.html='';return}
  if(!force&&!changed&&(pending||document.activeElement?.closest('form, .plot, #run-select')||main.querySelector('.plot:hover')))return;
@@ -364,7 +365,7 @@ function render(force=false){
  if(markup!==main.dataset.html){main.innerHTML=markup;main.dataset.html=markup}
 }
 async function api(path,data){
- const res=await fetch('/api/'+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data),signal:AbortSignal.timeout(path==='backtest'?70000:30000)});
+ const res=await fetch('/api/'+path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(data),signal:timeoutSignal(path==='backtest'?70000:30000)});
  const result=await res.json();
  if(!res.ok){
    if(res.status===401&&path!=='auth') signInRequired();
@@ -405,7 +406,7 @@ async function refresh(force=false){
  try{
    if(!navigator.onLine)throw Error('Offline');
    if(!authInfo||authInfo.required&&!authInfo.authenticated){
-     const session=await fetch('/api/auth',{cache:'no-store',signal:AbortSignal.timeout(5500)});
+     const session=await fetch('/api/auth',{cache:'no-store',credentials:'same-origin',signal:timeoutSignal(15000)});
      if(!session.ok){
        let err='Worker unavailable ('+session.status+').';
        try{const j=await session.json();if(j?.error)err=j.error}catch{}
@@ -425,7 +426,7 @@ async function refresh(force=false){
        editor??=read('ft-draft');
      }
    }
-   const res=await fetch('/api/state',{cache:'no-store',signal:AbortSignal.timeout(4500)});
+   const res=await fetch('/api/state',{cache:'no-store',credentials:'same-origin',signal:timeoutSignal(10000)});
    if(revision!==authRevision)return;
    if(res.status===401){signInRequired();return}
    if(!res.ok)throw Error('Unavailable');
