@@ -19,9 +19,21 @@
   </div>
 </aside>
 <div class="workspace">
-  <header class="topbar"><div id="crumb">Workspace <span>/</span> <strong>Dashboard</strong></div><div class="top-actions"><span class="connection" id="connection"><i class="dot"></i> Connecting</span><a class="icon-button" href="#settings" aria-label="Notifications" id="bell"></a><button type="button" class="button" id="sign-out" data-action="sign-out" hidden>Sign out</button></div></header>
+  <header class="topbar">
+    <a class="mobile-brand" href="#dashboard"><img src="/mark.svg" alt=""><span>Fast<span>Trader</span></span></a>
+    <div id="crumb">Workspace <span>/</span> <strong>Dashboard</strong></div>
+    <div class="top-actions">
+      <span class="connection" id="connection"><i class="dot"></i> Connecting</span>
+      <button type="button" class="icon-button bell-button" id="bell" data-action="toggle-notifs" aria-label="Notifications" aria-expanded="false"></button>
+      <a class="mobile-avatar" href="#profile" id="mobile-avatar" aria-label="Profile">PT</a>
+      <button type="button" class="button" id="sign-out" data-action="sign-out" hidden>Sign out</button>
+    </div>
+  </header>
   <main id="view"><p class="muted">Loading workspace…</p></main>
 </div>
+<nav id="mobile-nav" class="mobile-nav" aria-label="Mobile navigation"></nav>
+<div id="notif-backdrop" class="notif-backdrop" data-action="close-notifs" hidden></div>
+<aside id="notif-drawer" class="notif-drawer" aria-label="Notifications" hidden></aside>
 <div id="toast" role="status" hidden></div>
 </body>
 </html>

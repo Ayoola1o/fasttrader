@@ -1,3 +1,4 @@
 .env
 .fasttrader/
 node_modules/
+/.env.example

@@ -111,7 +111,7 @@ export function decision(s, closes, account, position, price, rules = isCrypto(s
     }
     return null;
   }
-  if (!warmedUp || limit || options.cooldown > 0 || options.volume === 0) return null;
+  if (!warmedUp || limit || options.cooldown > 0 || (!rules && options.volume === 0)) return null;
   const window = closes.slice(-s.period);
   const average = window.reduce((sum, value) => sum + value, 0) / window.length;
   const momentum = 100 * (closes.at(-1) / average - 1);

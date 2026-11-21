@@ -338,7 +338,9 @@ function orderContext(bot, s, bars) {
   const freeBuyingPower = accountReserved === null ? 0 : Math.max(0, state.account.buyingPower - accountReserved);
   const freeCrypto = accountReserved === null ? 0 : Math.max(0, (state.account.cryptoBuyingPower ?? state.account.cash) - accountReserved);
   const cash = Math.min(freeCash, freeBuyingPower, ledger.available, rules ? freeCrypto : Infinity);
-  const account = { ...state.account, cash };
+  const botReserved = reservedBuys(botOrders(bot.id)) ?? 0;
+  const botExposure = (position ? position.qty * price : 0) + botReserved;
+  const account = { ...state.account, cash, exposure: botExposure };
   const window = contiguousBars(bars, s.period);
   const warmedUp = window.length >= s.period;
   const cooldown = bot.cooldownBars ?? 0;

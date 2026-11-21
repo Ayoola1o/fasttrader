@@ -39,6 +39,7 @@ const ranges={'15M':15,'1H':60,'4H':240,'1D':1440};
 const screen={search:'',volume:0,volatility:0};
 const cryptoScreen={search:'',volume:0,volatility:0};
 let botFilter='all', launchVersion=null, launchInstrument=null, launchBudget='', fundBudget=null;
+let notifOpen=false, notifFilter='all', lastSeenNotif='';
 const historyFilter={asset:'',strategy:'',start:'',end:''};
 const key=s=>s.id+'@'+s.version;
 const version=k=>state.strategies.find(s=>key(s)===k);
@@ -54,8 +55,19 @@ function chrome(){
    nav.innerHTML=groups.map(([label,items])=>`<span class="nav-label">${label}</span>`+items.map(k=>`<a href="#${k}" class="nav-link ${k===active||k==='trading'&&active==='session'?'active':''}" ${k===active?'aria-current="page"':''}>${icon(k)}${pages[k]}</a>`).join('')).join('');
    nav.dataset.page=active;
  }
+ const mobileNav=$('#mobile-nav');
+ if(mobileNav&&mobileNav.dataset.page!==active){
+   const mobileTabs=[['dashboard','Home'],['trading','Bots'],['screener','Markets'],['strategies','Rules'],['portfolio','Assets']];
+   mobileNav.innerHTML=mobileTabs.map(([k,label])=>`<a href="#${k}" class="mobile-tab ${k===active||k==='trading'&&active==='session'?'active':''}" ${k===active?'aria-current="page"':''}>${icon(k)}<span>${label}</span></a>`).join('');
+   mobileNav.dataset.page=active;
+ }
  $('#crumb').innerHTML='Workspace <span>/</span> <strong>'+pages[active]+'</strong>';
- $('#bell').innerHTML=icon('bell');
+ const unread=state?.events?state.events.filter(e=>!lastSeenNotif||e.t>lastSeenNotif).length:0;
+ const bell=$('#bell');
+ if(bell){
+   bell.innerHTML=icon('bell')+(unread?`<span class="bell-badge">${unread>9?'9+':unread}</span>`:'');
+   bell.setAttribute('aria-expanded',String(notifOpen));
+ }
  if(!state)return;
  const status=$('#connection');
  status.className='connection '+(online?tone(state.feed):'bad');
@@ -64,7 +76,28 @@ function chrome(){
  $('#workspace-mode').textContent=state.mode==='demo'?'Demo workspace':'Alpaca Paper';
  $('#workspace-source').textContent=online?'Broker '+state.broker:syncLabel();
  $('#profile-name').textContent=state.profile.name;
- $('#avatar').textContent=state.profile.name.split(/ +/).slice(0,2).map(x=>x[0]).join('').toUpperCase();
+ const initials=state.profile.name.split(/ +/).slice(0,2).map(x=>x[0]).join('').toUpperCase()||'PT';
+ $('#avatar').textContent=initials;
+ const mobileAvatar=$('#mobile-avatar');
+ if(mobileAvatar)mobileAvatar.textContent=initials;
+ renderNotifDrawer();
+}
+function renderNotifDrawer(){
+ const backdrop=$('#notif-backdrop'), drawer=$('#notif-drawer');
+ if(!backdrop||!drawer)return;
+ const signedOut=authInfo?.required&&!authInfo.authenticated;
+ const open=notifOpen&&!signedOut&&Boolean(state);
+ backdrop.hidden=!open;
+ drawer.hidden=!open;
+ if(!open)return;
+ const kinds=[['all','All'],['signals','Signals'],['fills','Fills'],['risk','Risk'],['connections','Feed']];
+ const events=(state.events??[]).filter(e=>notifFilter==='all'||e.kind===notifFilter);
+ const kindTone=k=>k==='fills'||k==='signals'?'good':k==='connections'?'bad':'';
+ drawer.innerHTML=`<div class="notif-handle"><span></span></div>
+  <div class="notif-head"><div><b>Notifications</b><small>${syncLabel()}</small></div><div class="actions">${btn('Mark read','mark-notifs-read')}${btn('Close','close-notifs')}</div></div>
+  <div class="notif-filters">${kinds.map(([k,label])=>btn(label,'notif-filter',k,false,`aria-pressed="${notifFilter===k}"`)).join('')}</div>
+  <div class="notif-list">${events.length?events.map(e=>`<div class="notif-item"><div class="inline">${badge(e.kind??'alert',kindTone(e.kind))}<small>${stamp(e.t)}</small></div><p>${esc(e.message)}</p></div>`).join(''):empty('No notifications in this category yet.')}</div>
+  <div class="notif-foot"><a class="button" href="#settings" data-action="close-notifs">Alert preferences &amp; Integrations →</a></div>`;
 }
 let chartId=0;
 function plot(points,unit='price'){
@@ -426,6 +459,10 @@ document.addEventListener('click',async event=>{
    return;
  }
  if(!state)return;
+ if(action==='toggle-notifs'){notifOpen=!notifOpen;if(notifOpen&&state.events?.[0])lastSeenNotif=state.events[0].t;chrome();return}
+ if(action==='close-notifs'){notifOpen=false;chrome();return}
+ if(action==='notif-filter'){notifFilter=value;renderNotifDrawer();return}
+ if(action==='mark-notifs-read'){if(state.events?.[0])lastSeenNotif=state.events[0].t;chrome();toast('Notifications marked read.');return}
  if(action==='watch'){selected=value;chartMode='Price'}
  if(action==='range')range=value;
  if(action==='chart')chartMode=value;
@@ -545,6 +582,7 @@ document.addEventListener('keydown',event=>{
 });
 window.addEventListener('hashchange',()=>{
  const route=location.hash.split('?')[0];
+ notifOpen=false;
  if(route==='#trading'){launchVersion=null;launchInstrument=null;launchBudget=''}
  if(route==='#session')fundBudget=null;
  if(state&&route==='#strategies'&&params().has('new')&&!params().has('symbol'))editor=fresh();
