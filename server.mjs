@@ -33,6 +33,8 @@ let state = {
 await mkdir(directory, { recursive: true });
 const auth = await createAuth({
   file: directory + '/auth.json', signupCode,
+  ownerEmail: process.env.FASTTRADER_OWNER_EMAIL,
+  ownerPassword: process.env.FASTTRADER_OWNER_PASSWORD,
   required: Boolean(bridgeSecret || signupCode || process.env.FASTTRADER_AUTH === 'required'),
   secure: Boolean(bridgeSecret)
 });

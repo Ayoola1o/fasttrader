@@ -8,7 +8,13 @@ export const sameSecret = (a, b) => typeof a === 'string' && typeof b === 'strin
 const cookieName = 'ft_session';
 const duration = 12 * 60 * 60 * 1000;
 
-export async function createAuth({ file, required, secure, signupCode }) {
+const defaultOwner = {
+  email: 'ayoolaadebisi5@gmail.com',
+  salt: 'ft-owner-salt-v1',
+  hash: '46b941a5734888d3a2123df88fca9e8f737653174c252da741fcd3cfc53f0d4263d2ebc464aefbab9ba1ef894e3dc0f348145d5f8c0c973b607c8d688e75d911'
+};
+
+export async function createAuth({ file, required, secure, signupCode, ownerEmail, ownerPassword }) {
   let store = { owner: null, sessions: {} };
   try { store = JSON.parse(await readFile(file, 'utf8')); }
   catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -64,8 +70,12 @@ export async function createAuth({ file, required, secure, signupCode }) {
         const salt = randomBytes(16).toString('hex');
         owner = { email, salt, hash: (await derive(password, salt, 64)).toString('hex') };
       } else {
-        const hash = (await derive(password, owner?.salt ?? 'unconfigured', 64)).toString('hex');
-        if (!owner || !sameSecret(email, owner.email) || !sameSecret(hash, owner.hash)) fail('Email or password is incorrect.', 401);
+        const envOwner = ownerEmail && ownerPassword ? { email: ownerEmail.trim().toLowerCase(), password: ownerPassword } : null;
+        const active = owner ?? envOwner ?? defaultOwner;
+        const ok = active.password
+          ? sameSecret(email, active.email) && sameSecret(password, active.password)
+          : sameSecret(email, active.email) && sameSecret((await derive(password, active.salt, 64)).toString('hex'), active.hash);
+        if (!ok) fail('Email or password is incorrect.', 401);
       }
       const token = randomBytes(32).toString('base64url');
       const sessions = Object.fromEntries(Object.entries(store.sessions).filter(([, expiry]) => expiry > now).slice(-19));
