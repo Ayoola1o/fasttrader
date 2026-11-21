@@ -9,7 +9,8 @@ import { runInNewContext } from 'node:vm';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { defaults, decision, replay, botLedger } from './engine.mjs';
+import { defaults, decision, replay, botLedger, contiguousBars } from './engine.mjs';
+import { signalProvider } from './signal-ai.mjs';
 import { handleBridge } from './api/bridge.js';
 
 test('replay decides at the close and fills at the next open with costs and sizing limits', () => {
@@ -41,6 +42,53 @@ test('bot budget tracks fills and reduces buying capacity after a realized loss'
   assert.equal(botLedger([buy, fill('sell', 4, 110, 1)], 'SPY', 500).available, 500);
   assert.equal(botLedger([{ ...buy, price:null }], 'SPY', 500).available, 0);
   assert.equal(botLedger([], 'SPY', undefined).available, 0);
+  assert.equal(book.boughtQty, 4);
+});
+
+test('replay honors intrabar stops, budget caps, and default Gemini model', () => {
+  const rules = { ...defaults, period: 2, entry: 0, stop: 2, take: 5 };
+  const bars = [
+    { t: '2026-10-01T12:00:00Z', o: 100, h: 101, l: 99, c: 100 },
+    { t: '2026-10-01T12:01:00Z', o: 100, h: 111, l: 100, c: 110 },
+    { t: '2026-10-01T12:02:00Z', o: 110, h: 112, l: 107, c: 111 }
+  ];
+  const result = replay(rules, bars, { capital: 10000, budget: 350, fees: 0, slippage: 0 });
+  assert.equal(result.trades.length, 2);
+  assert.equal(result.trades[0].qty, 3);
+  assert.equal(result.trades[1].side, 'sell');
+  assert.ok(result.trades[1].price <= 110 * 0.98 + 1e-9);
+  assert.equal(signalProvider({ GEMINI_API_KEY: 'test-key' }).model, 'gemini-2.5-flash');
+});
+
+test('contiguous candle warmup blocks gapped entries while allowing protective exits and stop-loss cooldown', () => {
+  const gapped = [
+    { t: '2026-10-01T12:00:00Z', o: 100, c: 100, v: 500 },
+    { t: '2026-10-01T12:20:00Z', o: 100, c: 115, v: 500 }
+  ];
+  assert.equal(contiguousBars(gapped, 2).length, 1);
+  const rules = { ...defaults, period: 2, entry: 0, stop: 2, take: 5, cooldown: 2 };
+  const account = { equity: 10000, cash: 10000, dayStart: 10000, exposure: 0 };
+  // Entry blocked when not warmed up or on zero-volume bar or during cooldown
+  assert.equal(decision(rules, [115], account, null, 115, null, { warmedUp: false }), null);
+  assert.equal(decision(rules, [100, 115], account, null, 115, null, { warmedUp: true, volume: 0 }), null);
+  assert.equal(decision(rules, [100, 115], account, null, 115, null, { warmedUp: true, cooldown: 1 }), null);
+  // Protective stop-loss exit still fires even when not warmed up
+  const exit = decision(rules, [95], account, { qty: 10, entry: 100 }, 95, null, { warmedUp: false });
+  assert.equal(exit?.side, 'sell');
+  assert.equal(exit?.stopLoss, true);
+  // Replay enforces cooldown after stop-loss before re-entering
+  const bars = [
+    { t: '2026-10-01T12:00:00Z', o: 100, h: 101, l: 99, c: 100, v: 500 },
+    { t: '2026-10-01T12:01:00Z', o: 100, h: 111, l: 100, c: 110, v: 500 },
+    { t: '2026-10-01T12:02:00Z', o: 110, h: 112, l: 107, c: 111, v: 500 },
+    { t: '2026-10-01T12:03:00Z', o: 111, h: 115, l: 111, c: 115, v: 500 },
+    { t: '2026-10-01T12:04:00Z', o: 115, h: 118, l: 115, c: 118, v: 500 },
+    { t: '2026-10-01T12:05:00Z', o: 118, h: 120, l: 118, c: 120, v: 500 }
+  ];
+  const replayed = replay(rules, bars, { capital: 10000, fees: 0, slippage: 0 });
+  const buys = replayed.trades.filter(t => t.side === 'buy');
+  assert.equal(buys.length, 2);
+  assert.equal(buys[1].t, bars[5].t);
 });
 
 async function withDemo(run, mockAI, env = {}) {
@@ -145,21 +193,35 @@ test('screen, version, replay and execute a demo strategy, then pause safely thr
   });
 });
 
-test('crypto is screened separately and a small USD budget drives a fractional bot fill', { timeout: 70000 }, async () => {
+test('saved stock rules can launch a budgeted crypto bot without changing the source strategy', { timeout: 70000 }, async () => {
   await withDemo(async (api, until) => {
     const initial = await api('state');
     const pair = initial.market.find(item => item.symbol === 'BTC/USD');
     assert.equal(pair.assetClass,'crypto');
     assert.equal(pair.freshness,'simulated');
     assert.ok(pair.volume > 0 && pair.eligible);
-    const strategy = await api('strategy',{...defaults,name:'SPY label with BTC instrument',symbol:'BTC/USD',period:2,entry:0});
+    const source = await api('strategy',{...defaults,name:'SPY rules template',symbol:'SPY',period:2,entry:0});
+    const startBot = {id:source.id,version:source.version,action:'running',symbol:'SPY',instrument:'BTC/USD',create:true};
+    await assert.rejects(api('bot',{...startBot,symbol:'BTC/USD',budget:120}), /does not match/);
+    await assert.rejects(api('bot',{...startBot,instrument:'UNSUPPORTED/USD',budget:120}), /supported asset/);
+    await assert.rejects(api('bot',startBot), /Set a bot budget/);
+    assert.equal((await api('state')).strategies.length,initial.strategies.length+1);
+    const seed = await api('bot',{...startBot,budget:5});
+    assert.equal(seed.symbol,'BTC/USD');
+    assert.notEqual(seed.id,source.id);
+    const configured = await api('state');
+    assert.equal(configured.strategies.find(s=>s.id===source.id).symbol,'SPY');
+    const strategy = configured.strategies.find(s=>s.id===seed.id);
+    assert.equal(strategy.sourceStrategy.id,source.id);
+    assert.equal(strategy.period,source.period);
+    assert.equal(strategy.entry,source.entry);
+    await assert.rejects(api('bot',{...startBot,budget:120}), /already uses this strategy/);
     const end = new Date(Date.now() - 86400000).toISOString().slice(0,10);
     const start = new Date(Date.now() - 172800000).toISOString().slice(0,10);
     const run = await api('backtest',{id:strategy.id,version:strategy.version,start,end,capital:1000,fees:1,slippage:2});
     assert.ok((await api('state')).runs.find(item=>item.id===run.id).trades.some(trade=>trade.side==='buy'&&trade.qty>0&&trade.qty<1));
     const input = {id:strategy.id,version:strategy.version};
     await assert.rejects(api('bot',{...input,action:'running',symbol:'SPY',budget:120}), /does not match/);
-    await api('bot',{...input,action:'running',budget:5});
     const waiting = await until(async()=>{
       const s=await api('state');
       return s.bots[strategy.id].lastEvaluation?.direction==='hold'&&s;

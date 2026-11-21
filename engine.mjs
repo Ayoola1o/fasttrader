@@ -29,8 +29,19 @@ function entryQty(budget, price, rules) {
 
 export const defaults = {
   name: 'Momentum Alpha', symbol: 'SPY', period: 12, entry: 0.1, exit: -0.1,
-  size: 10, exposure: 20, dailyLoss: 3, stop: 2, take: 4, ai: false
+  size: 10, exposure: 20, dailyLoss: 3, stop: 2, take: 4, cooldown: 5, ai: false
 };
+
+export function contiguousBars(bars, period, maxGapMs = 180000) {
+  if (!Array.isArray(bars) || !bars.length) return [];
+  const slice = [bars.at(-1)];
+  for (let i = bars.length - 2; i >= 0 && slice.length < period; i--) {
+    const gap = Date.parse(slice[0].t) - Date.parse(bars[i].t);
+    if (!Number.isFinite(gap) || gap <= 0 || gap > maxGapMs) break;
+    slice.unshift(bars[i]);
+  }
+  return slice;
+}
 
 export function botLedger(orders, symbol, budget) {
   const holdings = new Map();
@@ -38,12 +49,13 @@ export function botLedger(orders, symbol, budget) {
   const fills = orders.filter(order => order.filled > 0).toSorted((a, b) =>
     Date.parse(a.filledAt ?? a.t) - Date.parse(b.filledAt ?? b.t));
   for (const order of fills) {
-    const holding = holdings.get(order.symbol) ?? { qty: 0, cost: 0 };
+    const holding = holdings.get(order.symbol) ?? { qty: 0, cost: 0, boughtQty: 0 };
     holdings.set(order.symbol, holding);
     if (!Number.isFinite(order.price) || order.price <= 0) complete = false;
     const value = (order.price ?? 0) * order.filled;
     if (order.side === 'buy') {
       holding.qty += order.filled;
+      holding.boughtQty += order.filled;
       holding.cost += value;
       bought += value;
       buyFills++;
@@ -57,10 +69,10 @@ export function botLedger(orders, symbol, budget) {
       sellFills++;
     }
   }
-  const { qty, cost } = holdings.get(symbol) ?? { qty: 0, cost: 0 };
+  const { qty, cost, boughtQty } = holdings.get(symbol) ?? { qty: 0, cost: 0, boughtQty: 0 };
   const invested = Array.from(holdings.values()).reduce((sum, holding) => sum + holding.cost, 0);
   const available = complete && Number.isFinite(budget) ? Math.max(0, budget + Math.min(0, realized) - invested) : 0;
-  return { qty, cost, invested, bought, sold, realized, buyFills, sellFills, available, complete };
+  return { qty, cost, boughtQty, invested, bought, sold, realized, buyFills, sellFills, available, complete };
 }
 
 export function strategy(input) {
@@ -73,34 +85,49 @@ export function strategy(input) {
     result[key] = value;
   }
   if (!Number.isInteger(result.period) || result.size > result.exposure) throw Error('Use a whole period and size within the exposure limit.');
+  const cooldown = input.cooldown === undefined ? 0 : input.cooldown;
+  if (!Number.isInteger(cooldown) || cooldown < 0 || cooldown > 60) throw Error('Invalid value for cooldown');
+  result.cooldown = cooldown;
   return result;
 }
 
-export function decision(s, closes, account, position, price, rules = isCrypto(s.symbol) ? cryptoReplayRules : null) {
-  if (closes.length < s.period || !Number.isFinite(price) || price <= 0) return null;
-  const window = closes.slice(-s.period);
-  const average = window.reduce((sum, value) => sum + value, 0) / window.length;
-  const momentum = 100 * (closes.at(-1) / average - 1);
+export function decision(s, closes, account, position, price, rules = isCrypto(s.symbol) ? cryptoReplayRules : null, options = {}) {
+  if (!Number.isFinite(price) || price <= 0) return null;
+  const warmedUp = options.warmedUp !== false && closes.length >= s.period;
   const pnl = position?.qty > 0 ? 100 * (price / position.entry - 1) : 0;
   const limit = account.equity <= account.dayStart * (1 - s.dailyLoss / 100);
   if (position?.qty > 0) {
-    if (limit || pnl <= -s.stop || pnl >= s.take || momentum < s.exit) {
-      return { side: 'sell', qty: position.qty, protective: limit || pnl <= -s.stop || pnl >= s.take,
-        rationale: limit ? 'Maximum daily loss reached' : pnl <= -s.stop ? 'Stop-loss reached' : pnl >= s.take ? 'Take-profit reached' : 'Price fell below the exit threshold' };
+    const protective = limit || pnl <= -s.stop || pnl >= s.take;
+    if (protective) {
+      return { side: 'sell', qty: position.qty, protective: true, stopLoss: !limit && pnl <= -s.stop,
+        rationale: limit ? 'Maximum daily loss reached' : pnl <= -s.stop ? 'Stop-loss reached' : 'Take-profit reached' };
+    }
+    if (!warmedUp) return null;
+    const window = closes.slice(-s.period);
+    const average = window.reduce((sum, value) => sum + value, 0) / window.length;
+    const momentum = 100 * (closes.at(-1) / average - 1);
+    if (momentum < s.exit) {
+      return { side: 'sell', qty: position.qty, protective: false, rationale: 'Price fell below the exit threshold' };
     }
     return null;
   }
-  if (limit || momentum <= s.entry) return null;
+  if (!warmedUp || limit || options.cooldown > 0 || options.volume === 0) return null;
+  const window = closes.slice(-s.period);
+  const average = window.reduce((sum, value) => sum + value, 0) / window.length;
+  const momentum = 100 * (closes.at(-1) / average - 1);
+  if (momentum <= s.entry) return null;
   const budget = Math.min(account.equity * s.size / 100, account.equity * s.exposure / 100 - account.exposure, account.cash);
   const qty = entryQty(budget, price, rules);
   return qty > 0 ? { side: 'buy', qty, rationale: 'Price is ' + momentum.toFixed(2) + '% above its moving average' } : null;
 }
 
 export function replay(s, bars, options) {
-  let cash = options.capital, dayStart = cash, peak = cash, day, position, pending;
+  let cash = options.capital, dayStart = cash, peak = cash, day, position, pending, cooldown = 0;
   const curve = [], trades = [];
-  const closes = [];
+  const historyBars = [];
   const rules = isCrypto(s.symbol) ? cryptoReplayRules : null;
+  const budgetCap = Number.isFinite(options.budget) && options.budget > 0 ? options.budget : Infinity;
+  const maxGapMs = options.maxGapMs ?? 180000;
   for (const bar of bars) {
     const date = bar.t.slice(0, 10);
     if (date !== day) {
@@ -113,21 +140,45 @@ export function replay(s, bars, options) {
       const unitCost = price * (1 + options.fees / 10000);
       const equity = cash + (position?.qty ?? 0) * bar.o;
       const qty = buy ? equity <= dayStart * (1 - s.dailyLoss / 100) ? 0 :
-        Math.min(pending.qty, entryQty(Math.min(cash, equity * s.exposure / 100, equity * s.size / 100), unitCost, rules)) : position.qty;
+        Math.min(pending.qty, entryQty(Math.min(cash, budgetCap, equity * s.exposure / 100, equity * s.size / 100), unitCost, rules)) : position.qty;
       if (qty > 0 && (!buy || !rules || qty * price >= rules.minValue)) {
         const fee = qty * price * options.fees / 10000;
         const pnl = buy ? null : qty * (price - position.entry) - fee - position.fee;
         cash += (buy ? -1 : 1) * qty * price - fee;
         position = buy ? { qty, entry: price, fee } : null;
+        if (!buy && pending.stopLoss) cooldown = s.cooldown ?? 0;
         trades.push({ t: bar.t, side: pending.side, qty, price, fee, pnl });
+      }
+      pending = null;
+    }
+    if (position && Number.isFinite(bar.l) && Number.isFinite(bar.h) && bar.l > 0 && bar.h >= bar.l) {
+      const stopPrice = position.entry * (1 - s.stop / 100);
+      const takePrice = position.entry * (1 + s.take / 100);
+      const stopped = bar.l <= stopPrice;
+      const trigger = stopped ? Math.min(bar.o, stopPrice) : bar.h >= takePrice ? Math.max(bar.o, takePrice) : null;
+      if (trigger !== null) {
+        const price = trigger * (1 - options.slippage / 10000);
+        const qty = position.qty;
+        const fee = qty * price * options.fees / 10000;
+        const pnl = qty * (price - position.entry) - fee - position.fee;
+        cash += qty * price - fee;
+        position = null;
+        if (stopped) cooldown = s.cooldown ?? 0;
+        trades.push({ t: bar.t, side: 'sell', qty, price, fee, pnl });
       }
     }
     const exposure = (position?.qty ?? 0) * bar.c;
     const equity = cash + exposure;
     peak = Math.max(peak, equity);
     curve.push({ t: bar.t, value: equity, drawdown: 100 * (equity / peak - 1) });
-    closes.push(bar.c);
-    pending = decision(s, closes, { equity, cash, dayStart, exposure }, position, bar.c);
+    historyBars.push(bar);
+    const window = contiguousBars(historyBars, s.period, maxGapMs);
+    pending = decision(s, window.map(b => b.c), { equity, cash: Math.min(cash, budgetCap), dayStart, exposure }, position, bar.c, rules, {
+      warmedUp: window.length >= s.period,
+      cooldown,
+      volume: Number.isFinite(bar.v) ? bar.v : undefined
+    });
+    if (cooldown > 0) cooldown--;
   }
   return { curve, trades, final: curve.at(-1)?.value ?? cash, drawdown: Math.min(0, ...curve.map(p => p.drawdown)) };
 }

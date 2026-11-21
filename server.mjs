@@ -1,7 +1,7 @@
 import { createServer } from 'node:http';
 import { readFile, mkdir, writeFile, rename } from 'node:fs/promises';
 import { randomUUID, createHash } from 'node:crypto';
-import { instruments, defaults, strategy, decision, replay, synthetic, botLedger, isCrypto, cryptoReplayRules, roundDown } from './engine.mjs';
+import { instruments, defaults, strategy, decision, replay, synthetic, botLedger, isCrypto, cryptoReplayRules, roundDown, contiguousBars } from './engine.mjs';
 import { assessSignal, signalProvider } from './signal-ai.mjs';
 import { createAuth, sameSecret } from './auth.mjs';
 
@@ -22,7 +22,7 @@ const signupCode = process.env.FASTTRADER_SIGNUP_CODE;
 if (signupCode && signupCode.length < 24) throw Error('FASTTRADER_SIGNUP_CODE must have at least 24 characters.');
 const directory = process.env.FASTTRADER_DATA_DIR || '.fasttrader';
 const file = directory + '/' + (demo ? 'demo' : 'alpaca-' + createHash('sha256').update(headers['APCA-API-KEY-ID']).digest('hex').slice(0, 16)) + '.json';
-const terminal = new Set(['filled', 'canceled', 'expired', 'rejected', 'replaced']);
+const terminal = new Set(['filled', 'canceled', 'expired', 'rejected', 'replaced', 'done_for_day']);
 const time = () => new Date().toISOString();
 let state = {
   cash: 100000, account: { equity: 100000, cash: 100000, buyingPower: 100000, dayStart: 100000, exposure: 0 },
@@ -46,6 +46,8 @@ state.cryptoSessionOpen = false;
 const symbols = Object.keys(instruments);
 const feedKey = symbol => isCrypto(symbol) ? 'cryptoFeed' : 'feed';
 const feedEpoch = { feed: 0, cryptoFeed: 0 };
+const polledAt = { feed: 0, cryptoFeed: 0 };
+const wsConnected = { feed: false, cryptoFeed: false };
 let brokerAt = 0, busy = false, simulated = {}, latestDemo = Date.now() - 5000;
 let lastSubmittingBot;
 const eligible = new Set(demo ? symbols : []);
@@ -56,7 +58,9 @@ const sourceFor = symbol => demo ? 'Synthetic market' : isCrypto(symbol) ? 'Alpa
 const validBar = bar => Number.isFinite(bar.c) && bar.c > 0 && Number.isFinite(bar.o) && bar.o > 0;
 const maxAge = 150000;
 const aiLimit = 3;
-const aiLifetime = 12000;
+const aiLifetime = 20000;
+const staleOrderMs = 120000;
+const cryptoSlippageBps = Math.max(0, Math.min(200, Number(process.env.ALPACA_CRYPTO_SLIPPAGE_BPS ?? 25) || 0));
 const pendingAI = new Map();
 let activeAI = 0;
 let queue = Promise.resolve();
@@ -76,7 +80,18 @@ function event(kind, message) {
 }
 async function request(host, path, opts = {}) {
   const response = await fetch(host + path, { ...opts, headers: { ...headers, 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(6500) });
-  if (!response.ok) throw Object.assign(Error('Alpaca request failed (' + response.status + ')'), { status: response.status });
+  if (!response.ok) {
+    let detail = '';
+    try {
+      const payload = await response.json();
+      if (typeof payload?.message === 'string' && payload.message.trim()) detail = ': ' + payload.message.trim();
+    } catch {}
+    const reset = Number(response.headers.get('x-ratelimit-reset'));
+    throw Object.assign(Error('Alpaca request failed (' + response.status + ')' + detail), {
+      status: response.status,
+      resetAt: Number.isFinite(reset) && reset > 0 ? reset * 1000 : null
+    });
+  }
   return response.status === 204 ? null : response.json();
 }
 const broker = (path, opts) => request('https://paper-api.alpaca.markets/v2', path, opts);
@@ -84,22 +99,35 @@ async function history(symbol, start, end) {
   if (demo) return synthetic(symbol, start, end, 60000);
   const params = new URLSearchParams({ symbols: symbol, timeframe: '1Min', start: new Date(start).toISOString(), end: new Date(end).toISOString(), limit: '10000' });
   const crypto = isCrypto(symbol);
-  if (!crypto) params.set('feed', feed === 'delayed_sip' ? 'sip' : feed);
+  if (!crypto) {
+    params.set('feed', feed === 'delayed_sip' ? 'sip' : feed);
+    params.set('adjustment', 'split');
+  }
   const path = crypto ? '/v1beta3/crypto/us/bars?' : '/v2/stocks/bars?';
   const bars = [];
-  do {
-    const page = await request('https://data.alpaca.markets', path + params);
+  for (let pages = 0; pages < 50; pages++) {
+    let page;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        page = await request('https://data.alpaca.markets', path + params);
+        break;
+      } catch (error) {
+        if (error.status !== 429 || attempt === 2) throw error;
+        const wait = error.resetAt ? Math.min(5000, Math.max(500, error.resetAt - Date.now())) : 1000 * (attempt + 1);
+        await new Promise(resolve => setTimeout(resolve, wait));
+      }
+    }
     bars.push(...(page.bars?.[symbol] ?? []).filter(validBar));
     if (!page.next_page_token) break;
     params.set('page_token', page.next_page_token);
-  } while (true);
+  }
   return bars;
 }
 function addBar(symbol, bar) {
   if (!validBar(bar)) return;
   const list = state.bars[symbol] ??= [];
   if (list.at(-1)?.t >= bar.t) return;
-  list.push({ t: bar.t, c: bar.c, o: bar.o, v: bar.v, vw: bar.vw });
+  list.push({ t: bar.t, c: bar.c, o: bar.o, ...(Number.isFinite(bar.h) ? { h: bar.h } : {}), ...(Number.isFinite(bar.l) ? { l: bar.l } : {}), v: bar.v, vw: bar.vw });
   if (list.length > 1500) list.shift();
 }
 function connect(key, retry = 1000) {
@@ -107,7 +135,8 @@ function connect(key, retry = 1000) {
   const channel = crypto ? '/v1beta3/crypto/us' : '/v2/' + feed;
   const subscription = symbols.filter(symbol => feedKey(symbol) === key);
   const socket = new WebSocket('wss://stream.data.alpaca.markets' + channel);
-  state[key] = 'connecting';
+  if (state[key] !== 'polling') state[key] = 'connecting';
+  let nextRetry = Math.min(30000, retry * 2);
   const timeout = setTimeout(() => socket.close(), 10000);
   socket.addEventListener('open', () => socket.send(JSON.stringify({ action: 'auth', key: headers['APCA-API-KEY-ID'], secret: headers['APCA-API-SECRET-KEY'] })));
   socket.addEventListener('message', ({ data }) => {
@@ -116,11 +145,19 @@ function connect(key, retry = 1000) {
         if (msg.T === 'success' && msg.msg === 'authenticated') socket.send(JSON.stringify({ action: 'subscribe', bars: subscription, trades: subscription }));
         if (msg.T === 'subscription') {
           clearTimeout(timeout);
-          retry = 1000;
+          nextRetry = 1000;
+          wsConnected[key] = true;
           state[key] = !crypto && feed === 'delayed_sip' ? 'delayed' : 'live';
           feedEpoch[key] = Date.now();
         }
-        if (msg.T === 'error') socket.close();
+        if (msg.T === 'error') {
+          if (msg.code === 406) nextRetry = 300000;
+          if (state[key] !== 'polling') {
+            console.error((crypto ? 'Crypto' : 'Stock') + ' feed error:', msg.code, msg.msg, msg.code === 406 ? '(using REST polling fallback)' : '');
+            event('connections', (crypto ? 'Crypto' : 'Stock') + ' feed error (' + msg.code + '): ' + msg.msg);
+          }
+          socket.close();
+        }
         if (!subscription.includes(msg.S)) continue;
         if (msg.T === 'b') addBar(msg.S, msg);
         if (msg.T === 't' && msg.p > 0 && (!state.quotes[msg.S] || msg.t > state.quotes[msg.S].t)) state.quotes[msg.S] = { price: msg.p, t: msg.t };
@@ -130,10 +167,43 @@ function connect(key, retry = 1000) {
   socket.addEventListener('error', () => socket.close());
   socket.addEventListener('close', () => {
     clearTimeout(timeout);
-    state[key] = 'offline';
-    event('connections', (crypto ? 'Crypto' : 'Stock') + ' market feed disconnected');
-    setTimeout(() => connect(key, Math.min(30000, retry * 2)), retry);
+    wsConnected[key] = false;
+    if (state[key] !== 'polling') {
+      state[key] = 'offline';
+      event('connections', (crypto ? 'Crypto' : 'Stock') + ' market feed disconnected');
+    }
+    setTimeout(() => connect(key, nextRetry), nextRetry);
   });
+}
+
+async function pollMarket(key) {
+  if (demo || wsConnected[key] || Date.now() - polledAt[key] < 15000) return;
+  polledAt[key] = Date.now();
+  const crypto = key === 'cryptoFeed';
+  const list = symbols.filter(symbol => feedKey(symbol) === key);
+  const params = new URLSearchParams({ symbols: list.join(',') });
+  if (!crypto) params.set('feed', feed === 'delayed_sip' ? 'sip' : feed);
+  const barPath = crypto ? '/v1beta3/crypto/us/latest/bars?' : '/v2/stocks/bars/latest?';
+  const tradePath = crypto ? '/v1beta3/crypto/us/latest/trades?' : '/v2/stocks/trades/latest?';
+  try {
+    const [barRes, tradeRes] = await Promise.all([
+      request('https://data.alpaca.markets', barPath + params),
+      request('https://data.alpaca.markets', tradePath + params)
+    ]);
+    for (const symbol of list) {
+      const bar = barRes.bars?.[symbol];
+      if (bar) addBar(symbol, bar);
+      const trade = tradeRes.trades?.[symbol];
+      if (trade && trade.p > 0 && (!state.quotes[symbol] || trade.t > state.quotes[symbol].t)) {
+        state.quotes[symbol] = { price: trade.p, t: trade.t };
+      }
+    }
+    if (!wsConnected[key]) {
+      const prior = state[key];
+      state[key] = !crypto && feed === 'delayed_sip' ? 'delayed' : 'polling';
+      if (prior !== state[key]) feedEpoch[key] = Date.now();
+    }
+  } catch {}
 }
 
 function normalize(order) {
@@ -197,6 +267,15 @@ async function reconcile() {
         if (error.status !== 404 || item.status !== 'unknown') throw error;
         // Ambiguous submissions remain blocked pending broker confirmation.
       }
+      if (item.side === 'buy' && item.id && !terminal.has(item.status) && item.status !== 'unknown' &&
+        Date.now() - Date.parse(item.t) > staleOrderMs) {
+        try {
+          await broker('/orders/' + encodeURIComponent(item.id), { method: 'DELETE' });
+          event('fills', 'Canceled stale ' + item.symbol + ' buy order');
+        } catch (error) {
+          if (![404, 422].includes(error.status)) throw error;
+        }
+      }
     }
     state.positions = positions.map(p => ({ symbol: canonicalSymbol(p.symbol), qty: +p.qty, entry: +p.avg_entry_price, price: +p.current_price }));
     state.account = { equity: +account.equity, cash: +account.cash, buyingPower: +account.buying_power, dayStart: +account.last_equity,
@@ -214,10 +293,10 @@ function ready(symbol) {
   const bar = state.bars[symbol]?.at(-1);
   const key = feedKey(symbol);
   const open = demo || (isCrypto(symbol) ? state.cryptoSessionOpen : state.sessionOpen);
-  return eligible.has(symbol) && (state[key] === 'live' || state[key] === 'simulated') && Date.now() - brokerAt < 20000 &&
+  return eligible.has(symbol) && (state[key] === 'live' || state[key] === 'simulated' || state[key] === 'polling') && Date.now() - brokerAt < 20000 &&
     brokerAt >= feedEpoch[key] && open && bar && Date.now() - Date.parse(bar.t) < maxAge;
 }
-const unresolvedOrders = () => state.orders.some(order => !terminal.has(order.status));
+const unresolvedFor = symbol => state.orders.some(order => !terminal.has(order.status) && (order.status === 'unknown' || order.symbol === symbol));
 
 function quotePrice(symbol, bar) {
   const quote = state.quotes[symbol];
@@ -236,18 +315,38 @@ function reservedBuys(orders) {
   return reserved;
 }
 
+function positionMatchesLedger(position, ledger, rules) {
+  const tolerance = rules ? 0.00000001 : 0.000001;
+  const feeAllowance = rules ? Math.max(tolerance, (ledger.boughtQty ?? 0) * 0.01) : tolerance;
+  if (position) {
+    if (position.qty <= 0) return false;
+    if (position.qty > ledger.qty + tolerance) return false;
+    return ledger.qty - position.qty <= feeAllowance;
+  }
+  return ledger.qty >= -tolerance && ledger.qty <= feeAllowance;
+}
+
 function orderContext(bot, s, bars) {
   const position = state.positions.find(p => p.symbol === s.symbol);
   const ledger = botLedger(botOrders(bot.id), s.symbol, hasBudget(bot.budget) ? bot.budget : null);
-  const { qty } = ledger;
   const rules = isCrypto(s.symbol) ? cryptoRules.get(s.symbol) : null;
-  const tolerance = rules ? 0.00000001 : 0.000001;
-  if (position ? position.qty <= 0 || Math.abs(position.qty - qty) > tolerance : Math.abs(qty) > tolerance) return null;
-  const price = quotePrice(s.symbol, bars.at(-1));
-  const cash = Math.min(state.account.cash, state.account.buyingPower, ledger.available,
-    rules ? state.account.cryptoBuyingPower ?? state.account.cash : Infinity);
+  if (!positionMatchesLedger(position, ledger, rules)) return null;
+  const bar = bars.at(-1);
+  const price = quotePrice(s.symbol, bar);
+  const accountReserved = reservedBuys(state.orders);
+  const freeCash = accountReserved === null ? 0 : Math.max(0, state.account.cash - accountReserved);
+  const freeBuyingPower = accountReserved === null ? 0 : Math.max(0, state.account.buyingPower - accountReserved);
+  const freeCrypto = accountReserved === null ? 0 : Math.max(0, (state.account.cryptoBuyingPower ?? state.account.cash) - accountReserved);
+  const cash = Math.min(freeCash, freeBuyingPower, ledger.available, rules ? freeCrypto : Infinity);
   const account = { ...state.account, cash };
-  return { position, price, ledger, cash, rules, proposal: decision(s, bars.slice(-s.period).map(b => b.c), account, position, price, rules) };
+  const window = contiguousBars(bars, s.period);
+  const warmedUp = window.length >= s.period;
+  const cooldown = bot.cooldownBars ?? 0;
+  const volume = Number.isFinite(bar?.v) ? bar.v : undefined;
+  return {
+    position, price, ledger, cash, rules, warmedUp, warmupCount: window.length, cooldown, volume,
+    proposal: decision(s, window.map(b => b.c), account, position, price, rules, { warmedUp, cooldown, volume })
+  };
 }
 
 function currentCandidate(candidate) {
@@ -271,10 +370,14 @@ function drainAI() {
 }
 
 async function completeAI(job) {
-  const { bot, s, proposal, bars } = job;
+  const { bot, s, proposal, bars, price, position } = job;
   let model, error;
-  try { model = await assessSignal(aiProvider, s.symbol, proposal.side, bars); }
-  catch (failure) { error = failure; }
+  try {
+    model = await assessSignal(aiProvider, s.symbol, proposal.side, bars, fetch, {
+      price, rationale: proposal.rationale, period: s.period,
+      position: position ? { qty: position.qty, entry: position.entry, pnlPct: Number((100 * (price / position.entry - 1)).toFixed(2)) } : null
+    });
+  } catch (failure) { error = failure; }
   activeAI--;
   drainAI();
   try {
@@ -284,8 +387,11 @@ async function completeAI(job) {
         bot.status = error.message;
       } else {
         bot.status = 'Running';
-        if (model.side === proposal.side && !unresolvedOrders()) {
-          try { await reconcile(); }
+        if (model.side === proposal.side && !unresolvedFor(s.symbol)) {
+          if (!demo) {
+        await Promise.all([pollMarket('feed'), pollMarket('cryptoFeed')]);
+      }
+      try { await reconcile(); }
           catch {
             state.broker = 'offline';
             brokerAt = 0;
@@ -297,8 +403,10 @@ async function completeAI(job) {
         try { await applySignal(job, model); }
         catch (failure) {
           bot.status = failure.message;
-          brokerAt = 0;
-          state.broker = 'offline';
+          if (!failure.status || failure.status >= 500) {
+            brokerAt = 0;
+            state.broker = 'offline';
+          }
         }
       }
       await persist();
@@ -320,14 +428,13 @@ async function evaluate(bot) {
       ? 'Stock session closed or trading unavailable' : 'Waiting for fresh feed and broker';
     return;
   }
-  if (unresolvedOrders()) { bot.status = 'Waiting for order reconciliation'; return; }
+  if (unresolvedFor(s.symbol)) { bot.status = 'Waiting for order reconciliation'; return; }
   const epoch = feedEpoch[feedKey(s.symbol)];
   if (Date.parse(bar.t) + (demo ? 0 : 60000) < Math.max(bot.started, epoch)) {
     bot.status = 'Waiting for a new bar';
     return;
   }
   if (bar.t === bot.lastBar) return;
-  bot.lastBar = bar.t;
   const context = orderContext(bot, s, bars);
   if (!context) {
     bot.status = 'Position differs from strategy fills';
@@ -337,29 +444,38 @@ async function evaluate(bot) {
   const minimum = context.rules ? Math.max(context.rules.minValue, context.price * context.rules.minimum) : context.price;
   bot.status = !hasBudget(bot.budget) ? 'Budget required for new buys' :
     !context.ledger.complete ? 'Awaiting complete fill history' :
+    !context.warmedUp && !context.position ? `Warming up candles (${context.warmupCount}/${s.period})` :
+    context.cooldown > 0 && !context.position ? `Stop-loss cooldown (${context.cooldown} bars)` :
     !context.position && context.ledger.available < minimum ? 'Budget below minimum order size' : 'Running';
   const { proposal } = context;
   if (!proposal) {
-    const rationale = bot.status !== 'Running' ? bot.status :
-      bars.length < s.period ? 'Waiting for enough bars to calculate the indicator' :
+    bot.lastBar = bar.t;
+    if ((bot.cooldownBars ?? 0) > 0) bot.cooldownBars--;
+    const rationale = !context.warmedUp && !context.position ? `Warming up: ${context.warmupCount}/${s.period} contiguous 1-minute candles` :
+      context.cooldown > 0 && !context.position ? `Post-stop-loss cooldown (${context.cooldown} bars remaining)` :
+      context.volume === 0 && !context.position ? 'Skipped zero-volume bar' :
+      bot.status !== 'Running' ? bot.status :
       state.account.equity <= state.account.dayStart * (1 - s.dailyLoss / 100) ? 'Daily loss limit reached' :
       context.cash < minimum && !context.position ? 'Available buying power is below the minimum order' :
       context.position ? 'Holding the current position. No exit rule matched.' : 'No entry passed the strategy and risk rules.';
     bot.lastEvaluation = { t: bar.t, price: context.price, direction: 'hold', rationale };
     return;
   }
-  bot.lastEvaluation = { t: bar.t, price: context.price, direction: proposal.side, rationale: proposal.rationale };
-  const candidate = { bot, s, bar, proposal, epoch, expires: Date.now() + aiLifetime };
+  const candidate = { bot, s, bar, proposal, price: context.price, position: context.position, epoch, expires: Date.now() + aiLifetime };
   if (s.ai && !proposal.protective) {
     if (pendingAI.has(bot.id) || pendingAI.size >= symbols.length) {
       bot.status = 'Waiting for AI capacity';
       return;
     }
+    bot.lastBar = bar.t;
+    bot.lastEvaluation = { t: bar.t, price: context.price, direction: proposal.side, rationale: proposal.rationale };
     pendingAI.set(bot.id, { ...candidate, bars: bars.slice(-20) });
     bot.status = 'Awaiting AI confirmation';
     drainAI();
     return;
   }
+  bot.lastBar = bar.t;
+  bot.lastEvaluation = { t: bar.t, price: context.price, direction: proposal.side, rationale: proposal.rationale };
   await applySignal(candidate);
 }
 
@@ -373,14 +489,21 @@ async function applySignal(candidate, model = null) {
   event('signals', signal.symbol + ' ' + signal.direction + ' signal');
   if (proposal.protective) event('risk', proposal.rationale);
   if (model && model.side !== proposal.side) return;
-  if (!currentCandidate(candidate) || unresolvedOrders()) return;
+  if (!currentCandidate(candidate) || unresolvedFor(s.symbol)) return;
   const context = orderContext(bot, s, state.bars[s.symbol]);
   if (!context) return;
-  const { position, price: latest, proposal: validated, rules } = context;
+  const { position, price: latest, proposal: validated, rules, cash } = context;
   if (!validated || validated.side !== proposal.side) return;
-  const rawQty = Math.min(proposal.qty, validated.qty);
+  const rawLimit = proposal.side === 'buy'
+    ? roundDown(latest * (1 + (rules && !demo ? cryptoSlippageBps : 0) / 10000), rules?.tick ?? 0.01)
+    : null;
+  const limitPrice = rawLimit && rawLimit > 0 ? rawLimit : null;
+  let rawQty = Math.min(proposal.qty, validated.qty);
+  if (proposal.side === 'buy' && limitPrice && rawQty * limitPrice > cash) {
+    rawQty = rules ? roundDown(cash / limitPrice, rules.increment) : Math.floor(cash / limitPrice);
+  }
   const qty = rules && proposal.side === 'sell' ? roundDown(rawQty, rules.increment) : rawQty;
-  const limitPrice = proposal.side === 'buy' ? roundDown(latest, rules?.tick ?? 0.01) : null;
+  if (qty <= 0) return;
   if (rules && (qty + 1e-10 < rules.minimum || qty * (limitPrice ?? latest) < rules.minValue)) {
     bot.status = 'Order below crypto minimum';
     return;
@@ -399,6 +522,7 @@ async function applySignal(candidate, model = null) {
     if (proposal.side === 'buy') state.positions.push({ symbol: s.symbol, qty, entry: latest, price: latest, strategy: s.name });
     else {
       order.pnl = qty * (latest - position.entry);
+      if (proposal.stopLoss) bot.cooldownBars = s.cooldown ?? 0;
       if (position.qty - qty > 1e-9) position.qty = Number((position.qty - qty).toFixed(9));
       else state.positions = state.positions.filter(p => p !== position);
     }
@@ -412,10 +536,12 @@ async function applySignal(candidate, model = null) {
   try {
     const decimal = value => value.toFixed(9).replace(/\.?0+$/, '');
     const execution = proposal.side === 'buy' ? { type: 'limit', limit_price: rules ? decimal(order.limitPrice) : order.limitPrice.toFixed(2) } : { type: 'market' };
+    const timeInForce = rules ? (proposal.side === 'buy' ? 'ioc' : 'gtc') : 'day';
     const submitted = await broker('/orders', { method: 'POST', body: JSON.stringify({
-      symbol: s.symbol, qty: rules ? decimal(qty) : qty, side: proposal.side, ...execution, time_in_force: rules ? 'ioc' : 'day', client_order_id: client
+      symbol: s.symbol, qty: rules ? decimal(qty) : String(qty), side: proposal.side, ...execution, time_in_force: timeInForce, client_order_id: client
     }) });
     updateOrder(normalize(submitted));
+    if (proposal.stopLoss) bot.cooldownBars = s.cooldown ?? 0;
   } catch (error) {
     if ([400, 403, 422].includes(error.status)) {
       try { updateOrder(normalize(await broker('/orders:by_client_order_id?client_order_id=' + client))); }
@@ -432,11 +558,11 @@ if (demo) {
   connect('feed');
   connect('cryptoFeed');
   for (const symbol of symbols) {
-    const end = Date.now() - (isCrypto(symbol) ? 1 : 16) * 60000;
-    history(symbol, Date.now() - 3 * 86400000, end).then(bars => {
+    const end = Date.now() - (isCrypto(symbol) || feed === 'iex' ? 1 : 16) * 60000;
+    history(symbol, Date.now() - 3 * 86400000, end).then(bars => serial(() => {
       const merged = new Map([...bars, ...(state.bars[symbol] ?? [])].map(bar => [bar.t, bar]));
       state.bars[symbol] = [...merged.values()].sort((a, b) => a.t.localeCompare(b.t)).slice(-1500);
-    }).catch(() => {});
+    })).catch(() => {});
   }
 }
 async function cycle() {
@@ -455,6 +581,9 @@ async function cycle() {
             state.quotes[symbol] = { price: bar.c, t: stamp };
           }
         }
+      }
+      if (!demo) {
+        await Promise.all([pollMarket('feed'), pollMarket('cryptoFeed')]);
       }
       try { await reconcile(); }
       catch {
@@ -489,7 +618,7 @@ async function cycle() {
 await cycle();
 setInterval(cycle, 5000);
 
-const assets = { '/': ['index.html','text/html'], '/app.js': ['app.js','text/javascript'], '/style.css': ['style.css','text/css'], '/sw.js': ['sw.js','text/javascript'], '/mark.svg': ['mark.svg','image/svg+xml'] };
+const assets = { '/': ['index.html','text/html'], '/app.js': ['app.js','text/javascript'], '/style.css': ['style.css','text/css'], '/sw.js': ['sw.js','text/javascript'], '/mark.svg': ['mark.svg','image/svg+xml'], '/favicon.ico': ['mark.svg','image/svg+xml'] };
 function snapshot() {
   const market = symbols.map(symbol => {
     const [name] = instruments[symbol];
@@ -505,7 +634,7 @@ function snapshot() {
       change: first && quote.price ? 100 * (quote.price / first - 1) : null,
       volume: window.length ? window.reduce((sum, bar) => sum + (bar.v ?? 0) * (crypto ? bar.vw ?? bar.c : 1), 0) : null,
       volatility: first ? 100 * (Math.max(...window.map(bar => bar.c)) - Math.min(...window.map(bar => bar.c))) / first : null,
-      freshness: Date.now() - Date.parse(quote.t) < maxAge && ['live','simulated','delayed'].includes(status) ? status : status === 'delayed' ? 'delayed' : 'cached' };
+      freshness: Date.now() - Date.parse(quote.t) < maxAge && ['live','simulated','delayed','polling'].includes(status) ? status : status === 'delayed' ? 'delayed' : 'cached' };
   });
   const botSessions = Object.fromEntries(Object.values(state.bots).map(bot => {
     const orders = botOrders(bot.id);
@@ -516,7 +645,7 @@ function snapshot() {
     const unrealized = ledger.complete && ledger.qty > 0 ? Number.isFinite(mark) ? ledger.qty * mark - ledger.cost : null : ledger.complete ? 0 : null;
     return [bot.id, { ...ledger, available: reserved === null ? 0 : Math.max(0, ledger.available - reserved), reserved, mark, unrealized }];
   }));
-  return { ...state, botSessions, orders: state.orders.toSorted((a, b) => (b.t ?? '').localeCompare(a.t ?? '')),
+  return { ...state, botSessions, orders: state.orders.toSorted((a, b) => (b.t ?? '').localeCompare(a.t ?? '')).slice(0, 500),
     runs: state.runs.map(({ curve, trades, ...run }) => ({
     ...run, curve: curve.filter((_, idx) => idx % Math.ceil(curve.length / 650) === 0 || idx === curve.length - 1),
     tradeCount: trades.length, trades: trades.slice(-250)
@@ -541,14 +670,27 @@ async function change(path, input) {
     const id = existing?.id ?? randomUUID();
     const latest = state.strategies.findLast(item => item.id === id);
     if (latest && latest.version !== input.baseVersion) throw Error('Strategy changed. Review the latest version before saving.');
-    const item = { ...strategy(input), id, version: (latest?.version ?? 0) + 1, mutation };
+    const item = { ...strategy(input), id, version: (latest?.version ?? 0) + 1, mutation, sourceStrategy: latest?.sourceStrategy };
     state.strategies.push(item);
     return item;
   }
   if (path === '/api/bot') {
-    const s = state.strategies.find(item => item.id === input.id && item.version === input.version);
-    if (!s || !['running','paused','stopped'].includes(input.action)) throw Error('Invalid bot command.');
-    if (input.symbol !== undefined && input.symbol !== s.symbol) throw Error('The instrument does not match this strategy version.');
+    const source = state.strategies.find(item => item.id === input.id && item.version === input.version);
+    if (!source || !['running','paused','stopped'].includes(input.action)) throw Error('Invalid bot command.');
+    if (input.symbol !== undefined && input.symbol !== source.symbol) throw Error('The instrument does not match this strategy version.');
+    let s = source;
+    if (input.instrument !== undefined) {
+      if (input.create !== true || input.action !== 'running') throw Error('Choose a new instrument when launching a bot.');
+      if (input.instrument !== source.symbol) {
+        const rootId = source.sourceStrategy?.rootId ?? source.id;
+        const reused = state.strategies.some(item => item.symbol === input.instrument &&
+          (item.sourceStrategy?.rootId ?? item.sourceStrategy?.id ?? item.id) === rootId &&
+          state.bots[item.id]?.symbol === input.instrument);
+        if (reused) throw Error('A bot already uses this strategy on that instrument. Open its session to resume it.');
+        s = { ...strategy({ ...source, symbol: input.instrument }), id: randomUUID(), version: 1,
+          sourceStrategy: { id: source.id, version: source.version, symbol: source.symbol, rootId } };
+      }
+    }
     const previous = state.bots[s.id];
     if (input.create === true && previous) throw Error('This strategy already has a bot. Use its controls to resume it.');
     if (input.action !== 'running' && previous?.version !== s.version) throw Error('This bot version changed. Refresh and try again.');
@@ -580,6 +722,7 @@ async function change(path, input) {
       }
     }
     if (previous?.version === s.version && previous.desired === input.action && previous.budget === budget) return previous;
+    if (s !== source) state.strategies.push(s);
     state.bots[s.id] = { id: s.id, version: s.version, name: s.name, symbol: s.symbol, desired: input.action, status: input.action,
       budget, createdAt: previous?.createdAt ?? previous?.started ?? Date.now(), started: Date.now(),
       lastBar: previous?.symbol === s.symbol ? previous.lastBar : undefined,

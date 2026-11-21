@@ -15,7 +15,7 @@ const qtyText=v=>Number.isFinite(v)?v.toLocaleString('en-US',{maximumFractionDig
 const pct=v=>Number.isFinite(v)?(v>0?'+':'')+v.toFixed(2)+'%':'—';
 const stamp=(v,opts)=>v?new Date(v).toLocaleString(undefined,opts??{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
 const date=v=>new Date(v).toISOString().slice(0,10);
-const tone=v=>['live','connected','simulated','filled','Running','running','buy'].includes(v)?'good':['offline','rejected','sell'].includes(v)?'bad':'';
+const tone=v=>['live','polling','connected','simulated','filled','Running','running','buy'].includes(v)?'good':['offline','rejected','sell'].includes(v)?'bad':'';
 const color=v=>v>0?'good':v<0?'bad':'';
 const badge=(v,t=tone(v))=>`<span class="badge ${t}">${esc(v)}</span>`;
 const btn=(label,action,value='',primary=false,attrs='')=>`<button type="button" class="button ${primary?'primary':''}" data-action="${action}" data-value="${esc(value)}" ${attrs}>${label}</button>`;
@@ -38,7 +38,7 @@ let state=null,online=false,active='',selected='',chartMode='Price',range='1H',a
 const ranges={'15M':15,'1H':60,'4H':240,'1D':1440};
 const screen={search:'',volume:0,volatility:0};
 const cryptoScreen={search:'',volume:0,volatility:0};
-let botFilter='all', launchVersion=null;
+let botFilter='all', launchVersion=null, launchInstrument=null, launchBudget='', fundBudget=null;
 const historyFilter={asset:'',strategy:'',start:'',end:''};
 const key=s=>s.id+'@'+s.version;
 const version=k=>state.strategies.find(s=>key(s)===k);
@@ -59,7 +59,7 @@ function chrome(){
  if(!state)return;
  const status=$('#connection');
  status.className='connection '+(online?tone(state.feed):'bad');
- status.innerHTML='<i class="dot"></i>'+esc(!online?'Browser offline · Cached':({simulated:'Demo feed',live:'Feed connected',delayed:'Delayed feed'})[state.feed]??'Feed '+state.feed);
+ status.innerHTML='<i class="dot"></i>'+esc(!online?'Browser offline · Cached':({simulated:'Demo feed',live:'Feed connected',polling:'Feed connected (REST)',delayed:'Delayed feed'})[state.feed]??'Feed '+state.feed);
  status.title=syncLabel();
  $('#workspace-mode').textContent=state.mode==='demo'?'Demo workspace':'Alpaca Paper';
  $('#workspace-source').textContent=online?'Broker '+state.broker:syncLabel();
@@ -92,7 +92,7 @@ const metric=(label,v,note,k,mint=false)=>`<section class="panel metric"><div cl
 const mark=(s,i=0)=>`<span class="ticker-mark" data-color="${i%5}">${esc(s.slice(0,2))}</span>`;
 const orders=(items,limit=100)=>table(['Asset','Side','Filled / quantity','Fill price','Status','Time'],items.slice(0,limit).map(o=>[esc(o.symbol),badge(o.side),qtyText(o.filled)+' / '+qtyText(o.qty),usd(o.price),badge(o.status),stamp(o.t)]),'Orders will appear after a bot submits a signal.');
 const sessionRoute=b=>'session?id='+encodeURIComponent(b.id);
-const botRows=()=>Object.values(state.bots).map(b=>`<a class="bot-row bot-session-link" href="#${sessionRoute(b)}"><span><b>${esc(b.name)}</b><small>${b.symbol} · v${b.version}</small></span>${badge(botStatus(b))}</a>`).join('')||empty('No bots started. Launch a saved strategy in Live Trading.');
+const botRows=()=>Object.values(state.bots).map(b=>`<a class="bot-row bot-session-link" href="#${sessionRoute(b)}"><span><b>${esc(b.name)}</b><small>${esc(b.symbol)} · v${b.version}</small></span>${badge(botStatus(b))}</a>`).join('')||empty('No bots started. Launch a saved strategy in Live Trading.');
 function dashboard(){
  const a=state.account,m=state.market.find(i=>i.symbol===selected)??state.market[0],enabled=Object.values(state.bots).filter(b=>b.desired==='running'),running=enabled.filter(b=>b.status==='Running');
  const chartSymbol=m?.symbol??'';
@@ -121,10 +121,13 @@ function trading(){
  const groups=[['all','All bots'],['running','Active'],['paused','Paused'],['stopped','Stopped']];
  const counts=Object.fromEntries(groups.map(([k])=>[k,k==='all'?bots.length:bots.filter(b=>b.desired===k).length]));
  const filters=`<div class="tabs" role="group" aria-label="Filter bots">${groups.map(([k,label])=>btn(label+' '+counts[k],'bot-filter',k,false,`aria-pressed="${botFilter===k}"`)).join('')}</div>`;
- const options=state.strategies.slice().reverse().filter(s=>!state.bots[s.id]&&state.market.some(m=>m.symbol===s.symbol&&m.eligible)&&(!s.ai||state.aiConfigured))
+ const options=state.strategies.slice().reverse().filter(s=>!s.ai||state.aiConfigured)
    .map(s=>[key(s),s.name+' · '+s.symbol+' · v'+s.version]);
+ const instruments=state.market.filter(m=>m.eligible).map(m=>[m.symbol,m.symbol+' · '+m.name]);
  const requested=launchVersion??params().get('version');
  const chosen=options.some(([id])=>id===requested)?requested:'';
+ const instrument=launchInstrument??(chosen?version(chosen)?.symbol:'');
+ const target=instruments.some(([id])=>id===instrument)?instrument:'';
  const unavailable=requested&&!chosen?'<small>The requested strategy is unavailable for launch. Select another version or open its existing bot session.</small>':'';
  const disabled=!online?'disabled':'';
  const rows=bots.filter(b=>botFilter==='all'||b.desired===botFilter).map(b=>{
@@ -145,8 +148,10 @@ function trading(){
    '<div class="metrics">'+metric('Active bots',counts.running,counts.running?bots.filter(b=>b.status==='Running'&&b.desired==='running').length+' processing signals':'No active bots','bot',true)+
    metric('Paused bots',counts.paused,'Available to resume','strategies')+metric('Stopped bots',counts.stopped,'Available to restart','portfolio')+
    metric('Paper broker',esc(online?state.broker:'cached'),esc(state.feedName)+' · '+esc(online?state.feed:'cached'),'equity')+'</div>'+
-   '<div class="stack">'+panel('Launch a bot','Set the maximum USD budget for this bot. Buy orders still follow your strategy and account risk limits.',
-     options.length?form('launch-bot',select('Strategy version','version',[['','Choose a strategy version'],...options],chosen,true)+numeric('Bot budget (USD)','budget','',1,1e9),unavailable+submit('Launch bot',!online)):
+   '<div class="stack">'+panel('Launch a bot','Choose the saved trading rules, the instrument to trade, and the maximum USD budget.',
+     options.length&&instruments.length?form('launch-bot',select('Strategy version','version',[['','Choose a strategy version'],...options],chosen,true)+
+       select('Ticker or crypto pair','instrument',[['','Choose an instrument'],...instruments],target,true)+numeric('Bot budget (USD)','budget',launchBudget,1,1e9),
+       unavailable+submit('Launch bot',!online)):
      empty('Save a strategy for an eligible instrument to launch another bot.'),link('Strategy Editor','strategies'))+
    panel('Bots','Pause or stop to prevent new submissions. Existing orders stay at the broker.',
      '<div class="bot-filters">'+filters+'</div>'+table(['Bot','Instrument / version','Status','Budget','Last evaluated bar','Latest order','Controls'],rows,'No bots in this view.'))+'</div>';
@@ -156,9 +161,11 @@ function session(){
  const back=link('Back to Live Trading','trading');
  if(!bot)return page('Automated execution','Bot Session','This bot could not be found.',back);
  const book=state.botSessions?.[bot.id]??{};
+ const strategy=version(key(bot));
+ const source=strategy?.sourceStrategy;
  const botOrders=state.orders.filter(order=>order.owned&&order.strategyId===bot.id);
  const signals=state.signals.filter(signal=>signal.strategyId===bot.id);
- const open=botOrders.filter(order=>!['filled','canceled','expired','rejected','replaced'].includes(order.status));
+ const open=botOrders.filter(order=>!['filled','canceled','expired','rejected','replaced','done_for_day'].includes(order.status));
  const holding=book.qty>0;
  const positionStatus=open.some(order=>order.side==='sell')?'Sell pending':holding?'Holding':open.some(order=>order.side==='buy')?'Buy pending':book.sellFills?'Sold':'Flat';
  const realized=book.complete?book.realized:null;
@@ -169,12 +176,13 @@ function session(){
  const command=(label,action)=>btn(label,'bot-command',action,false,`data-bot="${esc(bot.id)}" data-version="${bot.version}" ${!online?'disabled':''}`);
  const controls=bot.desired==='running'?'<div class="form"><div class="actions">'+command('Pause','paused')+command('Stop','stopped')+'</div></div>':
    bot.desired==='paused'?'<div class="form">'+command('Stop','stopped')+'</div>':'';
- const risk=bot.desired==='running'&&bot.budget?'':form('fund-bot',select('Strategy version','version',[['','Choose a strategy version'],...versions],selectedVersion,true)+numeric('Bot budget (USD)','budget',bot.budget??'',1,1e9),
+ const risk=bot.desired==='running'&&bot.budget?'':form('fund-bot',select('Strategy version','version',[['','Choose a strategy version'],...versions],selectedVersion,true)+numeric('Bot budget (USD)','budget',fundBudget??bot.budget??'',1,1e9),
        submit(bot.desired==='running'?'Set budget':bot.desired==='paused'?'Resume bot':'Restart bot',!online));
  const positionRows=holding?[[esc(bot.symbol),qtyText(book.qty),book.complete?usd(book.cost/book.qty):'—',usd(book.mark),
    Number.isFinite(book.mark)?usd(book.qty*book.mark):'—',moneyChange(book.unrealized)]]:[];
  const filled=botOrders.filter(order=>order.filled>0);
  return page('Paper bot session',esc(bot.name),esc(bot.symbol)+' · Strategy v'+bot.version+' · '+esc(state.mode==='demo'?'Demo paper trading':'Alpaca Paper'),back)+
+   (source?'<div class="notice">Rules copied from '+esc(version(source.id+'@'+source.version)?.name??'saved strategy')+' · '+esc(source.symbol)+' · v'+source.version+'</div>':'')+
    (!online?'<div class="notice">Showing cached bot activity · '+syncLabel()+'</div>':'')+
    '<div class="metrics">'+metric('Allocated budget',usd(bot.budget),usd(book.available)+' available for new buys','wallet')+
    metric('Amount invested',book.complete?usd(book.invested):'—','Cost basis of the open position','portfolio')+
@@ -206,8 +214,9 @@ function screener(){
  form('screen',field('Search','search',filter.search,'type="search" placeholder="Search symbols or names"')+numeric(crypto?'Minimum turnover (USD)':'Minimum volume','volume',filter.volume,0,1e12,1)+numeric('Minimum volatility (%)','volatility',filter.volatility,0,100),submit('Apply filters'))+
  table(['Asset','Price','Change','Volatility',crypto?'USD turnover':'Volume','Source / freshness',''],rows,'No instruments match these filters.'));
 }
-const fields=[['Lookback (1-minute bars)','period',2,60,1],['Entry above average (%)','entry',0,25],['Exit below average (%)','exit',-25,0],['Position size (% equity)','size',.1,100],['Maximum exposure (% equity)','exposure',.1,100],['Maximum daily loss (%)','dailyLoss',.1,50],['Stop-loss (%)','stop',.1,50],['Take-profit (%)','take',.1,100]];
-const fresh=(symbol='')=>({...latest()[0],id:'',version:0,name:'',symbol});
+const fields=[['Lookback (1-minute bars)','period',2,60,1],['Entry above average (%)','entry',0,25],['Exit below average (%)','exit',-25,0],['Position size (% equity)','size',.1,100],['Maximum exposure (% equity)','exposure',.1,100],['Maximum daily loss (%)','dailyLoss',.1,50],['Stop-loss (%)','stop',.1,50],['Take-profit (%)','take',.1,100],['Stop-loss cooldown (bars)','cooldown',0,60,1]];
+const defaultParams={period:12,entry:0.1,exit:-0.1,size:10,exposure:20,dailyLoss:3,stop:2,take:4,cooldown:5,ai:false};
+const fresh=(symbol='')=>({...defaultParams,id:'',version:0,name:'',symbol});
 function strategies(){
  const route=location.hash, requested=params().get('symbol');
  if(editorRoute!==route){
@@ -220,15 +229,16 @@ function strategies(){
  const options=state.strategies.slice().reverse().map(s=>[key(s),s.name+' · '+s.symbol+' · v'+s.version]);
  const asset=state.market.find(m=>m.symbol===editor.symbol);
  const inputs=field('Strategy name','name',editor.name,'required maxlength="60"')+select('Instrument or pair','symbol',[['','Choose an instrument'],...state.market.map(m=>[m.symbol,m.symbol+' · '+m.name])],asset?.symbol??'',true)+
- select('Saved version','version',[['','New draft'],...options],saved?key(saved):'')+fields.map(([label,k,min,max,step])=>numeric(label,k,editor[k],min,max,step)).join('');
- const botActions=saved?`<div class="actions">${link('Backtest v'+saved.version,'backtesting?version='+key(saved))}${bot?link('Open bot session',sessionRoute(bot)+'&version='+saved.version,true):link('Set budget and launch','trading?version='+encodeURIComponent(key(saved)),true)}</div>`:'';
+ select('Saved version','version',[['','New draft'],...options],saved?key(saved):'')+fields.map(([label,k,min,max,step])=>numeric(label,k,editor[k]??defaultParams[k],min,max,step)).join('');
+ const startTrade=s=>link('Start trade','trading?version='+encodeURIComponent(key(s)),true);
+ const botActions=saved?`<div class="actions">${link('Backtest v'+saved.version,'backtesting?version='+key(saved))}${bot?link('Open bot session',sessionRoute(bot)+'&version='+saved.version):''}${startTrade(saved)}</div>`:'';
  return page('Automated trading','Strategy Editor','Configure a minute-bar strategy and control its paper bot.',btn(icon('plus')+' New strategy','new','',true))+
  `<div class="grid">${panel('Strategy configuration','Long-only moving-average momentum · 1-minute bars',form('strategy',inputs,check('Require AI confirmation for non-protective signals','ai',editor.ai)+
  '<small>'+(state.aiConfigured?esc(state.aiProvider ?? 'AI provider')+' configured. Historical replay uses deterministic strategy versions.':'Configure a Gemini or OpenAI key in the server environment to enable AI confirmation.')+'</small>'+
  submit(online?'Save version':'Queue draft sync')+`<small id="draft-status">${editor.queued?'Queued for sync':editor.dirty?'Local draft':''}</small>`))}
  <div class="stack">${panel('Paper bot',bot?'Pinned to version '+bot.version:'Select a saved strategy version',
  (bot?`<div class="bot-row"><span>${bot.symbol}</span>${badge(botStatus(bot))}</div>`:empty('Save a strategy to enable paper bot controls.'))+'<div class="form">'+botActions+'</div>')}
- ${panel('Saved strategies','Latest versions',latest().map(s=>`<div class="bot-row"><div><b>${esc(s.name)}</b><small>${s.symbol} · v${s.version}</small></div>${btn('Edit','edit',key(s))}</div>`).join(''))}</div></div>`;
+ ${panel('Saved strategies','Latest versions',latest().map(s=>`<div class="bot-row"><div><b>${esc(s.name)}</b><small>${s.symbol} · v${s.version}</small></div><div class="actions">${btn('Edit','edit',key(s))}${startTrade(s)}</div></div>`).join(''))}</div></div>`;
 }
 function backtesting(){
  const runs=state.runs,eligible=state.strategies.filter(s=>!s.ai).reverse(),requested=params().get('version');
@@ -296,7 +306,8 @@ function authenticationView(){
 function render(force=false){
  const signedOut=authInfo?.required&&!authInfo.authenticated;
  document.body.classList.toggle('auth-screen',Boolean(signedOut));
- $('#sign-out').hidden=!authInfo?.required||!authInfo.authenticated;
+ const signOut=$('#sign-out');
+ if(signOut)signOut.hidden=!authInfo?.required||!authInfo.authenticated;
  const main=$('#view');
  if(signedOut){
    const markup=authenticationView();
@@ -438,9 +449,19 @@ document.addEventListener('click',async event=>{
 document.addEventListener('input',event=>{
  const form=event.target.closest('#strategy');
  if(form&&event.target.name!=='version')capture(form);
+ if(event.target.matches('#launch-bot [name=budget]'))launchBudget=event.target.value;
+ if(event.target.matches('#fund-bot [name=budget]'))fundBudget=event.target.value;
 });
 document.addEventListener('change',event=>{
- if(event.target.matches('#launch-bot [name=version]'))launchVersion=event.target.value;
+ if(event.target.matches('#launch-bot [name=version]')){
+   launchVersion=event.target.value;
+   const form=event.target.form;
+   const symbol=version(launchVersion)?.symbol;
+   const instrument=form.elements.instrument;
+   instrument.value=Array.from(instrument.options).some(option=>option.value===symbol)?symbol:'';
+   launchInstrument=instrument.value;
+ }
+ if(event.target.matches('#launch-bot [name=instrument]'))launchInstrument=event.target.value;
  if(event.target.matches('#strategy [name=version]')){
    editor=event.target.value?{...version(event.target.value)}:fresh();
    render(true);
@@ -474,8 +495,8 @@ document.addEventListener('submit',async event=>{
    if(form.id==='launch-bot'){
      const selected=version(data.version);
      if(!selected)throw Error('Choose a saved strategy version.');
-     const launched=await api('bot',{id:selected.id,version:selected.version,symbol:selected.symbol,action:'running',budget:+data.budget,create:true});
-     launchVersion=null;botFilter='all';
+     const launched=await api('bot',{id:selected.id,version:selected.version,symbol:selected.symbol,instrument:data.instrument,action:'running',budget:+data.budget,create:true});
+     launchVersion=null;launchInstrument=null;launchBudget='';botFilter='all';
      toast(selected.name+' launched.');
      location.hash=sessionRoute(launched);
    }
@@ -484,6 +505,7 @@ document.addEventListener('submit',async event=>{
      const selected=bot&&version(bot.id+'@'+data.version);
      if(!selected)throw Error('Choose a saved strategy version.');
      await api('bot',{id:selected.id,version:selected.version,symbol:selected.symbol,action:'running',budget:+data.budget});
+     fundBudget=null;
      toast('Bot budget saved.');
    }
    if(form.id==='strategy'){
@@ -498,7 +520,7 @@ document.addEventListener('submit',async event=>{
      runA=result.id;toast('Backtest complete.');
    }
    if(form.id==='settings'){await api('settings',Object.fromEntries(Object.keys(data).map(k=>[k,true])));toast('Notifications saved.')}
-   if(form.id==='profile'){await api('profile',{...data,offlineSync:form.elements.offlineSync.checked});toast('Profile saved.')}
+   if(form.id==='profile'){await api('profile',{...data,offlineSync:Boolean(form.elements.offlineSync?.checked)});toast('Profile saved.')}
    await refresh(true);
  }catch(error){toast(error.message)}
  finally{pending=false;if(control){control.disabled=false;if(form.id==='backtest')control.textContent='Run backtest'}}
@@ -523,7 +545,8 @@ document.addEventListener('keydown',event=>{
 });
 window.addEventListener('hashchange',()=>{
  const route=location.hash.split('?')[0];
- if(route==='#trading')launchVersion=null;
+ if(route==='#trading'){launchVersion=null;launchInstrument=null;launchBudget=''}
+ if(route==='#session')fundBudget=null;
  if(state&&route==='#strategies'&&params().has('new')&&!params().has('symbol'))editor=fresh();
  render(true);
 });

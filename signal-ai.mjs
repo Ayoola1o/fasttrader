@@ -1,6 +1,6 @@
 export function signalProvider(env) {
   if (env.GEMINI_API_KEY?.trim()) {
-    return { name: 'Gemini', key: env.GEMINI_API_KEY.trim(), model: env.GEMINI_MODEL?.trim() || 'gemini-3.5-flash' };
+    return { name: 'Gemini', key: env.GEMINI_API_KEY.trim(), model: env.GEMINI_MODEL?.trim() || 'gemini-2.5-flash' };
   }
   if (env.OPENAI_API_KEY?.trim()) {
     return { name: 'OpenAI', key: env.OPENAI_API_KEY.trim(), model: env.OPENAI_MODEL?.trim() || 'gpt-4.1-mini' };
@@ -8,10 +8,18 @@ export function signalProvider(env) {
   return null;
 }
 
-export async function assessSignal(provider, symbol, side, bars, request = fetch) {
+export async function assessSignal(provider, symbol, side, bars, request = fetch, context = null) {
   if (!provider) throw Error('AI provider is unconfigured');
-  const instruction = 'Analyze the minute closes and proposed direction. Return JSON with side (buy, sell, or hold) and rationale (one sentence). Use hold if the proposed direction lacks support.';
-  const input = JSON.stringify({ symbol, proposedSide: side, closes: bars.slice(-20).map(bar => bar.c) });
+  const instruction = 'Analyze the recent minute bars, price action, and proposed direction. Return JSON with side (buy, sell, or hold) and rationale (one sentence). Use hold if the proposed direction lacks support.';
+  const recent = bars.slice(-20);
+  const payload = {
+    symbol,
+    proposedSide: side,
+    closes: recent.map(bar => bar.c),
+    bars: recent.map(bar => ({ t: bar.t, o: bar.o, c: bar.c, ...(Number.isFinite(bar.h) ? { h: bar.h } : {}), ...(Number.isFinite(bar.l) ? { l: bar.l } : {}), ...(Number.isFinite(bar.v) ? { v: bar.v } : {}) })),
+    ...(context ? { context } : {})
+  };
+  const input = JSON.stringify(payload);
   const gemini = provider.name === 'Gemini';
   const headers = { 'Content-Type': 'application/json' };
   let url, body;
