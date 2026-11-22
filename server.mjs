@@ -12,7 +12,7 @@ const aiProvider = signalProvider(process.env);
 const demo = mode === 'demo';
 const feed = process.env.ALPACA_FEED || 'iex';
 const headers = { 'APCA-API-KEY-ID': process.env.ALPACA_KEY, 'APCA-API-SECRET-KEY': process.env.ALPACA_SECRET };
-if (!demo && (mode !== 'alpaca' || !headers['APCA-API-KEY-ID'] || !headers['APCA-API-SECRET-KEY'] || !['iex','sip','delayed_sip'].includes(feed))) {
+if (!demo && (mode !== 'alpaca' || !headers['APCA-API-KEY-ID'] || !headers['APCA-API-SECRET-KEY'] || !['iex', 'sip', 'delayed_sip'].includes(feed))) {
   throw Error('Set valid Alpaca Paper credentials and a supported feed in .env.');
 }
 const host = process.env.FASTTRADER_HOST || '127.0.0.1';
@@ -83,7 +83,7 @@ let activeAI = 0;
 let queue = Promise.resolve();
 function serial(task) {
   const job = queue.then(task);
-  queue = job.catch(() => {});
+  queue = job.catch(() => { });
   return job;
 }
 async function persist() {
@@ -111,7 +111,7 @@ async function request(host, path, opts = {}) {
     try {
       const payload = await response.json();
       if (typeof payload?.message === 'string' && payload.message.trim()) detail = ': ' + payload.message.trim();
-    } catch {}
+    } catch { }
     const reset = Number(response.headers.get('x-ratelimit-reset'));
     throw Object.assign(Error('Alpaca request failed (' + response.status + ')' + detail), {
       status: response.status,
@@ -229,13 +229,15 @@ async function pollMarket(key) {
       state[key] = !crypto && feed === 'delayed_sip' ? 'delayed' : 'polling';
       if (prior !== state[key]) feedEpoch[key] = Date.now();
     }
-  } catch {}
+  } catch { }
 }
 
 function normalize(order) {
-  return { id: order.id, client: order.client_order_id, symbol: canonicalSymbol(order.symbol), side: order.side, qty: +order.qty,
+  return {
+    id: order.id, client: order.client_order_id, symbol: canonicalSymbol(order.symbol), side: order.side, qty: +order.qty,
     filled: +order.filled_qty, status: order.status, price: order.filled_avg_price ? +order.filled_avg_price : null,
-    limitPrice: order.limit_price ? +order.limit_price : null, filledAt: order.filled_at || null, t: order.submitted_at || order.created_at };
+    limitPrice: order.limit_price ? +order.limit_price : null, filledAt: order.filled_at || null, t: order.submitted_at || order.created_at
+  };
 }
 function updateOrder(order) {
   const prior = state.orders.find(item => item.client === order.client);
@@ -267,7 +269,7 @@ async function refreshAssets(assetClass) {
       if (!Object.hasOwn(instruments, symbol) || isCrypto(symbol) !== crypto || !asset.tradable) continue;
       if (crypto) {
         const rules = { increment: +asset.min_trade_increment, minimum: +asset.min_order_size, tick: +asset.price_increment, minValue: 0 };
-        if (!asset.fractionable || ![rules.increment,rules.minimum,rules.tick].every(value => Number.isFinite(value) && value > 0)) continue;
+        if (!asset.fractionable || ![rules.increment, rules.minimum, rules.tick].every(value => Number.isFinite(value) && value > 0)) continue;
         cryptoRules.set(symbol, rules);
       }
       eligible.add(symbol);
@@ -313,9 +315,11 @@ async function reconcile() {
       }
     }
     state.positions = positions.map(p => ({ symbol: canonicalSymbol(p.symbol), qty: +p.qty, entry: +p.avg_entry_price, price: +p.current_price }));
-    state.account = { equity: +account.equity, cash: +account.cash, buyingPower: +account.buying_power, dayStart: +account.last_equity,
+    state.account = {
+      equity: +account.equity, cash: +account.cash, buyingPower: +account.buying_power, dayStart: +account.last_equity,
       cryptoBuyingPower: account.non_marginable_buying_power == null ? +account.cash : +account.non_marginable_buying_power,
-      exposure: positions.reduce((sum, p) => sum + Math.abs(+p.market_value), 0) };
+      exposure: positions.reduce((sum, p) => sum + Math.abs(+p.market_value), 0)
+    };
     const trading = !account.trading_blocked && !account.account_blocked && account.status === 'ACTIVE';
     state.sessionOpen = Boolean(clock?.is_open) && trading;
     state.cryptoSessionOpen = trading && (account.crypto_status == null || account.crypto_status === 'ACTIVE');
@@ -509,9 +513,9 @@ async function evaluate(bot) {
   const minimum = context.rules ? Math.max(context.rules.minValue, context.price * context.rules.minimum) : context.price;
   bot.status = !hasBudget(bot.budget) ? 'Budget required for new buys' :
     !context.ledger.complete ? 'Awaiting complete fill history' :
-    !context.warmedUp && !context.position ? `Warming up candles (${context.warmupCount}/${context.warmupNeeded})` :
-    context.cooldown > 0 && !context.position ? `Stop-loss cooldown (${context.cooldown} bars)` :
-    !context.position && context.ledger.available < minimum ? 'Budget below minimum order size' : 'Running';
+      !context.warmedUp && !context.position ? `Warming up candles (${context.warmupCount}/${context.warmupNeeded})` :
+        context.cooldown > 0 && !context.position ? `Stop-loss cooldown (${context.cooldown} bars)` :
+          !context.position && context.ledger.available < minimum ? 'Budget below minimum order size' : 'Running';
   const { proposal } = context;
   if (!proposal) {
     bot.lastBar = bar.t;
@@ -547,8 +551,10 @@ async function evaluate(bot) {
 
 async function applySignal(candidate, model = null) {
   const { bot, s, bar, proposal } = candidate;
-  const signal = { t: time(), symbol: s.symbol, direction: model?.side ?? proposal.side, rationale: model?.rationale ?? proposal.rationale,
-    strategyId: s.id, strategy: s.name, version: s.version, source: model ? aiProvider.name : 'Strategy rules' };
+  const signal = {
+    t: time(), symbol: s.symbol, direction: model?.side ?? proposal.side, rationale: model?.rationale ?? proposal.rationale,
+    strategyId: s.id, strategy: s.name, version: s.version, source: model ? aiProvider.name : 'Strategy rules'
+  };
   state.signals.unshift(signal);
   bot.lastEvaluation = { ...bot.lastEvaluation, t: bar.t, direction: signal.direction, rationale: signal.rationale };
   state.signals.length = Math.min(100, state.signals.length);
@@ -576,9 +582,11 @@ async function applySignal(candidate, model = null) {
   }
   const client = 'ft-' + createHash('sha256').update([s.id, s.version, bar.t, proposal.side].join('/')).digest('hex').slice(0, 40);
   if (state.orders.some(order => order.client === client)) return;
-  const order = { client, owned: true, strategyId: s.id, strategy: s.name, version: s.version, symbol: s.symbol, side: proposal.side,
+  const order = {
+    client, owned: true, strategyId: s.id, strategy: s.name, version: s.version, symbol: s.symbol, side: proposal.side,
     qty, filled: 0, status: 'unknown', t: time(), price: null,
-    limitPrice: demo ? null : limitPrice };
+    limitPrice: demo ? null : limitPrice
+  };
   if (demo) {
     order.status = 'filled';
     order.filled = qty;
@@ -603,9 +611,11 @@ async function applySignal(candidate, model = null) {
     const decimal = value => value.toFixed(9).replace(/\.?0+$/, '');
     const execution = proposal.side === 'buy' ? { type: 'limit', limit_price: rules ? decimal(order.limitPrice) : order.limitPrice.toFixed(2) } : { type: 'market' };
     const timeInForce = rules ? (proposal.side === 'buy' ? 'ioc' : 'gtc') : 'day';
-    const submitted = await broker('/orders', { method: 'POST', body: JSON.stringify({
-      symbol: s.symbol, qty: rules ? decimal(qty) : String(qty), side: proposal.side, ...execution, time_in_force: timeInForce, client_order_id: client
-    }) });
+    const submitted = await broker('/orders', {
+      method: 'POST', body: JSON.stringify({
+        symbol: s.symbol, qty: rules ? decimal(qty) : String(qty), side: proposal.side, ...execution, time_in_force: timeInForce, client_order_id: client
+      })
+    });
     updateOrder(normalize(submitted));
     if (proposal.stopLoss) bot.cooldownBars = s.cooldown ?? 0;
   } catch (error) {
@@ -628,7 +638,7 @@ if (demo) {
     history(symbol, Date.now() - 3 * 86400000, end).then(bars => serial(() => {
       const merged = new Map([...bars, ...(state.bars[symbol] ?? [])].map(bar => [bar.t, bar]));
       state.bars[symbol] = [...merged.values()].sort((a, b) => a.t.localeCompare(b.t)).slice(-1500);
-    })).catch(() => {});
+    })).catch(() => { });
   }
 }
 async function cycle() {
@@ -684,7 +694,7 @@ async function cycle() {
 await cycle();
 setInterval(cycle, 5000);
 
-const assets = { '/': ['index.html','text/html'], '/app.js': ['app.js','text/javascript'], '/style.css': ['style.css','text/css'], '/sw.js': ['sw.js','text/javascript'], '/mark.svg': ['mark.svg','image/svg+xml'], '/favicon.ico': ['mark.svg','image/svg+xml'] };
+const assets = { '/': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/style.css': ['style.css', 'text/css'], '/sw.js': ['sw.js', 'text/javascript'], '/mark.svg': ['mark.svg', 'image/svg+xml'], '/favicon.ico': ['mark.svg', 'image/svg+xml'] };
 function snapshot() {
   const market = symbols.map(symbol => {
     const [name] = instruments[symbol];
@@ -695,12 +705,14 @@ function snapshot() {
     const trade = state.quotes[symbol], last = bars.at(-1);
     const quote = trade && (!last || trade.t >= last.t) ? trade : { price: last?.c, t: last?.t };
     const window = bars.slice(-60);
-    return { symbol, name, assetClass: crypto ? 'crypto' : 'stock', source: sourceFor(symbol),
+    return {
+      symbol, name, assetClass: crypto ? 'crypto' : 'stock', source: sourceFor(symbol),
       eligible: eligible.has(symbol) && (demo || !crypto || state.cryptoSessionOpen), ...quote, metricsAt: window.at(-1)?.t,
       change: first && quote.price ? 100 * (quote.price / first - 1) : null,
       volume: window.length ? window.reduce((sum, bar) => sum + (bar.v ?? 0) * (crypto ? bar.vw ?? bar.c : 1), 0) : null,
       volatility: first ? 100 * (Math.max(...window.map(bar => bar.c)) - Math.min(...window.map(bar => bar.c))) / first : null,
-      freshness: Date.now() - Date.parse(quote.t) < maxAge && ['live','simulated','delayed','polling'].includes(status) ? status : status === 'delayed' ? 'delayed' : 'cached' };
+      freshness: Date.now() - Date.parse(quote.t) < maxAge && ['live', 'simulated', 'delayed', 'polling'].includes(status) ? status : status === 'delayed' ? 'delayed' : 'cached'
+    };
   });
   const botSessions = Object.fromEntries(Object.values(state.bots).map(bot => {
     const orders = botOrders(bot.id);
@@ -711,13 +723,15 @@ function snapshot() {
     const unrealized = ledger.complete && ledger.qty > 0 ? Number.isFinite(mark) ? ledger.qty * mark - ledger.cost : null : ledger.complete ? 0 : null;
     return [bot.id, { ...ledger, available: reserved === null ? 0 : Math.max(0, ledger.available - reserved), reserved, mark, unrealized }];
   }));
-  return { ...state, botSessions, orders: state.orders.toSorted((a, b) => (b.t ?? '').localeCompare(a.t ?? '')).slice(0, 500),
+  return {
+    ...state, botSessions, orders: state.orders.toSorted((a, b) => (b.t ?? '').localeCompare(a.t ?? '')).slice(0, 500),
     runs: state.runs.map(({ curve, trades, ...run }) => ({
-    ...run, curve: curve.filter((_, idx) => idx % Math.ceil(curve.length / 650) === 0 || idx === curve.length - 1),
-    tradeCount: trades.length, trades: trades.slice(-250)
-  })),
+      ...run, curve: curve.filter((_, idx) => idx % Math.ceil(curve.length / 650) === 0 || idx === curve.length - 1),
+      tradeCount: trades.length, trades: trades.slice(-250)
+    })),
     mode, accountKey: storeKey, supabaseConnected: remoteStore.enabled, telegramConfigured: telegram.configured, market, aiConfigured: Boolean(aiProvider), aiProvider: aiProvider?.name ?? null,
-    feedName: demo ? 'Synthetic market' : 'Alpaca ' + feed.toUpperCase() };
+    feedName: demo ? 'Synthetic market' : 'Alpaca ' + feed.toUpperCase()
+  };
 }
 async function body(req, limit = 20000) {
   let raw = '';
@@ -769,8 +783,10 @@ async function change(path, input) {
           (item.sourceStrategy?.rootId ?? item.sourceStrategy?.id ?? item.id) === rootId);
         if (reused) s = reused;
         else {
-          s = { ...strategy({ ...source, symbol }), id: randomUUID(), version: 1,
-            sourceStrategy: { id: source.id, version: source.version, symbol: source.symbol, rootId } };
+          s = {
+            ...strategy({ ...source, symbol }), id: randomUUID(), version: 1,
+            sourceStrategy: { id: source.id, version: source.version, symbol: source.symbol, rootId }
+          };
           state.strategies.push(s);
         }
       }
@@ -811,7 +827,7 @@ async function change(path, input) {
       return bot;
     }
     const source = state.strategies.find(item => item.id === input.id && item.version === input.version);
-    if (!source || !['running','paused','stopped'].includes(input.action)) throw Error('Invalid bot command.');
+    if (!source || !['running', 'paused', 'stopped'].includes(input.action)) throw Error('Invalid bot command.');
     if (input.symbol !== undefined && input.symbol !== source.symbol) throw Error('The instrument does not match this strategy version.');
     let s = source;
     if (input.instrument !== undefined) {
@@ -822,8 +838,10 @@ async function change(path, input) {
           (item.sourceStrategy?.rootId ?? item.sourceStrategy?.id ?? item.id) === rootId &&
           state.bots[item.id]?.symbol === input.instrument);
         if (reused) throw Error('A bot already uses this strategy on that instrument. Open its session to resume it.');
-        s = { ...strategy({ ...source, symbol: input.instrument }), id: randomUUID(), version: 1,
-          sourceStrategy: { id: source.id, version: source.version, symbol: source.symbol, rootId } };
+        s = {
+          ...strategy({ ...source, symbol: input.instrument }), id: randomUUID(), version: 1,
+          sourceStrategy: { id: source.id, version: source.version, symbol: source.symbol, rootId }
+        };
       }
     }
     const previous = state.bots[s.id];
@@ -858,15 +876,17 @@ async function change(path, input) {
     }
     if (previous?.version === s.version && previous.desired === input.action && previous.budget === budget) return previous;
     if (s !== source) state.strategies.push(s);
-    state.bots[s.id] = { id: s.id, version: s.version, name: s.name, symbol: s.symbol, desired: input.action, status: input.action,
+    state.bots[s.id] = {
+      id: s.id, version: s.version, name: s.name, symbol: s.symbol, desired: input.action, status: input.action,
       budget, createdAt: previous?.createdAt ?? previous?.started ?? Date.now(), started: Date.now(),
       lastBar: previous?.symbol === s.symbol ? previous.lastBar : undefined,
-      lastEvaluation: previous?.version === s.version && previous?.symbol === s.symbol ? previous.lastEvaluation : undefined };
+      lastEvaluation: previous?.version === s.version && previous?.symbol === s.symbol ? previous.lastEvaluation : undefined
+    };
     return state.bots[s.id];
   }
   if (path === '/api/settings') {
     if (input.testTelegram === true) return telegram.sendTest(mode);
-    state.alerts = Object.fromEntries(['signals','fills','risk','connections','telegram'].map(key => [key, input[key] === true]));
+    state.alerts = Object.fromEntries(['signals', 'fills', 'risk', 'connections', 'telegram'].map(key => [key, input[key] === true]));
     return state.alerts;
   }
   if (path === '/api/profile') {
@@ -930,7 +950,7 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === 'POST' && url.pathname.startsWith('/api/') &&
       (!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] ?? '') ||
-       (req.headers.origin && new URL(req.headers.origin).host !== req.headers.host))) {
+        (req.headers.origin && new URL(req.headers.origin).host !== req.headers.host))) {
       return respond(403, { error: 'Use a same-origin JSON request.' });
     }
     if (req.method === 'GET' && url.pathname === '/api/auth') return respond(200, auth.status(req.headers.cookie));
