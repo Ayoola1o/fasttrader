@@ -989,7 +989,7 @@ async function change(path, input) {
 }
 async function backtest(input) {
   const s = state.strategies.find(item => item.id === input.id && item.version === input.version);
-  if (!s || s.ai) throw Error('Select a saved strategy with deterministic inputs for historical replay.');
+  if (!s || s.mode === 'ai_notepad') throw Error('AI Notepad strategies cannot be replayed deterministically. Select a Rule Builder or preset strategy.');
   const { capital, fees, slippage } = input;
   const hasBudget = input.budget !== undefined && input.budget !== null && input.budget !== '';
   const budget = hasBudget ? Number(input.budget) : undefined;

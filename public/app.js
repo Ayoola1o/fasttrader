@@ -491,7 +491,7 @@ function strategies(){
  ${panel('Saved strategies','Latest versions',latest().map(s=>`<div class="bot-row"><div><b>${esc(s.name)}</b><small>${esc(s.symbol)} · ${s.mode==='ai_notepad'?'AI Notepad':esc(s.timeframe??'1Min')} · v${s.version}</small></div><div class="actions">${btn('Edit','edit',key(s))}${startTrade(s)}</div></div>`).join(''))}</div></div>`;
 }
 function backtesting(){
- const runs=state.runs,eligible=state.strategies.filter(s=>!s.ai).reverse(),requested=params().get('version');
+ const runs=state.runs,eligible=state.strategies.filter(s=>s.mode!=='ai_notepad').reverse(),notepadCount=state.strategies.filter(s=>s.mode==='ai_notepad').length,requested=params().get('version');
  const chosen=eligible.some(s=>key(s)===requested)?requested:'';
  const chosenStrat=eligible.find(s=>key(s)===chosen);
  const cryptoDefault=chosenStrat?.symbol?.includes('/');
@@ -499,11 +499,12 @@ function backtesting(){
  if(!runs.some(r=>r.id===runA))runA=runs[0]?.id??'';
  if(runB===null&&runs.length>1)runB=runs[1].id;
  const a=runs.find(r=>r.id===runA),b=runs.find(r=>r.id===runB);
- const inputs=select('Saved strategy','version',[['','Choose a saved strategy'],...eligible.map(s=>[key(s),s.name+' v'+s.version+' · '+s.symbol+' ('+(s.timeframe??'1Min')+')'])],chosen,true)+
+ const inputs=select('Saved strategy','version',[['','Choose a saved strategy'],...eligible.map(s=>[key(s),s.name+' v'+s.version+' · '+s.symbol+' ('+(s.timeframe??'1Min')+')'+(s.ai?' · rules only':'')])],chosen,true)+
  field('Start date','start',date(Date.now()-86400000*7),'type="date" required')+field('End date','end',date(Date.now()),'type="date" required')+
  numeric('Starting capital ($)','capital',100000,100,1e9,1)+
  field('Bot budget cap ($, optional)','budget','','type="number" min="1" max="1000000000" step="0.01" placeholder="Optional cap"')+
  numeric('Fees (bps)','fees',cryptoDefault?25:1,0,500)+numeric('Slippage (bps)','slippage',cryptoDefault?5:2,0,500);
+ const notepadHint=notepadCount?`<small style="display:block;margin-top:6px;color:var(--muted)">${notepadCount} AI Notepad ${notepadCount===1?'strategy is':'strategies are'} excluded from historical replay because they evaluate free-form text via live AI rather than deterministic rules. Rule-based strategies with AI confirmation enabled replay their underlying rules.</small>`:'';
  const pfText=m=>!m?'—':m.profitFactor!==null?m.profitFactor.toFixed(2):(m.wins>0&&m.losses===0?'∞':'—');
  const summary=r=>{
    if(!r)return empty('Choose a second run to compare.');
@@ -515,7 +516,7 @@ function backtesting(){
  };
  const openNote=a?.metrics?.openPosition?`<small style="display:block;margin-bottom:8px;color:var(--muted)">Open position at end of test: ${qtyText(a.metrics.openPosition.qty)} @ ${usd(a.metrics.openPosition.entry)} (mark ${usd(a.metrics.openPosition.mark)}, unrealized <b class="${color(a.metrics.openPosition.unrealized)}">${usd(a.metrics.openPosition.unrealized)}</b>).</small>`:'';
  return page('Strategy research','Backtesting','Replay a saved strategy with next-bar-open fills, intrabar stops, and modeled trading costs.')+
- `<div class="stack">${panel('Run configuration','Signals evaluate on each strategy’s configured timeframe (1m / 5m / 15m / 1h). Next-bar open determines simulated execution; crypto defaults to 25 bps taker fees.',form('backtest',inputs,submit('Run backtest',!online||!eligible.length)))}
+ `<div class="stack">${panel('Run configuration','Signals evaluate on each strategy’s configured timeframe (1m / 5m / 15m / 1h). Next-bar open determines simulated execution; crypto defaults to 25 bps taker fees.',form('backtest',inputs,submit('Run backtest',!online||!eligible.length))+notepadHint)}
  ${a?panel('Run comparison','Compare equity curves and risk-adjusted metrics.',`<div id="run-select" class="form"><div class="fields">${select('First run','runA',runs.map(option),runA)}${select('Second run','runB',[['','Select run'],...runs.map(option)],runB)}</div></div><div class="form comparison">${summary(a)}${summary(b)}</div>`):''}
  ${a?panel('Drawdown','First run · decline from the equity high-water mark',plot(a.curve.map(p=>({t:p.t,value:p.drawdown})),'percent')):''}
  ${a?panel('Trade log','First run · latest 250 modeled fills, fees, and exit reasons',openNote+table(['Time','Side','Quantity','Fill price','Fees','Realized P&L','Reason'],a.trades.slice(-250).reverse().map(t=>[stamp(t.t),badge(t.side),qtyText(t.qty),usd(t.price),usd(t.fee),usd(t.pnl),esc(t.reason??'—')]),'No executions in this run.')):''}</div>`;
