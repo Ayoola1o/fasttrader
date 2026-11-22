@@ -240,9 +240,10 @@ function normalize(order) {
 function updateOrder(order) {
   const prior = state.orders.find(item => item.client === order.client);
   if (order.status === 'filled' && prior?.status !== 'filled') {
+    const botName = order.strategy ?? prior?.strategy;
     const val = Number.isFinite(order.price) && order.filled > 0 ? `$${(order.filled * order.price).toFixed(2)}` : '';
     const details = [
-      order.strategy ? `Bot: ${order.strategy}` : null,
+      botName ? `Bot: ${botName}` : null,
       Number.isFinite(order.price) ? `Filled: ${order.filled} @ $${order.price.toFixed(4)} ${val ? '(' + val + ')' : ''}` : null,
       Number.isFinite(order.pnl) ? `Realized P&L: ${order.pnl >= 0 ? '+' : ''}$${order.pnl.toFixed(2)}` : null
     ];
@@ -455,10 +456,7 @@ async function completeAI(job) {
       } else {
         bot.status = 'Running';
         if (model.side === proposal.side && !unresolvedFor(s.symbol)) {
-          if (!demo) {
-        await Promise.all([pollMarket('feed'), pollMarket('cryptoFeed')]);
-      }
-      try { await reconcile(); }
+          try { await reconcile(); }
           catch {
             state.broker = 'offline';
             brokerAt = 0;
@@ -521,7 +519,7 @@ async function evaluate(bot) {
     if ((bot.cooldownBars ?? 0) > 0) bot.cooldownBars--;
     const rationale = !context.warmedUp && !context.position ? `Warming up: ${context.warmupCount}/${context.warmupNeeded} contiguous ${context.timeframe} candles` :
       context.cooldown > 0 && !context.position ? `Post-stop-loss cooldown (${context.cooldown} bars remaining)` :
-      context.volume === 0 && !context.position ? 'Skipped zero-volume bar' :
+      !context.rules && context.volume === 0 && !context.position ? 'Skipped zero-volume bar' :
       bot.status !== 'Running' ? bot.status :
       state.account.equity <= state.account.dayStart * (1 - s.dailyLoss / 100) ? 'Daily loss limit reached' :
       context.cash < minimum && !context.position ? 'Available buying power is below the minimum order' :
@@ -780,7 +778,7 @@ async function change(path, input) {
       if (!Number.isFinite(adoptPrice) || adoptPrice <= 0) throw Error('Position price is unavailable for adoption.');
       const priorLedger = botLedger(botOrders(s.id), symbol, null);
       const adoptedCost = position.qty * adoptPrice;
-      const budget = Math.min(1e9, Number(Math.max(1, priorLedger.invested + adoptedCost + extra).toFixed(2)));
+      const budget = Math.min(1e9, Number(Math.max(1, priorLedger.invested - Math.min(0, priorLedger.realized) + adoptedCost + extra).toFixed(2)));
       const nowIso = time();
       state.orders.unshift({
         client: 'ft-adopt-' + randomUUID().slice(0, 12),
