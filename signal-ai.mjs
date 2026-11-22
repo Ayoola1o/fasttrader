@@ -10,8 +10,11 @@ export function signalProvider(env) {
 
 export async function assessSignal(provider, symbol, side, bars, request = fetch, context = null) {
   if (!provider) throw Error('AI provider is unconfigured');
+  const autonomous = context?.aiAutonomous === true && typeof context?.aiNotes === 'string' && context.aiNotes.trim().length > 0;
   const customRule = typeof context?.aiPrompt === 'string' && context.aiPrompt.trim() ? ' User confirmation rule: ' + context.aiPrompt.trim().slice(0, 300) : '';
-  const instruction = 'Analyze the recent minute bars, price action, and proposed direction. Return JSON with side (buy, sell, or hold) and rationale (one sentence). Use hold if the proposed direction lacks support.' + customRule;
+  const instruction = autonomous
+    ? 'You are executing a paper trading strategy written by the user. Follow the user strategy notes strictly using the provided market candles, indicators, open position state, and news. Return JSON with side (buy, sell, or hold) and rationale (one concise sentence explaining which part of the strategy matched or why you chose hold). Only return buy when flat, only return sell when holding a position, otherwise return hold. User strategy:\n' + context.aiNotes.trim().slice(0, 4000)
+    : 'Analyze the recent minute bars, price action, and proposed direction. Return JSON with side (buy, sell, or hold) and rationale (one sentence). Use hold if the proposed direction lacks support.' + customRule;
   const recent = bars.slice(-20);
   const payload = {
     symbol,

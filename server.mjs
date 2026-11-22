@@ -1,7 +1,7 @@
 import { createServer } from 'node:http';
 import { readFile, mkdir, writeFile, rename } from 'node:fs/promises';
 import { randomUUID, createHash } from 'node:crypto';
-import { instruments, defaults, strategy, decision, replay, synthetic, botLedger, isCrypto, cryptoReplayRules, roundDown, contiguousBars, aggregateBars, computeATR, timeframes, ruleWarmupBars } from './engine.mjs';
+import { instruments, defaults, strategy, decision, replay, synthetic, botLedger, isCrypto, cryptoReplayRules, roundDown, contiguousBars, aggregateBars, computeATR, computeRSI, indicatorValue, timeframes, ruleWarmupBars } from './engine.mjs';
 import { assessSignal, signalProvider } from './signal-ai.mjs';
 import { createAuth, sameSecret } from './auth.mjs';
 import { createStore } from './store.mjs';
@@ -443,8 +443,16 @@ async function completeAI(job) {
   let model, error;
   try {
     const headlines = await recentNews(s.symbol);
+    const indicators = s.mode === 'ai_notepad' ? {
+      sma12: indicatorValue(bars, { indicator: 'sma', period: 12 }),
+      ema20: indicatorValue(bars, { indicator: 'ema', period: 20 }),
+      ema50: indicatorValue(bars, { indicator: 'ema', period: 50 }),
+      rsi14: computeRSI(bars.map(b => b.c), 14),
+      atr14: computeATR(bars, 14)
+    } : undefined;
     model = await assessSignal(aiProvider, s.symbol, proposal.side, bars, fetch, {
       price, rationale: proposal.rationale, period: s.period, mode: s.mode ?? 'momentum', timeframe: s.timeframe ?? '1Min',
+      ...(proposal.aiAutonomous ? { aiAutonomous: true, aiNotes: s.aiNotes, indicators } : {}),
       ...(s.aiPrompt ? { aiPrompt: s.aiPrompt } : {}),
       ...(headlines.length ? { headlines } : {}),
       position: position ? { qty: position.qty, entry: position.entry, pnlPct: Number((100 * (price / position.entry - 1)).toFixed(2)) } : null
@@ -539,8 +547,8 @@ async function evaluate(bot) {
     }
     bot.lastBar = bar.t;
     bot.lastEvaluation = { t: bar.t, price: context.price, direction: proposal.side, rationale: proposal.rationale };
-    pendingAI.set(bot.id, { ...candidate, bars: bars.slice(-20) });
-    bot.status = 'Awaiting AI confirmation';
+    pendingAI.set(bot.id, { ...candidate, bars: s.mode === 'ai_notepad' ? aggregateBars(bars, s.timeframe ?? '1Min').slice(-60) : bars.slice(-20) });
+    bot.status = s.mode === 'ai_notepad' ? 'AI reading strategy notepad' : 'Awaiting AI confirmation';
     drainAI();
     return;
   }

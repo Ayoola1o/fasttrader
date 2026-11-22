@@ -322,9 +322,14 @@ function screener(){
  table(['Asset','Price','Change','Volatility',crypto?'USD turnover':'Volume','Source / freshness',''],rows,'No instruments match these filters.'));
 }
 const fields=[['Lookback (bars)','period',2,60,1],['Entry threshold (%)','entry',0,25],['Exit threshold (%)','exit',-25,0],['Position size (% equity)','size',.1,100],['Fixed size (USD)','sizeUsd',1,1e9,1],['Maximum exposure (% equity)','exposure',.1,100],['Maximum daily loss (%)','dailyLoss',.1,50],['Stop-loss (%)','stop',.1,50],['Trailing stop (%, 0=off)','trailingStop',0,50,.1],['Take-profit (%)','take',.1,100],['ATR stop multiplier (0=off)','atrStop',0,10,.1],['Stop-loss cooldown (bars)','cooldown',0,60,1],['Max hold (bars, 0=off)','maxHoldBars',0,1440,1]];
-const defaultParams={mode:'momentum',timeframe:'1Min',period:12,entry:0.1,exit:-0.1,sizeMode:'percent',size:10,sizeUsd:500,exposure:20,dailyLoss:3,stop:2,trailingStop:0,take:4,atrStop:0,cooldown:5,maxHoldBars:0,ai:false,aiPrompt:'',rules:null};
-const fresh=(symbol='')=>({...defaultParams,id:'',version:0,name:'',symbol,rules:null});
-const modeLabels={momentum:'Momentum (SMA)',mean_reversion:'Mean Reversion (Bollinger + RSI)',breakout:'Breakout (Donchian Channel)',custom:'Custom Rule Builder'};
+const defaultParams={mode:'momentum',timeframe:'1Min',period:12,entry:0.1,exit:-0.1,sizeMode:'percent',size:10,sizeUsd:500,exposure:20,dailyLoss:3,stop:2,trailingStop:0,take:4,atrStop:0,cooldown:5,maxHoldBars:0,ai:false,aiPrompt:'',aiNotes:'',rules:null};
+const fresh=(symbol='',mode='momentum')=>({...defaultParams,mode,ai:mode==='ai_notepad',id:'',version:0,name:'',symbol,rules:null});
+const modeLabels={momentum:'Momentum (SMA)',mean_reversion:'Mean Reversion (Bollinger + RSI)',breakout:'Breakout (Donchian Channel)',custom:'Custom Rule Builder',ai_notepad:'AI Notepad Strategy'};
+const notepadTemplates={
+ smart_dip:{label:'Smart Dip Buyer',name:'AI Smart Dip Buyer',timeframe:'15Min',sizeMode:'usd',sizeUsd:500,stop:2.5,trailingStop:1.5,take:5,aiNotes:'Strategy: Smart Dip Buyer (Long-Only)\n\nENTRY (BUY when flat):\n- Buy only if price is pulling back in an overall uptrend (near or above EMA 50) OR RSI(14) is oversold (< 38) with a stabilizing green candle.\n- Avoid buying vertical green spikes (>1.5% in a single candle) or negative breaking news.\n\nEXIT (SELL when holding):\n- Sell if RSI(14) becomes overbought (> 72) and momentum stalls.\n- Sell if bearish news breaks or price closes decisively below EMA 20.\n\nOtherwise return HOLD.'},
+ breakout_rider:{label:'Breakout & Trend Rider',name:'AI Breakout Rider',timeframe:'15Min',sizeMode:'usd',sizeUsd:500,stop:2,trailingStop:1.8,take:6,aiNotes:'Strategy: Momentum Breakout Rider\n\nENTRY (BUY when flat):\n- Enter when price breaks cleanly above recent 10-bar highs with expanding candle bodies and EMA 20 sloping up.\n- Confirm RSI(14) is between 52 and 72 (strong trend, not exhausted).\n\nEXIT (SELL when holding):\n- Take profit if trend loses steam with 2 consecutive red candles below EMA 20.\n- Hold through normal minor pullbacks while above EMA 20.\n\nOtherwise return HOLD.'},
+ news_swing:{label:'News + Price Action',name:'AI News Catalyst Swing',timeframe:'5Min',sizeMode:'usd',sizeUsd:500,stop:2,trailingStop:1.5,take:4.5,aiNotes:'Strategy: News & Price Action Swing\n\nENTRY (BUY when flat):\n- Buy when recent headlines are bullish or neutral AND price is making higher lows above SMA 12.\n- Never buy into clearly bearish headlines or sharp sell-offs.\n\nEXIT (SELL when holding):\n- Exit immediately if bearish news appears or price drops sharply below recent support.\n- Otherwise let take-profit or trailing stop manage the winner.\n\nReturn HOLD when no clear edge exists.'}
+};
 const tfOptions=[['1Min','1 Minute'],['5Min','5 Minutes'],['15Min','15 Minutes'],['1Hour','1 Hour']];
 const tfMsMap={'1Min':60000,'5Min':300000,'15Min':900000,'1Hour':3600000};
 const ruleIndLabels={close:'Close',sma:'SMA',ema:'EMA',rsi:'RSI',bb_upper:'BB Upper',bb_lower:'BB Lower',macd:'MACD',macd_signal:'MACD Signal',donchian_high:'Donchian High',donchian_low:'Donchian Low',atr:'ATR',volume:'Volume',avg_volume:'Avg Volume',pct_change:'% Change',number:'Number'};
@@ -443,10 +448,33 @@ function strategies(){
  const saved=editor.id&&version(key(editor)),bot=saved&&state.bots[editor.id];
  const options=state.strategies.slice().reverse().map(s=>[key(s),s.name+' · '+s.symbol+' · v'+s.version]);
  const asset=state.market.find(m=>m.symbol===editor.symbol);
+ const isNotepad=editor.mode==='ai_notepad';
+ const editorSwitcher=`<div class="tabs" role="tablist" aria-label="Editor type">${btn('Visual Rule Builder','editor-type','visual',false,`role="tab" aria-selected="${!isNotepad}"`)}${btn('AI Strategy Notepad','editor-type','ai_notepad',false,`role="tab" aria-selected="${isNotepad}"`)}</div>`;
+ const startTrade=s=>link('Start trade','trading?version='+encodeURIComponent(key(s)),true);
+ const botActions=saved?`<div class="actions">${!saved.ai?link('Backtest v'+saved.version,'backtesting?version='+key(saved)):''}${bot?link('Open bot session',sessionRoute(bot)+'&version='+saved.version):''}${startTrade(saved)}</div>`:'';
+ if(isNotepad){
+   const noteTemplates=`<div class="template-bar"><span class="section-label">AI Notepad Starters</span><div class="actions">${Object.entries(notepadTemplates).map(([k,t])=>btn(t.label,'apply-note-template',k)).join('')}</div></div>`;
+   const noteBase=field('Strategy name','name',editor.name,'required maxlength="60" placeholder="e.g. AI Smart Dip Buyer"')+
+     select('Instrument or pair','symbol',[['','Choose an instrument'],...state.market.map(m=>[m.symbol,m.symbol+' · '+m.name])],asset?.symbol??'',true)+
+     select('Saved version','version',[['','New draft'],...options],saved?key(saved):'')+
+     select('Candle timeframe','timeframe',tfOptions,editor.timeframe??'15Min',true)+
+     select('Position sizing mode','sizeMode',[['percent','% of Equity'],['usd','Fixed USD per trade']],editor.sizeMode??'usd',true)+
+     numeric('Fixed size (USD)','sizeUsd',editor.sizeUsd??500,1,1e9,1);
+   const noteRisk=[['Position size (% equity)','size',.1,100],['Maximum exposure (% equity)','exposure',.1,100],['Stop-loss (%)','stop',.1,50],['Trailing stop (%, 0=off)','trailingStop',0,50,.1],['Take-profit (%)','take',.1,100],['Maximum daily loss (%)','dailyLoss',.1,50],['Stop-loss cooldown (bars)','cooldown',0,60,1],['Max hold (bars, 0=off)','maxHoldBars',0,1440,1]].map(([label,k,min,max,step])=>numeric(label,k,editor[k]??defaultParams[k],min,max,step)).join('');
+   const hiddenDefaults=`<input type="hidden" name="mode" value="ai_notepad"><input type="hidden" name="period" value="${editor.period??12}"><input type="hidden" name="entry" value="${editor.entry??0.1}"><input type="hidden" name="exit" value="${editor.exit??-0.1}"><input type="hidden" name="atrStop" value="${editor.atrStop??0}"><input type="checkbox" name="ai" checked hidden>`;
+   const notepadBox=`<label class="field notepad-field"><span>Write your strategy for the AI (plain English rules, entries, exits, news &amp; candle conditions)</span><textarea name="aiNotes" class="ai-notepad" rows="12" required minlength="10" maxlength="4000" placeholder="Example:\nBUY when price is above EMA 20 and RSI(14) pulls back below 40 with no bearish news.\nSELL when RSI(14) > 72 or price drops below EMA 20.\nOtherwise HOLD.">${esc(editor.aiNotes??'')}</textarea><small>${(editor.aiNotes??'').length} / 4000 characters · ${state.aiConfigured?esc(state.aiProvider)+' will read these notes + live candles, EMA/SMA/RSI/ATR, position P&amp;L, and Alpaca News on every bar.':'Configure GEMINI_API_KEY or OPENAI_API_KEY in server env to run AI Notepad bots.'}</small></label>`;
+   const guardCard=panel('AI Notepad guardrails','Hard risk limits always stay enforced in code',`<div class="bot-row"><span><b>AI engine</b><small>${state.aiConfigured?esc(state.aiProvider)+' active':'API key required'}</small></span>${badge(state.aiConfigured?'Ready':'Unconfigured',state.aiConfigured?'good':'bad')}</div><div class="bot-row"><span><b>Protective exits</b><small>Stop-loss ${editor.stop??2}% · Trail ${editor.trailingStop??0}% · Take-profit ${editor.take??4}%</small></span>${badge('Hard-coded','good')}</div><div class="bot-row"><span><b>Live context sent to AI</b><small>OHLCV candles, SMA12, EMA20/50, RSI14, ATR14, open P&amp;L &amp; Alpaca News</small></span>${badge(editor.timeframe??'15Min')}</div>`);
+   return page('Automated trading','Strategy Editor','Write a plain-English strategy in the AI Notepad or switch to the Visual Rule Builder.',btn(icon('plus')+' New strategy','new','',true))+
+     editorSwitcher+
+     `<div class="grid">${panel('AI Strategy Notepad','Write how the AI should read the market, enter, and exit',noteTemplates+form('strategy',noteBase+noteRisk,hiddenDefaults+notepadBox+submit(online?'Save AI strategy':'Queue draft sync')+`<small id="draft-status">${editor.queued?'Queued for sync':editor.dirty?'Local draft':''}</small>`))}
+     <div class="stack">${guardCard}${panel('Paper bot',bot?'Pinned to version '+bot.version:'Select a saved strategy version',
+     (bot?`<div class="bot-row"><span>${esc(bot.symbol)}</span>${badge(botStatus(bot))}</div>`:empty('Save your AI Notepad strategy to launch a bot.'))+'<div class="form">'+botActions+'</div>')}
+     ${panel('Saved strategies','Latest versions',latest().map(s=>`<div class="bot-row"><div><b>${esc(s.name)}</b><small>${esc(s.symbol)} · ${s.mode==='ai_notepad'?'AI Notepad':esc(s.timeframe??'1Min')} · v${s.version}</small></div><div class="actions">${btn('Edit','edit',key(s))}${startTrade(s)}</div></div>`).join(''))}</div></div>`;
+ }
  const templatesBar=`<div class="template-bar"><span class="section-label">1-Click Templates</span><div class="actions">${Object.entries(strategyTemplates).map(([k,t])=>btn(t.label,'apply-template',k)).join('')}</div></div>`;
  const baseInputs=field('Strategy name','name',editor.name,'required maxlength="60"')+select('Instrument or pair','symbol',[['','Choose an instrument'],...state.market.map(m=>[m.symbol,m.symbol+' · '+m.name])],asset?.symbol??'',true)+
  select('Saved version','version',[['','New draft'],...options],saved?key(saved):'')+
- select('Strategy mode','mode',Object.entries(modeLabels),editor.mode??'momentum',true)+
+ select('Strategy mode','mode',Object.entries(modeLabels).filter(([k])=>k!=='ai_notepad'),editor.mode??'momentum',true)+
  select('Candle timeframe','timeframe',tfOptions,editor.timeframe??'1Min',true)+
  select('Position sizing mode','sizeMode',[['percent','% of Equity'],['usd','Fixed USD per trade']],editor.sizeMode??'percent',true);
  const riskInputs=fields.map(([label,k,min,max,step])=>numeric(label,k,editor[k]??defaultParams[k],min,max,step)).join('');
@@ -454,14 +482,13 @@ function strategies(){
  const aiSection=check('Require AI confirmation for non-protective signals','ai',editor.ai)+
  field('Custom AI confirmation rule (optional)','aiPrompt',editor.aiPrompt??'','maxlength="300" placeholder="e.g. Veto buys if news is bearish or candle jumped >2%"')+
  '<small>'+(state.aiConfigured?esc(state.aiProvider ?? 'AI provider')+' configured (with live Alpaca News headlines). Historical replay uses deterministic rules.':'Configure a Gemini or OpenAI key in the server environment to enable AI confirmation.')+'</small>';
- const startTrade=s=>link('Start trade','trading?version='+encodeURIComponent(key(s)),true);
- const botActions=saved?`<div class="actions">${link('Backtest v'+saved.version,'backtesting?version='+key(saved))}${bot?link('Open bot session',sessionRoute(bot)+'&version='+saved.version):''}${startTrade(saved)}</div>`:'';
- return page('Automated trading','Strategy Editor','Build custom indicator rules, risk guardrails, and AI filters.',btn(icon('plus')+' New strategy','new','',true))+
+ return page('Automated trading','Strategy Editor','Build custom indicator rules or switch to the AI Strategy Notepad.',btn(icon('plus')+' New strategy','new','',true))+
+ editorSwitcher+
  `<div class="grid">${panel('Strategy & rule builder','Pick a template or stack custom Entry/Exit conditions',templatesBar+form('strategy',baseInputs+riskInputs,ruleBuilder+aiSection+
  submit(online?'Save version':'Queue draft sync')+`<small id="draft-status">${editor.queued?'Queued for sync':editor.dirty?'Local draft':''}</small>`))}
  <div class="stack">${renderLiveDebugger()}${panel('Paper bot',bot?'Pinned to version '+bot.version:'Select a saved strategy version',
  (bot?`<div class="bot-row"><span>${esc(bot.symbol)}</span>${badge(botStatus(bot))}</div>`:empty('Save a strategy to enable paper bot controls.'))+'<div class="form">'+botActions+'</div>')}
- ${panel('Saved strategies','Latest versions',latest().map(s=>`<div class="bot-row"><div><b>${esc(s.name)}</b><small>${esc(s.symbol)} · ${esc(s.timeframe??'1Min')} · v${s.version}</small></div><div class="actions">${btn('Edit','edit',key(s))}${startTrade(s)}</div></div>`).join(''))}</div></div>`;
+ ${panel('Saved strategies','Latest versions',latest().map(s=>`<div class="bot-row"><div><b>${esc(s.name)}</b><small>${esc(s.symbol)} · ${s.mode==='ai_notepad'?'AI Notepad':esc(s.timeframe??'1Min')} · v${s.version}</small></div><div class="actions">${btn('Edit','edit',key(s))}${startTrade(s)}</div></div>`).join(''))}</div></div>`;
 }
 function backtesting(){
  const runs=state.runs,eligible=state.strategies.filter(s=>!s.ai).reverse(),requested=params().get('version');
@@ -784,6 +811,17 @@ document.addEventListener('click',async event=>{
  if(action==='apply-template'){
    const tpl=strategyTemplates[value];
    if(tpl){editor={...editor,...structuredClone(tpl),id:editor?.id??'',version:editor?.version??0,symbol:editor?.symbol||state.market[0]?.symbol||'',dirty:true,mutation:crypto.randomUUID()};toast('Loaded template: '+tpl.label)}
+ }
+ if(action==='editor-type'){
+   if(value==='ai_notepad'){
+     editor={...editor,mode:'ai_notepad',ai:true,timeframe:editor?.timeframe==='1Min'?'15Min':(editor?.timeframe??'15Min'),dirty:true,mutation:crypto.randomUUID()};
+   }else{
+     editor={...editor,mode:editor?.mode==='ai_notepad'?'momentum':(editor?.mode??'momentum'),dirty:true,mutation:crypto.randomUUID()};
+   }
+ }
+ if(action==='apply-note-template'){
+   const tpl=notepadTemplates[value];
+   if(tpl){editor={...editor,...structuredClone(tpl),mode:'ai_notepad',ai:true,id:editor?.id??'',version:editor?.version??0,symbol:editor?.symbol||state.market[0]?.symbol||'',dirty:true,mutation:crypto.randomUUID()};toast('Loaded AI Notepad starter: '+tpl.label)}
  }
  if(action==='rule-logic'){
    const r=ensureRules();

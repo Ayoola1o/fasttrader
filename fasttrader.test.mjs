@@ -10,7 +10,7 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { defaults, decision, replay, botLedger, contiguousBars, aggregateBars, computeATR, strategy, evaluateRuleSet } from './engine.mjs';
-import { signalProvider } from './signal-ai.mjs';
+import { signalProvider, assessSignal } from './signal-ai.mjs';
 import { createTelegram } from './telegram.mjs';
 import { handleBridge } from './api/bridge.js';
 
@@ -169,6 +169,27 @@ test('telegram notifier formats HTML safely, throttles connection spam, and send
   const res = await tg.sendTest('alpaca');
   assert.equal(res.sent, true);
   assert.equal(sent.length, 3);
+});
+
+test('AI Notepad strategy validates notes, enforces hard stop-loss, and sends user notes to AI', async () => {
+  assert.throws(() => strategy({ ...defaults, name: 'Empty Note', mode: 'ai_notepad', aiNotes: 'short' }), /AI Notepad/);
+  const noteStrat = strategy({ ...defaults, name: 'Dip Note', mode: 'ai_notepad', timeframe: '15Min', aiNotes: 'Buy on oversold RSI dip above EMA 50, sell when RSI > 72.' });
+  assert.equal(noteStrat.ai, true);
+  const account = { equity: 10000, cash: 10000, dayStart: 10000, exposure: 0 };
+  const bars = Array.from({ length: 15 }, (_, i) => ({ t: new Date(Date.now() - (15 - i) * 60000).toISOString(), o: 100, h: 101, l: 99, c: 100, v: 100 }));
+  const prop = decision(noteStrat, bars.map(b => b.c), account, null, 100, null, { bars, warmedUp: true });
+  assert.equal(prop?.aiAutonomous, true);
+  // Hard stop-loss still triggers deterministically without AI
+  const stop = decision(noteStrat, bars.map(b => b.c), account, { qty: 10, entry: 100 }, 97, null, { bars, warmedUp: true });
+  assert.equal(stop?.protective, true);
+  assert.equal(stop?.side, 'sell');
+  // assessSignal includes user's notepad instructions in systemInstruction
+  let captured;
+  await assessSignal({ name: 'Gemini', key: 'k', model: 'gemini-2.5-flash' }, 'BTC/USD', 'buy', bars, async (_url, init) => {
+    captured = JSON.parse(init.body);
+    return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: JSON.stringify({ side: 'hold', rationale: 'Waiting for dip.' }) }] } }] }) };
+  }, { aiAutonomous: true, aiNotes: noteStrat.aiNotes, indicators: { rsi14: 55 } });
+  assert.match(captured.systemInstruction.parts[0].text, /Buy on oversold RSI dip/);
 });
 
 async function withDemo(run, mockAI, env = {}) {
