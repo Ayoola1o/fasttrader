@@ -8,13 +8,51 @@ export function signalProvider(env) {
   return null;
 }
 
+export async function testProviderKey(provider, request = fetch) {
+  if (!provider?.key || !['Gemini', 'OpenAI'].includes(provider.name)) throw Error('Choose Gemini or OpenAI and provide a valid API key.');
+  const gemini = provider.name === 'Gemini';
+  const headers = { 'Content-Type': 'application/json' };
+  let url, body;
+  if (gemini) {
+    url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent((provider.model || 'gemini-2.5-flash').replace(/^models\//, '')) + ':generateContent';
+    headers['x-goog-api-key'] = provider.key;
+    body = {
+      contents: [{ role: 'user', parts: [{ text: 'Reply with JSON {"ok":true}' }] }],
+      generationConfig: { responseMimeType: 'application/json', maxOutputTokens: 32 }
+    };
+  } else {
+    url = 'https://api.openai.com/v1/chat/completions';
+    headers.Authorization = 'Bearer ' + provider.key;
+    body = { model: provider.model || 'gpt-4.1-mini', response_format: { type: 'json_object' }, max_tokens: 32, messages: [
+      { role: 'user', content: 'Reply with JSON {"ok":true}' }
+    ] };
+  }
+  let response;
+  try {
+    response = await request(url, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(10000) });
+  } catch {
+    throw Error(provider.name + ' connection timed out.');
+  }
+  if (!response.ok) throw Error(provider.name + ' rejected key (HTTP ' + response.status + ')');
+  return { ok: true, provider: provider.name, model: provider.model };
+}
+
 export async function assessSignal(provider, symbol, side, bars, request = fetch, context = null) {
   if (!provider) throw Error('AI provider is unconfigured');
-  const autonomous = context?.aiAutonomous === true && typeof context?.aiNotes === 'string' && context.aiNotes.trim().length > 0;
+  const freeRoam = context?.aiFreeRoam === true;
+  const autonomous = !freeRoam && context?.aiAutonomous === true && typeof context?.aiNotes === 'string' && context.aiNotes.trim().length > 0;
   const customRule = typeof context?.aiPrompt === 'string' && context.aiPrompt.trim() ? ' User confirmation rule: ' + context.aiPrompt.trim().slice(0, 300) : '';
-  const instruction = autonomous
-    ? 'You are executing a paper trading strategy written by the user. Follow the user strategy notes strictly using the provided market candles, indicators, open position state, and news. Return JSON with side (buy, sell, or hold) and rationale (one concise sentence explaining which part of the strategy matched or why you chose hold). Only return buy when flat, only return sell when holding a position, otherwise return hold. User strategy:\n' + context.aiNotes.trim().slice(0, 4000)
-    : 'Analyze the recent minute bars, price action, and proposed direction. Return JSON with side (buy, sell, or hold) and rationale (one sentence). Use hold if the proposed direction lacks support.' + customRule;
+  let instruction;
+  if (freeRoam) {
+    const dynamic = context?.aiSizing === 'dynamic';
+    const feeNote = `Round-trip trading fee is ~${context?.roundTripFeeBps ?? 2} bps (${((context?.roundTripFeeBps ?? 2) / 100).toFixed(2)}%). Do NOT churn or take tiny trades smaller than fees.`;
+    const guidance = typeof context?.aiNotes === 'string' && context.aiNotes.trim() ? '\nOptional user guidance: ' + context.aiNotes.trim().slice(0, 1000) : '';
+    instruction = `You are an autonomous paper trading agent managing a dedicated USD budget for ${symbol} with a ${context?.aiRiskProfile ?? 'balanced'} risk profile. ${feeNote} Analyze the OHLCV candles, technical indicators, Alpaca news headlines, your current position & budget, and your recent decisions memory. Return JSON with side ("buy", "sell", or "hold"), allocationPct (${dynamic ? '25, 50, or 100 — percentage of available budget to buy or open position to sell' : '100'}), and rationale (one crisp sentence). Rules: do not sell when flat; ${dynamic ? 'you may buy while holding only to scale into high-conviction dips if budget is available' : 'only buy when flat and sell 100% when exiting'}; default to hold when edge is unclear.${guidance}`;
+  } else if (autonomous) {
+    instruction = 'You are executing a paper trading strategy written by the user. Follow the user strategy notes strictly using the provided market candles, indicators, open position state, and news. Return JSON with side (buy, sell, or hold) and rationale (one concise sentence explaining which part of the strategy matched or why you chose hold). Only return buy when flat, only return sell when holding a position, otherwise return hold. User strategy:\n' + context.aiNotes.trim().slice(0, 4000);
+  } else {
+    instruction = 'Analyze the recent minute bars, price action, and proposed direction. Return JSON with side (buy, sell, or hold) and rationale (one sentence). Use hold if the proposed direction lacks support.' + customRule;
+  }
   const recent = bars.slice(-20);
   const payload = {
     symbol,
@@ -30,12 +68,17 @@ export async function assessSignal(provider, symbol, side, bars, request = fetch
   if (gemini) {
     url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(provider.model.replace(/^models\//, '')) + ':generateContent';
     headers['x-goog-api-key'] = provider.key;
+    const properties = {
+      side: { type: 'STRING', enum: ['buy', 'sell', 'hold'] },
+      rationale: { type: 'STRING' },
+      ...(freeRoam ? { allocationPct: { type: 'INTEGER', enum: ['25', '50', '100'] } } : {})
+    };
     body = {
       systemInstruction: { parts: [{ text: instruction }] },
       contents: [{ role: 'user', parts: [{ text: input }] }],
       generationConfig: { responseMimeType: 'application/json', responseSchema: {
-        type: 'OBJECT', required: ['side', 'rationale'],
-        properties: { side: { type: 'STRING', enum: ['buy', 'sell', 'hold'] }, rationale: { type: 'STRING' } }
+        type: 'OBJECT', required: freeRoam ? ['side', 'allocationPct', 'rationale'] : ['side', 'rationale'],
+        properties
       } }
     };
   } else {
@@ -48,7 +91,7 @@ export async function assessSignal(provider, symbol, side, bars, request = fetch
 
   let response;
   try {
-    response = await request(url, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(10000) });
+    response = await request(url, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(12000) });
   } catch {
     throw Error('AI provider unavailable');
   }
@@ -62,7 +105,9 @@ export async function assessSignal(provider, symbol, side, bars, request = fetch
       : result.choices?.[0]?.message?.content;
     const output = JSON.parse(reply);
     if (!['buy', 'sell', 'hold'].includes(output?.side) || typeof output.rationale !== 'string' || !output.rationale.trim()) throw Error();
-    return { side: output.side, rationale: output.rationale.trim().slice(0, 400) };
+    const rawPct = Number(output.allocationPct);
+    const allocationPct = freeRoam && context?.aiSizing === 'dynamic' && [25, 50, 100].includes(rawPct) ? rawPct : 100;
+    return { side: output.side, rationale: output.rationale.trim().slice(0, 400), allocationPct };
   } catch {
     throw Error('Invalid AI response');
   }

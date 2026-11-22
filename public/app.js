@@ -284,6 +284,7 @@ function session(){
  const topUpForm=form('topup-bot',numeric('Add additional funds (USD)','addFunds','',1,1e9),submit('Add funds to bot',!online));
  const risk=bot.desired==='running'&&bot.budget?topUpForm:form('fund-bot',select('Strategy version','version',[['','Choose a strategy version'],...versions],selectedVersion,true)+numeric('Bot budget (USD)','budget',fundBudget??bot.budget??'',1,1e9),
        submit(bot.desired==='running'?'Set budget':bot.desired==='paused'?'Resume bot':'Restart bot',!online))+topUpForm;
+ const aiCallsBadge=strategy?.mode==='ai_autonomous'?badge(`AI calls today: ${bot.aiCallsToday??0}${strategy.aiDailyCap?' / '+strategy.aiDailyCap:''}`):'';
  const deleteControl=`<div class="form" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--line)"><div class="actions">${btn('Delete bot','open-delete-bot',bot.id,false,`style="background:#39212e;color:#ff8191;border-color:#592e42" ${!online?'disabled':''}`)}</div><small style="color:var(--muted)">Choose whether to liquidate any open position or leave it open when deleting.</small></div>`;
  const positionRows=holding?[[esc(bot.symbol),qtyText(book.qty),book.complete?usd(book.cost/book.qty):'—',usd(book.mark),
    Number.isFinite(book.mark)?usd(book.qty*book.mark):'—',moneyChange(book.unrealized)]]:[];
@@ -298,7 +299,7 @@ function session(){
    '<div class="stack">'+tradingView(bot.symbol,botOrders,holding?{qty:book.qty,entry:book.complete?book.cost/book.qty:null}:null,'Bot Trading View · Buy & Sell Markers')+'</div>'+
    '<div class="grid equal">'+panel('Position',positionStatus,table(['Asset','Units held','Average cost','Mark','Market value','Open P&L'],positionRows,'No open position held by this bot.'))+
    panel('Bot controls','Last evaluated '+stamp(bot.lastBar)+' · '+open.length+' open orders',
-     '<div class="form"><div class="actions">'+badge(botStatus(bot))+'<small>Started '+stamp(bot.started)+'</small></div>'+
+     '<div class="form"><div class="actions">'+badge(botStatus(bot))+aiCallsBadge+'<small>Started '+stamp(bot.started)+'</small></div>'+
      '<small>'+usd(book.reserved)+' reserved for pending buys</small></div>'+controls+liquidateControls+risk+deleteControl)+'</div>'+
    '<div class="stack">'+panel('Latest evaluation',bot.lastEvaluation?stamp(bot.lastEvaluation.t)+' · '+usd(bot.lastEvaluation.price):'Waiting for an evaluated bar',
      bot.lastEvaluation?'<div class="bot-row"><span>'+esc(bot.lastEvaluation.rationale)+'</span>'+badge(bot.lastEvaluation.direction)+'</div>':empty(botStatus(bot)))+
@@ -323,9 +324,14 @@ function screener(){
  table(['Asset','Price','Change','Volatility',crypto?'USD turnover':'Volume','Source / freshness',''],rows,'No instruments match these filters.'));
 }
 const fields=[['Lookback (bars)','period',2,60,1],['Entry threshold (%)','entry',0,25],['Exit threshold (%)','exit',-25,0],['Position size (% equity)','size',.1,100],['Fixed size (USD)','sizeUsd',1,1e9,1],['Maximum exposure (% equity)','exposure',.1,100],['Maximum daily loss (%)','dailyLoss',.1,50],['Stop-loss (%)','stop',.1,50],['Trailing stop (%, 0=off)','trailingStop',0,50,.1],['Take-profit (%)','take',.1,100],['ATR stop multiplier (0=off)','atrStop',0,10,.1],['Stop-loss cooldown (bars)','cooldown',0,60,1],['Max hold (bars, 0=off)','maxHoldBars',0,1440,1]];
-const defaultParams={mode:'momentum',timeframe:'1Min',period:12,entry:0.1,exit:-0.1,sizeMode:'percent',size:10,sizeUsd:500,exposure:20,dailyLoss:3,stop:2,trailingStop:0,take:4,atrStop:0,cooldown:5,maxHoldBars:0,ai:false,aiPrompt:'',aiNotes:'',rules:null};
-const fresh=(symbol='',mode='momentum')=>({...defaultParams,mode,ai:mode==='ai_notepad',id:'',version:0,name:'',symbol,rules:null});
-const modeLabels={momentum:'Momentum (SMA)',mean_reversion:'Mean Reversion (Bollinger + RSI)',breakout:'Breakout (Donchian Channel)',custom:'Custom Rule Builder',ai_notepad:'AI Notepad Strategy'};
+const defaultParams={mode:'momentum',timeframe:'1Min',period:12,entry:0.1,exit:-0.1,sizeMode:'percent',size:10,sizeUsd:500,exposure:20,dailyLoss:3,stop:2,trailingStop:0,take:4,atrStop:0,cooldown:5,maxHoldBars:0,ai:false,aiPrompt:'',aiNotes:'',aiWakeMode:'smart',aiRiskProfile:'balanced',aiSizing:'dynamic',aiDailyCap:100,rules:null};
+const fresh=(symbol='',mode='momentum')=>({...defaultParams,mode,ai:mode==='ai_notepad'||mode==='ai_autonomous',id:'',version:0,name:'',symbol,rules:null});
+const modeLabels={momentum:'Momentum (SMA)',mean_reversion:'Mean Reversion (Bollinger + RSI)',breakout:'Breakout (Donchian Channel)',custom:'Custom Rule Builder',ai_notepad:'AI Notepad Strategy',ai_autonomous:'Autonomous AI Agent'};
+const autoRiskPresets={
+ conservative:{label:'Conservative',stop:3,trailingStop:2,take:8,dailyLoss:4,cooldown:3},
+ balanced:{label:'Balanced',stop:5,trailingStop:3,take:12,dailyLoss:6,cooldown:2},
+ aggressive:{label:'Aggressive',stop:8,trailingStop:4,take:20,dailyLoss:10,cooldown:1}
+};
 const notepadTemplates={
  smart_dip:{label:'Smart Dip Buyer',name:'AI Smart Dip Buyer',timeframe:'15Min',sizeMode:'usd',sizeUsd:500,stop:2.5,trailingStop:1.5,take:5,aiNotes:'Strategy: Smart Dip Buyer (Long-Only)\n\nENTRY (BUY when flat):\n- Buy only if price is pulling back in an overall uptrend (near or above EMA 50) OR RSI(14) is oversold (< 38) with a stabilizing green candle.\n- Avoid buying vertical green spikes (>1.5% in a single candle) or negative breaking news.\n\nEXIT (SELL when holding):\n- Sell if RSI(14) becomes overbought (> 72) and momentum stalls.\n- Sell if bearish news breaks or price closes decisively below EMA 20.\n\nOtherwise return HOLD.'},
  breakout_rider:{label:'Breakout & Trend Rider',name:'AI Breakout Rider',timeframe:'15Min',sizeMode:'usd',sizeUsd:500,stop:2,trailingStop:1.8,take:6,aiNotes:'Strategy: Momentum Breakout Rider\n\nENTRY (BUY when flat):\n- Enter when price breaks cleanly above recent 10-bar highs with expanding candle bodies and EMA 20 sloping up.\n- Confirm RSI(14) is between 52 and 72 (strong trend, not exhausted).\n\nEXIT (SELL when holding):\n- Take profit if trend loses steam with 2 consecutive red candles below EMA 20.\n- Hold through normal minor pullbacks while above EMA 20.\n\nOtherwise return HOLD.'},
@@ -450,9 +456,38 @@ function strategies(){
  const options=state.strategies.slice().reverse().map(s=>[key(s),s.name+' · '+s.symbol+' · v'+s.version]);
  const asset=state.market.find(m=>m.symbol===editor.symbol);
  const isNotepad=editor.mode==='ai_notepad';
- const editorSwitcher=`<div class="tabs" role="tablist" aria-label="Editor type">${btn('Visual Rule Builder','editor-type','visual',false,`role="tab" aria-selected="${!isNotepad}"`)}${btn('AI Strategy Notepad','editor-type','ai_notepad',false,`role="tab" aria-selected="${isNotepad}"`)}</div>`;
+ const isAutonomous=editor.mode==='ai_autonomous';
+ const editorSwitcher=`<div class="tabs" role="tablist" aria-label="Editor type">${btn('Visual Rule Builder','editor-type','visual',false,`role="tab" aria-selected="${!isNotepad&&!isAutonomous}"`)}${btn('AI Strategy Notepad','editor-type','ai_notepad',false,`role="tab" aria-selected="${isNotepad}"`)}${btn('Autonomous AI','editor-type','ai_autonomous',false,`role="tab" aria-selected="${isAutonomous}"`)}</div>`;
  const startTrade=s=>link('Start trade','trading?version='+encodeURIComponent(key(s)),true);
- const botActions=saved?`<div class="actions">${!saved.ai?link('Backtest v'+saved.version,'backtesting?version='+key(saved)):''}${bot?link('Open bot session',sessionRoute(bot)+'&version='+saved.version):''}${startTrade(saved)}</div>`:'';
+ const botActions=saved?`<div class="actions">${!['ai_notepad','ai_autonomous'].includes(saved.mode)?link('Backtest v'+saved.version,'backtesting?version='+key(saved)):''}${bot?link('Open bot session',sessionRoute(bot)+'&version='+saved.version):''}${startTrade(saved)}</div>`:'';
+ const savedList=latest().map(s=>`<div class="bot-row"><div><b>${esc(s.name)}</b><small>${esc(s.symbol)} · ${s.mode==='ai_autonomous'?'Autonomous AI':s.mode==='ai_notepad'?'AI Notepad':esc(s.timeframe??'1Min')} · v${s.version}</small></div><div class="actions">${btn('Edit','edit',key(s))}${startTrade(s)}</div></div>`).join('');
+ if(isAutonomous){
+   const riskButtons=`<div class="template-bar"><span class="section-label">Risk Guardrail Presets</span><div class="actions">${Object.entries(autoRiskPresets).map(([k,p])=>btn(p.label,'apply-risk-preset',k,(editor.aiRiskProfile??'balanced')===k)).join('')}</div></div>`;
+   const autoTf=[['5Min','5 Minutes'],['15Min','15 Minutes (Recommended)'],['1Hour','1 Hour']];
+   const autoBase=field('Bot strategy name','name',editor.name,'required maxlength="60" placeholder="e.g. BTC Autonomous Agent"')+
+     select('Asset / Token to trade','symbol',[['','Choose an instrument'],...state.market.map(m=>[m.symbol,m.symbol+' · '+m.name])],asset?.symbol??'',true)+
+     select('Saved version','version',[['','New draft'],...options],saved?key(saved):'')+
+     select('Candle timeframe','timeframe',autoTf,['5Min','15Min','1Hour'].includes(editor.timeframe)?editor.timeframe:'15Min',true)+
+     select('AI wake-up mode','aiWakeMode',[['smart','Smart Wake-Up (saves ~80% AI calls)'],['fixed','Fixed Candle (every closed bar)']],editor.aiWakeMode??'smart',true)+
+     select('Position sizing','aiSizing',[['dynamic','Dynamic (AI picks 25% / 50% / 100%)'],['simple','Simple (100% in / 100% out)']],editor.aiSizing??'dynamic',true)+
+     numeric('Max AI calls / day (0=unlimited)','aiDailyCap',editor.aiDailyCap??100,0,500,1);
+   const autoRisk=[['Hard stop-loss (%)','stop',.1,50],['Trailing stop (%, 0=off)','trailingStop',0,50,.1],['Hard take-profit (%)','take',.1,100],['Daily loss circuit breaker (%)','dailyLoss',.1,50],['Post-stop cooldown (bars)','cooldown',0,60,1]].map(([label,k,min,max,step])=>numeric(label,k,editor[k]??defaultParams[k],min,max,step)).join('');
+   const hiddenAuto=`<input type="hidden" name="mode" value="ai_autonomous"><input type="hidden" name="aiRiskProfile" value="${esc(editor.aiRiskProfile??'balanced')}"><input type="hidden" name="sizeMode" value="percent"><input type="hidden" name="size" value="100"><input type="hidden" name="sizeUsd" value="${editor.sizeUsd??500}"><input type="hidden" name="exposure" value="100"><input type="hidden" name="period" value="12"><input type="hidden" name="entry" value="0.1"><input type="hidden" name="exit" value="-0.1"><input type="hidden" name="atrStop" value="0"><input type="hidden" name="maxHoldBars" value="0"><input type="checkbox" name="ai" checked hidden>`;
+   const guidanceBox=`<label class="field notepad-field"><span>Optional guidance for the AI (leave blank for full autonomy)</span><textarea name="aiNotes" class="ai-notepad" rows="4" maxlength="1000" placeholder="Optional: e.g. Prefer swing dips, avoid chasing green spikes, hold winners patiently.">${esc(editor.aiNotes??'')}</textarea><small>Set the USD budget when launching on Live Trading. The AI sees live candles, EMA/RSI/MACD/Bollinger/ATR, Alpaca News, round-trip fee costs, and its own last 5 decisions.</small></label>`;
+   const keySource=state.botAiConfigured?`Dedicated Bot Key (${state.botAiInfo.provider} · ${state.botAiInfo.masked})`:state.aiConfigured?`Fallback server key (${state.aiProvider})`:'No AI key configured';
+   const feeInfo=asset?.symbol?.includes('/')?'50 bps round-trip (Crypto)':'~2 bps round-trip (Stock)';
+   const autoCard=panel('Autonomous AI guardrails','Hard safety limits stay enforced even if AI is offline',
+     `<div class="bot-row"><span><b>AI API Key</b><small>${esc(keySource)}</small></span>${badge(state.botAiConfigured||state.aiConfigured?'Ready':'Key needed',state.botAiConfigured||state.aiConfigured?'good':'bad')}</div>`+
+     `<div class="bot-row"><span><b>Hard safety net</b><small>SL -${editor.stop??5}% · Trail ${editor.trailingStop??3}% · Daily cap -${editor.dailyLoss??6}%</small></span>${badge('Hard-coded','good')}</div>`+
+     `<div class="bot-row"><span><b>Fee-aware prompting</b><small>${feeInfo} · Cooldown ${editor.cooldown??2} bars</small></span>${badge(editor.aiWakeMode==='fixed'?'Fixed':'Smart Wake')}</div>`+
+     `<div class="form" style="padding-top:4px">${link('Manage Dedicated AI Bot Key in Settings','settings')}</div>`);
+   return page('Automated trading','Strategy Editor','Give an Autonomous AI bot a token and budget — it manages entries, scaling, and exits under hard guardrails.',btn(icon('plus')+' New strategy','new','',true))+
+     editorSwitcher+
+     `<div class="grid">${panel('Autonomous AI Agent','Pick a token, timeframe, wake-up mode, and hard risk limits',riskButtons+form('strategy',autoBase+autoRisk,hiddenAuto+guidanceBox+submit(online?'Save Autonomous AI strategy':'Queue draft sync')+`<small id="draft-status">${editor.queued?'Queued for sync':editor.dirty?'Local draft':''}</small>`))}
+     <div class="stack">${autoCard}${panel('Paper bot',bot?'Pinned to version '+bot.version:'Select a saved strategy version',
+     (bot?`<div class="bot-row"><span>${esc(bot.symbol)}</span>${badge(botStatus(bot))}</div>`:empty('Save this strategy, then click Start trade to assign a USD budget and launch.'))+'<div class="form">'+botActions+'</div>')}
+     ${panel('Saved strategies','Latest versions',savedList)}</div></div>`;
+ }
  if(isNotepad){
    const noteTemplates=`<div class="template-bar"><span class="section-label">AI Notepad Starters</span><div class="actions">${Object.entries(notepadTemplates).map(([k,t])=>btn(t.label,'apply-note-template',k)).join('')}</div></div>`;
    const noteBase=field('Strategy name','name',editor.name,'required maxlength="60" placeholder="e.g. AI Smart Dip Buyer"')+
@@ -475,7 +510,7 @@ function strategies(){
  const templatesBar=`<div class="template-bar"><span class="section-label">1-Click Templates</span><div class="actions">${Object.entries(strategyTemplates).map(([k,t])=>btn(t.label,'apply-template',k)).join('')}</div></div>`;
  const baseInputs=field('Strategy name','name',editor.name,'required maxlength="60"')+select('Instrument or pair','symbol',[['','Choose an instrument'],...state.market.map(m=>[m.symbol,m.symbol+' · '+m.name])],asset?.symbol??'',true)+
  select('Saved version','version',[['','New draft'],...options],saved?key(saved):'')+
- select('Strategy mode','mode',Object.entries(modeLabels).filter(([k])=>k!=='ai_notepad'),editor.mode??'momentum',true)+
+ select('Strategy mode','mode',Object.entries(modeLabels).filter(([k])=>k!=='ai_notepad'&&k!=='ai_autonomous'),editor.mode??'momentum',true)+
  select('Candle timeframe','timeframe',tfOptions,editor.timeframe??'1Min',true)+
  select('Position sizing mode','sizeMode',[['percent','% of Equity'],['usd','Fixed USD per trade']],editor.sizeMode??'percent',true);
  const riskInputs=fields.map(([label,k,min,max,step])=>numeric(label,k,editor[k]??defaultParams[k],min,max,step)).join('');
@@ -492,7 +527,7 @@ function strategies(){
  ${panel('Saved strategies','Latest versions',latest().map(s=>`<div class="bot-row"><div><b>${esc(s.name)}</b><small>${esc(s.symbol)} · ${s.mode==='ai_notepad'?'AI Notepad':esc(s.timeframe??'1Min')} · v${s.version}</small></div><div class="actions">${btn('Edit','edit',key(s))}${startTrade(s)}</div></div>`).join(''))}</div></div>`;
 }
 function backtesting(){
- const runs=state.runs,eligible=state.strategies.filter(s=>s.mode!=='ai_notepad').reverse(),notepadCount=state.strategies.filter(s=>s.mode==='ai_notepad').length,requested=params().get('version');
+ const runs=state.runs,eligible=state.strategies.filter(s=>!['ai_notepad','ai_autonomous'].includes(s.mode)).reverse(),notepadCount=state.strategies.filter(s=>['ai_notepad','ai_autonomous'].includes(s.mode)).length,requested=params().get('version');
  const chosen=eligible.some(s=>key(s)===requested)?requested:'';
  const chosenStrat=eligible.find(s=>key(s)===chosen);
  const cryptoDefault=chosenStrat?.symbol?.includes('/');
@@ -505,7 +540,7 @@ function backtesting(){
  numeric('Starting capital ($)','capital',100000,100,1e9,1)+
  field('Bot budget cap ($, optional)','budget','','type="number" min="1" max="1000000000" step="0.01" placeholder="Optional cap"')+
  numeric('Fees (bps)','fees',cryptoDefault?25:1,0,500)+numeric('Slippage (bps)','slippage',cryptoDefault?5:2,0,500);
- const notepadHint=notepadCount?`<small style="display:block;margin-top:6px;color:var(--muted)">${notepadCount} AI Notepad ${notepadCount===1?'strategy is':'strategies are'} excluded from historical replay because they evaluate free-form text via live AI rather than deterministic rules. Rule-based strategies with AI confirmation enabled replay their underlying rules.</small>`:'';
+ const notepadHint=notepadCount?`<small style="display:block;margin-top:6px;color:var(--muted)">${notepadCount} AI-driven (AI Notepad / Autonomous AI) ${notepadCount===1?'strategy is':'strategies are'} excluded from historical replay because they evaluate live AI rather than deterministic rules. Rule-based strategies with AI confirmation enabled replay their underlying rules.</small>`:'';
  const pfText=m=>!m?'—':m.profitFactor!==null?m.profitFactor.toFixed(2):(m.wins>0&&m.losses===0?'∞':'—');
  const summary=r=>{
    if(!r)return empty('Choose a second run to compare.');
@@ -540,8 +575,17 @@ function portfolio(){
 function settings(){
  const row=(label,desc,status)=>`<div class="bot-row"><div><b>${label}</b><small>${desc}</small></div>${badge(status)}</div>`;
  const events=state.events.map(e=>`<div class="activity-item">${esc(e.message)}<small>${stamp(e.t)}</small></div>`).join('');
- return page('Workspace preferences','Settings','Review data providers, paper connectivity, and in-app / Telegram notifications.')+
- `<div class="grid equal"><div class="stack">${panel('Integrations','Credentials are configured in the server environment.',row('Stock data',esc(state.feedName),state.feed)+row('Paper broker',state.mode==='demo'?'Local simulated fills':'Alpaca Paper API',state.broker)+row('AI signal confirmation',esc(state.aiProvider ?? 'Gemini or OpenAI'),state.aiConfigured?'configured':'unconfigured')+row('Telegram alerts',state.telegramConfigured?'Bot connected':'Set TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID',state.telegramConfigured?'configured':'unconfigured')+row('Crypto data',state.mode==='demo'?'Synthetic market':'Alpaca Crypto US',state.cryptoFeed??'connecting')+row('Forex provider','Provider pending','unconfigured'))}
+ const bai=state.botAiInfo;
+ const botAiPanel=panel('AI Bot Trading Key','Dedicated API key for Autonomous AI bots (saved encrypted in Supabase so it never shares quota with your general key).',
+   row('Dedicated key status',bai?`${esc(bai.provider)} · ${esc(bai.model)} · ${esc(bai.masked)}`:'Not set — Autonomous AI falls back to server .env key',bai?'configured':'unconfigured')+
+   `<form id="bot-ai-key" class="form"><div class="fields">`+
+   select('AI Provider','provider',[['Gemini','Google Gemini'],['OpenAI','OpenAI']],bai?.provider??'Gemini',true)+
+   field('Model (optional)','model',bai?.model??'','maxlength="80" placeholder="e.g. gemini-2.5-flash or gemini-2.5-flash-lite"')+
+   field('API Key','key','','type="password" autocomplete="off" maxlength="300" placeholder="'+(bai?'Enter new key to replace saved key':'Paste Gemini or OpenAI API key')+'"')+
+   `</div><div class="actions">${submit('Save trading key',!online)}${btn('Test key','test-bot-ai-key','',false,!online?'disabled':'')}${bai?btn('Remove key','remove-bot-ai-key','',false,`style="color:#ff8191;border-color:#592e42" ${!online?'disabled':''}`):''}</div></form>`);
+ return page('Workspace preferences','Settings','Review data providers, dedicated AI Bot Trading Key, paper connectivity, and notifications.')+
+ `<div class="grid equal"><div class="stack">${panel('Integrations','Credentials are configured in the server environment.',row('Stock data',esc(state.feedName),state.feed)+row('Paper broker',state.mode==='demo'?'Local simulated fills':'Alpaca Paper API',state.broker)+row('General AI confirmation',esc(state.aiProvider ?? 'Gemini or OpenAI'),state.aiConfigured?'configured':'unconfigured')+row('Dedicated AI Bot Key',bai?esc(bai.provider+' · '+bai.masked):'Using fallback key',bai?'configured':'unconfigured')+row('Telegram alerts',state.telegramConfigured?'Bot connected':'Set TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID',state.telegramConfigured?'configured':'unconfigured')+row('Crypto data',state.mode==='demo'?'Synthetic market':'Alpaca Crypto US',state.cryptoFeed??'connecting'))}
+ ${botAiPanel}
  ${state.mode==='demo'?panel('Connection simulator','Exercise bot behavior during feed or broker outages.',`<div class="form"><div class="actions">${btn('Disconnect feed','outage','feed')}${btn('Disconnect broker','outage','broker')}${btn('Reconnect both','outage','clear',true)}</div></div>`):''}</div>
  <div class="stack">${panel('Notifications','Choose which events appear in the workspace and push to Telegram.',`<form id="settings" class="form">${Object.entries({signals:'Trade signals',fills:'Order fills',risk:'Risk limits',connections:'Connection failures',telegram:'Push alerts to Telegram'}).map(([k,v])=>check(v,k,k==='telegram'?state.alerts[k]!==false:state.alerts[k])).join('')}<div class="actions">${submit('Save preferences',!online)}${state.telegramConfigured?btn('Send test alert','test-telegram','',false,!online?'disabled':''):''}</div></form>`)}
  ${panel('Recent notifications',syncLabel(),events?'<div class="activity">'+events+'</div>':empty('No notifications yet.'))}</div></div>`;
@@ -695,7 +739,8 @@ const values=form=>Object.fromEntries(new FormData(form));
 function capture(form){
  const data=values(form);
  delete data.version;
- for(const [,k]of fields)data[k]=+data[k];
+ for(const [,k]of fields)if(data[k]!==undefined)data[k]=+data[k];
+ if(data.aiDailyCap!==undefined)data.aiDailyCap=+data.aiDailyCap;
  const changed=Object.entries({...data,ai:form.elements.ai.checked}).some(([k,v])=>editor[k]!==v);
  editor={...editor,...data,ai:form.elements.ai.checked,dirty:true,mutation:changed||!editor.dirty?crypto.randomUUID():editor.mutation};
  if(!authInfo?.required)write('ft-draft',editor);
@@ -847,6 +892,29 @@ document.addEventListener('click',async event=>{
    finally{pending=false}
    return;
  }
+ if(action==='test-bot-ai-key'){
+   if(!online||pending){toast('The workspace is reconnecting.');return}
+   const f=$('#bot-ai-key'), d=f?values(f):{};
+   pending=true;el.disabled=true;
+   try{
+     const res=await api('settings',{testBotAiKey:true,provider:d.provider,model:d.model,key:d.key});
+     toast(`${res.provider} (${res.model}) key verified!`);
+   }catch(error){toast(error.message)}
+   finally{pending=false;el.disabled=false}
+   return;
+ }
+ if(action==='remove-bot-ai-key'){
+   if(!online||pending){toast('The workspace is reconnecting.');return}
+   if(!confirm('Remove the dedicated AI Bot Trading Key? Autonomous AI bots will fall back to the server .env key.'))return;
+   pending=true;el.disabled=true;
+   try{
+     await api('settings',{removeBotAiKey:true});
+     toast('Dedicated AI Bot Trading Key removed.');
+     await refresh(true);
+   }catch(error){toast(error.message)}
+   finally{pending=false;el.disabled=false}
+   return;
+ }
  if(action==='test-telegram'){
    if(!online||pending){toast('The workspace is reconnecting.');return}
    pending=true;el.disabled=true;
@@ -879,8 +947,18 @@ document.addEventListener('click',async event=>{
  if(action==='editor-type'){
    if(value==='ai_notepad'){
      editor={...editor,mode:'ai_notepad',ai:true,timeframe:editor?.timeframe==='1Min'?'15Min':(editor?.timeframe??'15Min'),dirty:true,mutation:crypto.randomUUID()};
+   }else if(value==='ai_autonomous'){
+     const p=autoRiskPresets[editor?.aiRiskProfile??'balanced']??autoRiskPresets.balanced;
+     editor={...editor,mode:'ai_autonomous',ai:true,timeframe:['5Min','15Min','1Hour'].includes(editor?.timeframe)?editor.timeframe:'15Min',aiWakeMode:editor?.aiWakeMode??'smart',aiRiskProfile:editor?.aiRiskProfile??'balanced',aiSizing:editor?.aiSizing??'dynamic',aiDailyCap:editor?.aiDailyCap??100,size:100,exposure:100,stop:p.stop,trailingStop:p.trailingStop,take:p.take,dailyLoss:p.dailyLoss,cooldown:p.cooldown,dirty:true,mutation:crypto.randomUUID()};
    }else{
-     editor={...editor,mode:editor?.mode==='ai_notepad'?'momentum':(editor?.mode??'momentum'),dirty:true,mutation:crypto.randomUUID()};
+     editor={...editor,mode:['ai_notepad','ai_autonomous'].includes(editor?.mode)?'momentum':(editor?.mode??'momentum'),dirty:true,mutation:crypto.randomUUID()};
+   }
+ }
+ if(action==='apply-risk-preset'){
+   const p=autoRiskPresets[value];
+   if(p){
+     editor={...editor,aiRiskProfile:value,stop:p.stop,trailingStop:p.trailingStop,take:p.take,dailyLoss:p.dailyLoss,cooldown:p.cooldown,dirty:true,mutation:crypto.randomUUID()};
+     toast(`Applied ${p.label} risk guardrails.`);
    }
  }
  if(action==='apply-note-template'){
@@ -1073,6 +1151,12 @@ document.addEventListener('submit',async event=>{
      if(data.budget!=='')payload.budget=+data.budget; else delete payload.budget;
      const result=await api('backtest',payload);
      runA=result.id;toast('Backtest complete.');
+   }
+   if(form.id==='bot-ai-key'){
+     if(!data.key?.trim())throw Error('Paste a Gemini or OpenAI API key to save.');
+     await api('settings',{botAiKey:{provider:data.provider,model:data.model,key:data.key.trim()}});
+     form.reset();
+     toast('Dedicated AI Bot Trading Key saved securely.');
    }
    if(form.id==='settings'){await api('settings',Object.fromEntries(Object.keys(data).map(k=>[k,true])));toast('Notifications saved.')}
    if(form.id==='profile'){

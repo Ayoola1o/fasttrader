@@ -28,14 +28,15 @@ function entryQty(budget, price, rules) {
 }
 
 export const timeframes = { '1Min': 60000, '5Min': 300000, '15Min': 900000, '1Hour': 3600000 };
-export const strategyModes = ['momentum', 'mean_reversion', 'breakout', 'custom', 'ai_notepad'];
+export const strategyModes = ['momentum', 'mean_reversion', 'breakout', 'custom', 'ai_notepad', 'ai_autonomous'];
 export const ruleIndicators = ['close', 'sma', 'ema', 'rsi', 'bb_upper', 'bb_lower', 'macd', 'macd_signal', 'donchian_high', 'donchian_low', 'atr', 'volume', 'avg_volume', 'pct_change', 'number'];
 export const ruleOperators = ['gt', 'lt', 'gte', 'lte', 'crosses_above', 'crosses_below'];
 
 export const defaults = {
   name: 'Momentum Alpha', symbol: 'SPY', mode: 'momentum', timeframe: '1Min', period: 12, entry: 0.1, exit: -0.1,
   sizeMode: 'percent', size: 10, sizeUsd: 500, exposure: 20, dailyLoss: 3, stop: 2, take: 4, trailingStop: 0,
-  atrStop: 0, cooldown: 5, maxHoldBars: 0, ai: false, aiPrompt: '', aiNotes: '', rules: null
+  atrStop: 0, cooldown: 5, maxHoldBars: 0, ai: false, aiPrompt: '', aiNotes: '',
+  aiWakeMode: 'smart', aiRiskProfile: 'balanced', aiSizing: 'dynamic', aiDailyCap: 100, rules: null
 };
 
 export function aggregateBars(bars, timeframe = '1Min') {
@@ -317,13 +318,40 @@ export function strategy(input) {
   result.sizeUsd = sizeUsd;
   result.aiPrompt = typeof input.aiPrompt === 'string' ? input.aiPrompt.trim().slice(0, 300) : '';
   result.aiNotes = typeof input.aiNotes === 'string' ? input.aiNotes.trim().slice(0, 4000) : '';
+  result.aiWakeMode = input.aiWakeMode === 'fixed' ? 'fixed' : 'smart';
+  result.aiRiskProfile = ['conservative', 'balanced', 'aggressive'].includes(input.aiRiskProfile) ? input.aiRiskProfile : 'balanced';
+  result.aiSizing = input.aiSizing === 'simple' ? 'simple' : 'dynamic';
+  const aiDailyCap = input.aiDailyCap === undefined ? 100 : input.aiDailyCap;
+  if (!Number.isInteger(aiDailyCap) || aiDailyCap < 0 || aiDailyCap > 500) throw Error('Daily AI call cap must be a whole number between 0 and 500.');
+  result.aiDailyCap = aiDailyCap;
   result.rules = sanitizeRules(input.rules);
   if (result.mode === 'custom' && (!result.rules || !result.rules.entry.length)) throw Error('Add at least one entry rule for a custom strategy.');
   if (result.mode === 'ai_notepad') {
     if (result.aiNotes.length < 10) throw Error('Write your trading strategy instructions in the AI Notepad (at least 10 characters).');
     result.ai = true;
   }
+  if (result.mode === 'ai_autonomous') {
+    result.ai = true;
+  }
   return result;
+}
+
+export function shouldWakeAutonomousAI(bars, lastWakeAt = 0, now = Date.now()) {
+  if (!lastWakeAt) return { wake: true, trigger: 'Initial market scan' };
+  if (now - lastWakeAt >= 30 * 60000) return { wake: true, trigger: '30m periodic check-in' };
+  if (!Array.isArray(bars) || bars.length < 2) return { wake: false, trigger: 'Waiting for bars' };
+  const last = bars.at(-1), prev = bars.at(-2);
+  const moveOpen = last.o > 0 ? Math.abs(100 * (last.c / last.o - 1)) : 0;
+  const movePrev = prev.c > 0 ? Math.abs(100 * (last.c / prev.c - 1)) : 0;
+  if (Math.max(moveOpen, movePrev) >= 0.5) return { wake: true, trigger: `Price move ${Math.max(moveOpen, movePrev).toFixed(2)}%` };
+  const rsi = computeRSI(bars.map(b => b.c), 14);
+  if (rsi !== null && (rsi <= 35 || rsi >= 65)) return { wake: true, trigger: `RSI(14) at ${rsi.toFixed(1)}` };
+  const vols = bars.slice(-21, -1).map(b => b.v ?? 0).filter(v => v > 0);
+  if (vols.length >= 5 && (last.v ?? 0) > 0) {
+    const avgVol = vols.reduce((a, b) => a + b, 0) / vols.length;
+    if (avgVol > 0 && last.v >= avgVol * 1.8) return { wake: true, trigger: `Volume spike ${(last.v / avgVol).toFixed(1)}x` };
+  }
+  return { wake: false, trigger: 'Quiet market (Smart Wake-Up)' };
 }
 
 export function decision(s, closes, account, position, price, rules = isCrypto(s.symbol) ? cryptoReplayRules : null, options = {}) {
@@ -352,6 +380,12 @@ export function decision(s, closes, account, position, price, rules = isCrypto(s
     if (!warmedUp) return null;
     if (mode === 'ai_notepad') {
       return { side: 'sell', qty: position.qty, protective: false, aiAutonomous: true, rationale: 'Evaluating AI Notepad exit strategy' };
+    }
+    if (mode === 'ai_autonomous') {
+      const addCap = s.sizeMode === 'usd' && Number.isFinite(s.sizeUsd) ? s.sizeUsd : account.equity * s.size / 100;
+      const addBudget = Math.min(addCap, account.equity * s.exposure / 100 - account.exposure, account.cash);
+      const buyQty = s.aiSizing === 'dynamic' && !limit && (options.cooldown ?? 0) <= 0 ? entryQty(addBudget, price, rules) : 0;
+      return { side: 'sell', qty: position.qty, buyQty, protective: false, aiAutonomous: true, aiFreeRoam: true, rationale: 'Autonomous AI managing open position' };
     }
     if (hasCustomRules && s.rules.exit?.length) {
       const check = evaluateRuleSet(evalBars, s.rules, 'exit');
@@ -384,11 +418,15 @@ export function decision(s, closes, account, position, price, rules = isCrypto(s
     return null;
   }
   if (!warmedUp || limit || options.cooldown > 0 || (!rules && options.volume === 0)) return null;
-  if (mode === 'ai_notepad') {
+  if (mode === 'ai_notepad' || mode === 'ai_autonomous') {
     const sizeCap = s.sizeMode === 'usd' && Number.isFinite(s.sizeUsd) ? s.sizeUsd : account.equity * s.size / 100;
-    const budget = Math.min(sizeCap, account.equity * s.exposure / 100 - account.exposure, account.cash);
+    const budget = mode === 'ai_autonomous'
+      ? Math.min(account.equity * s.exposure / 100 - account.exposure, account.cash)
+      : Math.min(sizeCap, account.equity * s.exposure / 100 - account.exposure, account.cash);
     const qty = entryQty(budget, price, rules);
-    return qty > 0 ? { side: 'buy', qty, protective: false, aiAutonomous: true, rationale: 'Evaluating AI Notepad entry strategy' } : null;
+    return qty > 0
+      ? { side: 'buy', qty, protective: false, aiAutonomous: true, ...(mode === 'ai_autonomous' ? { aiFreeRoam: true } : {}), rationale: mode === 'ai_autonomous' ? 'Autonomous AI scanning market' : 'Evaluating AI Notepad entry strategy' }
+      : null;
   }
   let rationale = null;
   if (hasCustomRules && s.rules.entry?.length) {
@@ -425,7 +463,7 @@ export function decision(s, closes, account, position, price, rules = isCrypto(s
   const sizeCap = s.sizeMode === 'usd' && Number.isFinite(s.sizeUsd) ? s.sizeUsd : account.equity * s.size / 100;
   const budget = Math.min(sizeCap, account.equity * s.exposure / 100 - account.exposure, account.cash);
   const qty = entryQty(budget, price, rules);
-  return qty > 0 ? { side: 'buy', qty, rationale } : null;
+  return qty > 0 ? { side: 'buy', qty, ...(mode === 'ai_notepad' ? { aiAutonomous: true } : mode === 'ai_autonomous' ? { aiAutonomous: true, aiFreeRoam: true } : {}), rationale } : null;
 }
 
 export function downsampleCurve(curve, maxPoints = 650) {

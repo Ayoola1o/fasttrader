@@ -9,7 +9,7 @@ import { runInNewContext } from 'node:vm';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { defaults, decision, replay, downsampleCurve, botLedger, contiguousBars, aggregateBars, computeATR, strategy, evaluateRuleSet } from './engine.mjs';
+import { defaults, decision, replay, downsampleCurve, botLedger, contiguousBars, aggregateBars, computeATR, strategy, evaluateRuleSet, shouldWakeAutonomousAI } from './engine.mjs';
 import { signalProvider, assessSignal } from './signal-ai.mjs';
 import { createTelegram } from './telegram.mjs';
 import { handleBridge } from './api/bridge.js';
@@ -223,6 +223,37 @@ test('AI Notepad strategy validates notes, enforces hard stop-loss, and sends us
     return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: JSON.stringify({ side: 'hold', rationale: 'Waiting for dip.' }) }] } }] }) };
   }, { aiAutonomous: true, aiNotes: noteStrat.aiNotes, indicators: { rsi14: 55 } });
   assert.match(captured.systemInstruction.parts[0].text, /Buy on oversold RSI dip/);
+});
+
+test('Autonomous AI strategy supports smart wake-up, hard stop-loss, fee-aware prompting, and dynamic allocation', async () => {
+  const auto = strategy({
+    ...defaults, name: 'BTC Free-Roam', symbol: 'BTC/USD', mode: 'ai_autonomous', timeframe: '15Min',
+    aiWakeMode: 'smart', aiRiskProfile: 'balanced', aiSizing: 'dynamic', aiDailyCap: 80,
+    size: 100, exposure: 100, stop: 5, trailingStop: 3, take: 12, dailyLoss: 6, cooldown: 2
+  });
+  assert.equal(auto.ai, true);
+  assert.equal(auto.aiWakeMode, 'smart');
+  assert.equal(auto.aiSizing, 'dynamic');
+  const flatBars = Array.from({ length: 20 }, (_, i) => ({ t: new Date(Date.now() - (20 - i) * 900000).toISOString(), o: 100, h: 100.1, l: 99.9, c: 100, v: 100 }));
+  // Initial wake always triggers; immediate quiet bar does not wake; 0.8% move wakes
+  assert.equal(shouldWakeAutonomousAI(flatBars, 0).wake, true);
+  assert.equal(shouldWakeAutonomousAI(flatBars, Date.now() - 60000).wake, false);
+  const movedBars = [...flatBars.slice(0, -1), { ...flatBars.at(-1), o: 100, c: 100.9 }];
+  assert.equal(shouldWakeAutonomousAI(movedBars, Date.now() - 60000).wake, true);
+  // Hard stop-loss still fires deterministically without AI
+  const account = { equity: 10000, cash: 5000, dayStart: 10000, exposure: 5000 };
+  const hardStop = decision(auto, flatBars.map(b => b.c), account, { qty: 1, entry: 100 }, 94, null, { bars: flatBars, warmedUp: true });
+  assert.equal(hardStop?.protective, true);
+  assert.equal(hardStop?.side, 'sell');
+  // assessSignal parses dynamic allocationPct and includes fee cost
+  let captured;
+  const out = await assessSignal({ name: 'Gemini', key: 'k', model: 'gemini-2.5-flash' }, 'BTC/USD', 'buy', movedBars, async (_url, init) => {
+    captured = JSON.parse(init.body);
+    return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: JSON.stringify({ side: 'buy', allocationPct: 50, rationale: 'Scaling 50% into breakout.' }) }] } }] }) };
+  }, { aiFreeRoam: true, aiRiskProfile: 'balanced', aiSizing: 'dynamic', roundTripFeeBps: 50 });
+  assert.equal(out.side, 'buy');
+  assert.equal(out.allocationPct, 50);
+  assert.match(captured.systemInstruction.parts[0].text, /50 bps/);
 });
 
 async function withDemo(run, mockAI, env = {}) {

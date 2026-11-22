@@ -1,8 +1,8 @@
 import { createServer } from 'node:http';
 import { readFile, mkdir, writeFile, rename } from 'node:fs/promises';
-import { randomUUID, createHash } from 'node:crypto';
-import { instruments, defaults, strategy, decision, replay, downsampleCurve, synthetic, botLedger, isCrypto, cryptoReplayRules, roundDown, contiguousBars, aggregateBars, computeATR, computeRSI, indicatorValue, timeframes, ruleWarmupBars } from './engine.mjs';
-import { assessSignal, signalProvider } from './signal-ai.mjs';
+import { randomUUID, createHash, createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+import { instruments, defaults, strategy, decision, replay, downsampleCurve, synthetic, botLedger, isCrypto, cryptoReplayRules, roundDown, contiguousBars, aggregateBars, computeATR, computeRSI, indicatorValue, timeframes, ruleWarmupBars, shouldWakeAutonomousAI } from './engine.mjs';
+import { assessSignal, signalProvider, testProviderKey } from './signal-ai.mjs';
 import { createAuth, sameSecret } from './auth.mjs';
 import { createStore } from './store.mjs';
 import { createTelegram } from './telegram.mjs';
@@ -27,6 +27,40 @@ const storeKey = demo ? 'demo' : 'alpaca-' + createHash('sha256').update(headers
 const file = directory + '/' + storeKey + '.json';
 const remoteStore = createStore(process.env);
 const telegram = createTelegram(process.env);
+const secretsFile = directory + '/secrets-' + storeKey + '.json';
+const secretKey = createHash('sha256').update(process.env.WORKER_SHARED_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.ALPACA_SECRET || 'fasttrader-local-bot-ai-key').digest();
+function encryptSecret(obj) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', secretKey, iv);
+  const data = Buffer.concat([cipher.update(JSON.stringify(obj), 'utf8'), cipher.final()]);
+  return { iv: iv.toString('base64'), tag: cipher.getAuthTag().toString('base64'), data: data.toString('base64') };
+}
+function decryptSecret(enc) {
+  if (!enc?.iv || !enc?.tag || !enc?.data) return null;
+  try {
+    const decipher = createDecipheriv('aes-256-gcm', secretKey, Buffer.from(enc.iv, 'base64'));
+    decipher.setAuthTag(Buffer.from(enc.tag, 'base64'));
+    const raw = Buffer.concat([decipher.update(Buffer.from(enc.data, 'base64')), decipher.final()]).toString('utf8');
+    const parsed = JSON.parse(raw);
+    return parsed?.key && ['Gemini', 'OpenAI'].includes(parsed?.name) ? parsed : null;
+  } catch { return null; }
+}
+const maskKey = k => (typeof k === 'string' && k.length > 8 ? k.slice(0, 4) + '…' + k.slice(-4) : '••••');
+let botAiProvider = null;
+async function loadBotAiProvider() {
+  const remote = remoteStore.enabled ? await remoteStore.load('secrets:' + storeKey) : null;
+  if (remote) { botAiProvider = decryptSecret(remote); return; }
+  try { botAiProvider = decryptSecret(JSON.parse(await readFile(secretsFile, 'utf8'))); }
+  catch (err) { if (err.code !== 'ENOENT') console.error('Load bot AI key:', err.message); }
+}
+async function saveBotAiProvider(provider) {
+  botAiProvider = provider;
+  const payload = provider ? encryptSecret(provider) : { cleared: true };
+  await writeFile(secretsFile + '.tmp', JSON.stringify(payload));
+  await rename(secretsFile + '.tmp', secretsFile);
+  if (remoteStore.enabled) await remoteStore.save('secrets:' + storeKey, payload, { force: true });
+}
+const providerFor = s => (s?.mode === 'ai_autonomous' && botAiProvider ? botAiProvider : aiProvider);
 const terminal = new Set(['filled', 'canceled', 'expired', 'rejected', 'replaced', 'done_for_day']);
 const time = () => new Date().toISOString();
 let state = {
@@ -36,6 +70,7 @@ let state = {
   feed: 'connecting', broker: 'connecting', sessionOpen: demo, synced: null
 };
 await mkdir(directory, { recursive: true });
+await loadBotAiProvider();
 const auth = await createAuth({
   file: directory + '/auth.json', signupCode,
   ownerEmail: process.env.FASTTRADER_OWNER_EMAIL,
@@ -445,19 +480,36 @@ function drainAI() {
 
 async function completeAI(job) {
   const { bot, s, proposal, bars, price, position } = job;
+  const provider = providerFor(s);
   let model, error;
   try {
     const headlines = await recentNews(s.symbol);
-    const indicators = s.mode === 'ai_notepad' ? {
+    const rich = s.mode === 'ai_notepad' || s.mode === 'ai_autonomous';
+    const indicators = rich ? {
       sma12: indicatorValue(bars, { indicator: 'sma', period: 12 }),
+      ema9: indicatorValue(bars, { indicator: 'ema', period: 9 }),
       ema20: indicatorValue(bars, { indicator: 'ema', period: 20 }),
       ema50: indicatorValue(bars, { indicator: 'ema', period: 50 }),
       rsi14: computeRSI(bars.map(b => b.c), 14),
+      macd: indicatorValue(bars, { indicator: 'macd' }),
+      macdSignal: indicatorValue(bars, { indicator: 'macd_signal' }),
+      bbUpper: indicatorValue(bars, { indicator: 'bb_upper', period: 20 }),
+      bbLower: indicatorValue(bars, { indicator: 'bb_lower', period: 20 }),
       atr14: computeATR(bars, 14)
     } : undefined;
-    model = await assessSignal(aiProvider, s.symbol, proposal.side, bars, fetch, {
+    const ledger = s.mode === 'ai_autonomous' ? botLedger(botOrders(bot.id), s.symbol, bot.budget) : null;
+    const recentDecisions = s.mode === 'ai_autonomous'
+      ? state.signals.filter(sig => sig.strategyId === bot.id).slice(0, 5).map(sig => ({ t: sig.t, side: sig.direction, rationale: sig.rationale }))
+      : undefined;
+    model = await assessSignal(provider, s.symbol, proposal.side, bars, fetch, {
       price, rationale: proposal.rationale, period: s.period, mode: s.mode ?? 'momentum', timeframe: s.timeframe ?? '1Min',
       ...(proposal.aiAutonomous ? { aiAutonomous: true, aiNotes: s.aiNotes, indicators } : {}),
+      ...(proposal.aiFreeRoam ? {
+        aiFreeRoam: true, aiRiskProfile: s.aiRiskProfile ?? 'balanced', aiSizing: s.aiSizing ?? 'dynamic',
+        roundTripFeeBps: isCrypto(s.symbol) ? 50 : 2,
+        budget: ledger ? { allocated: bot.budget, available: Number(ledger.available.toFixed(2)), realized: Number(ledger.realized.toFixed(2)) } : undefined,
+        recentDecisions
+      } : {}),
       ...(s.aiPrompt ? { aiPrompt: s.aiPrompt } : {}),
       ...(headlines.length ? { headlines } : {}),
       position: position ? { qty: position.qty, entry: position.entry, pnlPct: Number((100 * (price / position.entry - 1)).toFixed(2)) } : null
@@ -470,9 +522,12 @@ async function completeAI(job) {
       if (!currentCandidate(job)) return;
       if (error) {
         bot.status = error.message;
+        if (error.message.includes('(429)')) bot.aiBackoffUntil = Date.now() + 5 * 60000;
       } else {
         bot.status = 'Running';
-        if (model.side === proposal.side && !unresolvedFor(s.symbol)) {
+        bot.aiBackoffUntil = 0;
+        const shouldAct = proposal.aiFreeRoam ? model.side !== 'hold' : model.side === proposal.side;
+        if (shouldAct && !unresolvedFor(s.symbol)) {
           try { await reconcile(); }
           catch (failure) {
             state.broker = 'offline';
@@ -546,14 +601,42 @@ async function evaluate(bot) {
   }
   const candidate = { bot, s, bar, proposal, price: context.price, position: context.position, epoch, expires: Date.now() + aiLifetime };
   if (s.ai && !proposal.protective) {
+    if (!providerFor(s)) {
+      bot.status = 'Configure an AI API key in Settings or .env';
+      return;
+    }
+    if (bot.aiBackoffUntil && Date.now() < bot.aiBackoffUntil) {
+      bot.status = 'AI rate-limit backoff (retrying shortly)';
+      return;
+    }
+    const today = time().slice(0, 10);
+    if (bot.aiCallsDay !== today) { bot.aiCallsDay = today; bot.aiCallsToday = 0; }
+    if (s.mode === 'ai_autonomous' && s.aiDailyCap > 0 && (bot.aiCallsToday ?? 0) >= s.aiDailyCap) {
+      bot.lastBar = bar.t;
+      bot.status = `Daily AI call cap reached (${bot.aiCallsToday}/${s.aiDailyCap})`;
+      bot.lastEvaluation = { t: bar.t, price: context.price, direction: 'hold', rationale: bot.status };
+      return;
+    }
+    const richBars = (s.mode === 'ai_notepad' || s.mode === 'ai_autonomous') ? aggregateBars(bars, s.timeframe ?? '1Min').slice(-60) : bars.slice(-20);
+    if (s.mode === 'ai_autonomous' && s.aiWakeMode === 'smart') {
+      const wake = shouldWakeAutonomousAI(richBars, bot.lastAiWakeAt ?? 0);
+      if (!wake.wake) {
+        bot.lastBar = bar.t;
+        bot.status = 'Running';
+        bot.lastEvaluation = { t: bar.t, price: context.price, direction: 'hold', rationale: wake.trigger };
+        return;
+      }
+      bot.lastAiWakeAt = Date.now();
+    }
     if (pendingAI.has(bot.id) || pendingAI.size >= symbols.length) {
       bot.status = 'Waiting for AI capacity';
       return;
     }
+    bot.aiCallsToday = (bot.aiCallsToday ?? 0) + 1;
     bot.lastBar = bar.t;
     bot.lastEvaluation = { t: bar.t, price: context.price, direction: proposal.side, rationale: proposal.rationale };
-    pendingAI.set(bot.id, { ...candidate, bars: s.mode === 'ai_notepad' ? aggregateBars(bars, s.timeframe ?? '1Min').slice(-60) : bars.slice(-20) });
-    bot.status = s.mode === 'ai_notepad' ? 'AI reading strategy notepad' : 'Awaiting AI confirmation';
+    pendingAI.set(bot.id, { ...candidate, bars: richBars });
+    bot.status = s.mode === 'ai_autonomous' ? 'Autonomous AI analyzing market' : s.mode === 'ai_notepad' ? 'AI reading strategy notepad' : 'Awaiting AI confirmation';
     drainAI();
     return;
   }
@@ -564,39 +647,54 @@ async function evaluate(bot) {
 
 async function applySignal(candidate, model = null) {
   const { bot, s, bar, proposal } = candidate;
+  const provider = providerFor(s);
+  const allocSuffix = proposal.aiFreeRoam && model && model.side !== 'hold' && s.aiSizing === 'dynamic' ? ` [${model.allocationPct ?? 100}% size]` : '';
   const signal = {
-    t: time(), symbol: s.symbol, direction: model?.side ?? proposal.side, rationale: model?.rationale ?? proposal.rationale,
-    strategyId: s.id, strategy: s.name, version: s.version, source: model ? aiProvider.name : 'Strategy rules'
+    t: time(), symbol: s.symbol, direction: model?.side ?? proposal.side, rationale: (model?.rationale ?? proposal.rationale) + allocSuffix,
+    strategyId: s.id, strategy: s.name, version: s.version, source: model ? (provider?.name ?? 'AI') : 'Strategy rules'
   };
   state.signals.unshift(signal);
   bot.lastEvaluation = { ...bot.lastEvaluation, t: bar.t, direction: signal.direction, rationale: signal.rationale };
   state.signals.length = Math.min(100, state.signals.length);
   event('signals', `${signal.direction.toUpperCase()} signal · ${signal.symbol}`, [`Bot: ${s.name} v${s.version} · Source: ${signal.source}`, signal.rationale]);
   if (proposal.protective) event('risk', `${s.symbol} protective exit`, [`Bot: ${s.name}`, proposal.rationale]);
-  if (model && model.side !== proposal.side) return;
+  const execSide = proposal.aiFreeRoam && model ? model.side : proposal.side;
+  if (model && !proposal.aiFreeRoam && model.side !== proposal.side) return;
+  if (execSide === 'hold') return;
   if (!currentCandidate(candidate) || unresolvedFor(s.symbol)) return;
   const context = orderContext(bot, s, state.bars[s.symbol]);
   if (!context) return;
   const { position, price: latest, proposal: validated, rules, cash } = context;
-  if (!validated || validated.side !== proposal.side) return;
-  const rawLimit = proposal.side === 'buy'
+  if (!validated) return;
+  if (!proposal.aiFreeRoam && validated.side !== execSide) return;
+  if (execSide === 'sell' && !(position?.qty > 0)) return;
+  if (execSide === 'buy' && position?.qty > 0 && !(proposal.aiFreeRoam && s.aiSizing === 'dynamic')) return;
+  const rawLimit = execSide === 'buy'
     ? roundDown(latest * (1 + (rules && !demo ? cryptoSlippageBps : 0) / 10000), rules?.tick ?? 0.01)
     : null;
   const limitPrice = rawLimit && rawLimit > 0 ? rawLimit : null;
-  let rawQty = Math.min(proposal.qty, validated.qty);
-  if (proposal.side === 'buy' && limitPrice && rawQty * limitPrice > cash) {
+  const alloc = proposal.aiFreeRoam && model && s.aiSizing === 'dynamic' ? Math.max(0.25, Math.min(1, (model.allocationPct ?? 100) / 100)) : 1;
+  let baseQty = execSide === 'sell'
+    ? position.qty
+    : position?.qty > 0
+      ? Math.min(proposal.buyQty ?? 0, validated.buyQty ?? 0)
+      : Math.min(proposal.qty, validated.qty);
+  let rawQty = alloc < 1
+    ? (rules ? roundDown(baseQty * alloc, rules.increment) : Math.floor(baseQty * alloc))
+    : baseQty;
+  if (execSide === 'buy' && limitPrice && rawQty * limitPrice > cash) {
     rawQty = rules ? roundDown(cash / limitPrice, rules.increment) : Math.floor(cash / limitPrice);
   }
-  const qty = rules && proposal.side === 'sell' ? roundDown(rawQty, rules.increment) : rawQty;
+  const qty = rules && execSide === 'sell' ? roundDown(rawQty, rules.increment) : rawQty;
   if (qty <= 0) return;
   if (rules && (qty + 1e-10 < rules.minimum || qty * (limitPrice ?? latest) < rules.minValue)) {
     bot.status = 'Order below crypto minimum';
     return;
   }
-  const client = 'ft-' + createHash('sha256').update([s.id, s.version, bar.t, proposal.side].join('/')).digest('hex').slice(0, 40);
+  const client = 'ft-' + createHash('sha256').update([s.id, s.version, bar.t, execSide].join('/')).digest('hex').slice(0, 40);
   if (state.orders.some(order => order.client === client)) return;
   const order = {
-    client, owned: true, strategyId: s.id, strategy: s.name, version: s.version, symbol: s.symbol, side: proposal.side,
+    client, owned: true, strategyId: s.id, strategy: s.name, version: s.version, symbol: s.symbol, side: execSide,
     qty, filled: 0, status: 'unknown', t: time(), price: null,
     limitPrice: demo ? null : limitPrice
   };
@@ -605,9 +703,18 @@ async function applySignal(candidate, model = null) {
     order.filled = qty;
     order.price = latest;
     order.filledAt = time();
-    state.cash += qty * latest * (proposal.side === 'buy' ? -1 : 1);
-    if (proposal.side === 'buy') state.positions.push({ symbol: s.symbol, qty, entry: latest, price: latest, strategy: s.name });
-    else {
+    state.cash += qty * latest * (execSide === 'buy' ? -1 : 1);
+    if (execSide === 'buy') {
+      const existingPos = state.positions.find(p => p.symbol === s.symbol);
+      if (existingPos) {
+        const totalQty = existingPos.qty + qty;
+        existingPos.entry = (existingPos.entry * existingPos.qty + latest * qty) / totalQty;
+        existingPos.qty = Number(totalQty.toFixed(9));
+        existingPos.price = latest;
+      } else {
+        state.positions.push({ symbol: s.symbol, qty, entry: latest, price: latest, strategy: s.name });
+      }
+    } else {
       order.pnl = qty * (latest - position.entry);
       if (proposal.stopLoss) bot.cooldownBars = s.cooldown ?? 0;
       if (position.qty - qty > 1e-9) position.qty = Number((position.qty - qty).toFixed(9));
@@ -622,11 +729,11 @@ async function applySignal(candidate, model = null) {
   if (!currentCandidate(candidate)) { order.status = 'canceled'; return; }
   try {
     const decimal = value => value.toFixed(9).replace(/\.?0+$/, '');
-    const execution = proposal.side === 'buy' ? { type: 'limit', limit_price: rules ? decimal(order.limitPrice) : order.limitPrice.toFixed(2) } : { type: 'market' };
-    const timeInForce = rules ? (proposal.side === 'buy' ? 'ioc' : 'gtc') : 'day';
+    const execution = execSide === 'buy' ? { type: 'limit', limit_price: rules ? decimal(order.limitPrice) : order.limitPrice.toFixed(2) } : { type: 'market' };
+    const timeInForce = rules ? (execSide === 'buy' ? 'ioc' : 'gtc') : 'day';
     const submitted = await broker('/orders', {
       method: 'POST', body: JSON.stringify({
-        symbol: s.symbol, qty: rules ? decimal(qty) : String(qty), side: proposal.side, ...execution, time_in_force: timeInForce, client_order_id: client
+        symbol: s.symbol, qty: rules ? decimal(qty) : String(qty), side: execSide, ...execution, time_in_force: timeInForce, client_order_id: client
       })
     });
     updateOrder(normalize(submitted));
@@ -742,7 +849,10 @@ function snapshot() {
       ...run, curve: curve.filter((_, idx) => idx % Math.ceil(curve.length / 650) === 0 || idx === curve.length - 1),
       tradeCount: trades.length, trades: trades.slice(-250)
     })),
-    mode, accountKey: storeKey, supabaseConnected: remoteStore.enabled, telegramConfigured: telegram.configured, market, aiConfigured: Boolean(aiProvider), aiProvider: aiProvider?.name ?? null,
+    mode, accountKey: storeKey, supabaseConnected: remoteStore.enabled, telegramConfigured: telegram.configured, market,
+    aiConfigured: Boolean(aiProvider), aiProvider: aiProvider?.name ?? null,
+    botAiConfigured: Boolean(botAiProvider),
+    botAiInfo: botAiProvider ? { provider: botAiProvider.name, model: botAiProvider.model, masked: maskKey(botAiProvider.key) } : null,
     feedName: demo ? 'Synthetic market' : 'Alpaca ' + feed.toUpperCase()
   };
 }
@@ -788,7 +898,7 @@ async function change(path, input) {
       if (active) throw Error('Pause or stop the existing ' + symbol + ' bot before assigning this position.');
       if (!eligible.has(symbol)) throw Error('This instrument is awaiting Alpaca eligibility confirmation.');
       if (!demo && isCrypto(symbol) && !state.cryptoSessionOpen) throw Error('Crypto trading is unavailable on this Alpaca Paper account.');
-      if (source.ai && !aiProvider) throw Error('Configure a Gemini or OpenAI API key before starting this bot.');
+      if (source.ai && !providerFor(source)) throw Error('Configure a Gemini or OpenAI API key in Settings or .env before starting this bot.');
       let s = source;
       if (source.symbol !== symbol) {
         const rootId = source.sourceStrategy?.rootId ?? source.id;
@@ -954,7 +1064,7 @@ async function change(path, input) {
       }
       if (!eligible.has(s.symbol)) throw Error('This instrument is awaiting Alpaca eligibility confirmation.');
       if (!demo && isCrypto(s.symbol) && !state.cryptoSessionOpen) throw Error('Crypto trading is unavailable on this Alpaca Paper account.');
-      if (s.ai && !aiProvider) throw Error('Configure a Gemini or OpenAI API key before starting this bot.');
+      if (s.ai && !providerFor(s)) throw Error('Configure a Gemini or OpenAI API key in Settings or .env before starting this bot.');
       const active = Object.values(state.bots).find(bot => bot.id !== s.id && bot.desired === 'running' && bot.symbol === s.symbol);
       if (active) throw Error('Pause or stop the existing ' + s.symbol + ' bot before starting another for that instrument.');
       if (previous && previous.symbol !== s.symbol) {
@@ -977,6 +1087,25 @@ async function change(path, input) {
   }
   if (path === '/api/settings') {
     if (input.testTelegram === true) return telegram.sendTest(mode);
+    if (input.removeBotAiKey === true) {
+      await saveBotAiProvider(null);
+      return { configured: false };
+    }
+    if (input.testBotAiKey === true) {
+      const candidate = input.key?.trim()
+        ? { name: input.provider === 'OpenAI' ? 'OpenAI' : 'Gemini', key: input.key.trim(), model: input.model?.trim() || (input.provider === 'OpenAI' ? 'gpt-4.1-mini' : 'gemini-2.5-flash') }
+        : botAiProvider;
+      if (!candidate) throw Error('Save or enter an AI Bot Trading Key first.');
+      return testProviderKey(candidate);
+    }
+    if (input.botAiKey && typeof input.botAiKey === 'object') {
+      const name = input.botAiKey.provider === 'OpenAI' ? 'OpenAI' : 'Gemini';
+      const key = String(input.botAiKey.key ?? '').trim();
+      if (key.length < 10 || key.length > 300) throw Error('Enter a valid Gemini or OpenAI API key.');
+      const model = String(input.botAiKey.model ?? '').trim().slice(0, 80) || (name === 'OpenAI' ? 'gpt-4.1-mini' : 'gemini-2.5-flash');
+      await saveBotAiProvider({ name, key, model });
+      return { configured: true, provider: name, model, masked: maskKey(key) };
+    }
     state.alerts = Object.fromEntries(['signals', 'fills', 'risk', 'connections', 'telegram'].map(key => [key, input[key] === true]));
     return state.alerts;
   }
@@ -1012,7 +1141,7 @@ async function change(path, input) {
 }
 async function backtest(input) {
   const s = state.strategies.find(item => item.id === input.id && item.version === input.version);
-  if (!s || s.mode === 'ai_notepad') throw Error('AI Notepad strategies cannot be replayed deterministically. Select a Rule Builder or preset strategy.');
+  if (!s || s.mode === 'ai_notepad' || s.mode === 'ai_autonomous') throw Error('AI Notepad and Autonomous AI strategies cannot be replayed deterministically. Select a Rule Builder or preset strategy.');
   const { capital, fees, slippage } = input;
   const hasBudget = input.budget !== undefined && input.budget !== null && input.budget !== '';
   const budget = hasBudget ? Number(input.budget) : undefined;
