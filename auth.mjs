@@ -14,10 +14,15 @@ const defaultOwner = {
   hash: '46b941a5734888d3a2123df88fca9e8f737653174c252da741fcd3cfc53f0d4263d2ebc464aefbab9ba1ef894e3dc0f348145d5f8c0c973b607c8d688e75d911'
 };
 
-export async function createAuth({ file, required, secure, signupCode, ownerEmail, ownerPassword }) {
+export async function createAuth({ file, required, secure, signupCode, ownerEmail, ownerPassword, remoteStore, storeKey = 'auth' }) {
   let store = { owner: null, sessions: {} };
-  try { store = JSON.parse(await readFile(file, 'utf8')); }
-  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  const remote = remoteStore?.enabled ? await remoteStore.load(storeKey) : null;
+  if (remote && typeof remote === 'object') {
+    store = { owner: remote.owner ?? null, sessions: remote.sessions ?? {} };
+  } else {
+    try { store = JSON.parse(await readFile(file, 'utf8')); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
   required ||= Boolean(store.owner);
   const attempts = [];
   let queue = Promise.resolve();
@@ -34,6 +39,7 @@ export async function createAuth({ file, required, secure, signupCode, ownerEmai
     await writeFile(file + '.tmp', JSON.stringify(next), { mode: 0o600 });
     await rename(file + '.tmp', file);
     store = next;
+    if (remoteStore?.enabled) await remoteStore.save(storeKey, next);
   };
   const fail = (message, code = 400) => { throw Object.assign(Error(message), { status: code }); };
   const change = async (input, cookie) => {

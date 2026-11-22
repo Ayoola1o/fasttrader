@@ -1,7 +1,7 @@
 const getRoutes = new Set(['auth', 'state']);
 const postRoutes = new Set(['auth', 'strategy', 'bot', 'settings', 'profile', 'demo', 'backtest']);
 const json = (status, error) => Response.json({ error }, { status, headers: { 'Cache-Control': 'no-store' } });
-const maxBodyBytes = 20000;
+const maxBodyBytes = 220000;
 
 export async function handleBridge(request, env = process.env, upstreamFetch = fetch) {
   const url = new URL(request.url);

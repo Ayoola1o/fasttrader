@@ -28,11 +28,14 @@ function entryQty(budget, price, rules) {
 }
 
 export const timeframes = { '1Min': 60000, '5Min': 300000, '15Min': 900000, '1Hour': 3600000 };
-export const strategyModes = ['momentum', 'mean_reversion', 'breakout'];
+export const strategyModes = ['momentum', 'mean_reversion', 'breakout', 'custom'];
+export const ruleIndicators = ['close', 'sma', 'ema', 'rsi', 'bb_upper', 'bb_lower', 'macd', 'macd_signal', 'donchian_high', 'donchian_low', 'atr', 'volume', 'avg_volume', 'pct_change', 'number'];
+export const ruleOperators = ['gt', 'lt', 'gte', 'lte', 'crosses_above', 'crosses_below'];
 
 export const defaults = {
   name: 'Momentum Alpha', symbol: 'SPY', mode: 'momentum', timeframe: '1Min', period: 12, entry: 0.1, exit: -0.1,
-  size: 10, exposure: 20, dailyLoss: 3, stop: 2, take: 4, atrStop: 0, cooldown: 5, ai: false
+  sizeMode: 'percent', size: 10, sizeUsd: 500, exposure: 20, dailyLoss: 3, stop: 2, take: 4, trailingStop: 0,
+  atrStop: 0, cooldown: 5, maxHoldBars: 0, ai: false, aiPrompt: '', rules: null
 };
 
 export function aggregateBars(bars, timeframe = '1Min') {
@@ -87,6 +90,122 @@ export function computeRSI(closes, period = 14) {
   return 100 - 100 / (1 + avgGain / avgLoss);
 }
 
+export function computeEMA(values, period) {
+  if (!Array.isArray(values) || values.length < period || period < 1) return null;
+  const k = 2 / (period + 1);
+  let ema = values.slice(0, period).reduce((sum, v) => sum + v, 0) / period;
+  for (let i = period; i < values.length; i++) ema = values[i] * k + ema * (1 - k);
+  return ema;
+}
+
+export function computeMACD(closes) {
+  if (!Array.isArray(closes) || closes.length < 35) return null;
+  const series = [];
+  for (let i = 26; i <= closes.length; i++) {
+    const sub = closes.slice(0, i);
+    const fast = computeEMA(sub, 12);
+    const slow = computeEMA(sub, 26);
+    if (fast !== null && slow !== null) series.push(fast - slow);
+  }
+  if (series.length < 9) return null;
+  const macd = series.at(-1);
+  const signal = computeEMA(series, 9);
+  return { macd, signal };
+}
+
+export function indicatorValue(bars, spec, offset = 0) {
+  if (!spec || !bars?.length) return null;
+  if (spec.indicator === 'number') return Number.isFinite(spec.value) ? spec.value : null;
+  const end = bars.length - offset;
+  if (end <= 0) return null;
+  const slice = bars.slice(0, end);
+  const closes = slice.map(b => b.c);
+  const period = Math.max(1, Math.min(200, Math.round(spec.period ?? 14)));
+  const last = slice.at(-1);
+  switch (spec.indicator) {
+    case 'close': return last.c;
+    case 'volume': return last.v ?? 0;
+    case 'sma': {
+      if (closes.length < period) return null;
+      const w = closes.slice(-period);
+      return w.reduce((s, v) => s + v, 0) / period;
+    }
+    case 'ema': return computeEMA(closes, period);
+    case 'rsi': return closes.length > period ? computeRSI(closes, period) : null;
+    case 'bb_upper':
+    case 'bb_lower': {
+      if (closes.length < period) return null;
+      const w = closes.slice(-period);
+      const mean = w.reduce((s, v) => s + v, 0) / period;
+      const std = Math.sqrt(w.reduce((s, v) => s + (v - mean) ** 2, 0) / period);
+      const mult = Number.isFinite(spec.mult) && spec.mult > 0 ? spec.mult : 2;
+      return spec.indicator === 'bb_upper' ? mean + mult * std : mean - mult * std;
+    }
+    case 'macd': return computeMACD(closes)?.macd ?? null;
+    case 'macd_signal': return computeMACD(closes)?.signal ?? null;
+    case 'donchian_high':
+    case 'donchian_low': {
+      if (slice.length <= period) return null;
+      const prior = slice.slice(-(period + 1), -1);
+      return spec.indicator === 'donchian_high'
+        ? Math.max(...prior.map(b => Number.isFinite(b.h) ? b.h : Math.max(b.o, b.c)))
+        : Math.min(...prior.map(b => Number.isFinite(b.l) ? b.l : Math.min(b.o, b.c)));
+    }
+    case 'atr': return slice.length > period ? computeATR(slice, period) : null;
+    case 'avg_volume': {
+      if (slice.length < period) return null;
+      const w = slice.slice(-period).map(b => b.v ?? 0);
+      return w.reduce((s, v) => s + v, 0) / period;
+    }
+    case 'pct_change': {
+      if (closes.length <= period) return null;
+      const prev = closes[closes.length - 1 - period];
+      return prev > 0 ? 100 * (last.c / prev - 1) : null;
+    }
+    default: return null;
+  }
+}
+
+export function evaluateRule(bars, rule) {
+  const leftVal = indicatorValue(bars, rule.left, 0);
+  const rightVal = indicatorValue(bars, rule.right, 0);
+  if (!Number.isFinite(leftVal) || !Number.isFinite(rightVal)) return { ready: false, pass: false, leftVal, rightVal };
+  if (rule.op === 'crosses_above' || rule.op === 'crosses_below') {
+    const prevLeft = indicatorValue(bars, rule.left, 1);
+    const prevRight = indicatorValue(bars, rule.right, 1);
+    if (!Number.isFinite(prevLeft) || !Number.isFinite(prevRight)) return { ready: false, pass: false, leftVal, rightVal };
+    const pass = rule.op === 'crosses_above' ? prevLeft <= prevRight && leftVal > rightVal : prevLeft >= prevRight && leftVal < rightVal;
+    return { ready: true, pass, leftVal, rightVal };
+  }
+  const pass = rule.op === 'gt' ? leftVal > rightVal : rule.op === 'lt' ? leftVal < rightVal : rule.op === 'gte' ? leftVal >= rightVal : leftVal <= rightVal;
+  return { ready: true, pass, leftVal, rightVal };
+}
+
+export function evaluateRuleSet(bars, rules, side) {
+  const list = rules?.[side] ?? [];
+  if (!list.length) return { ready: true, pass: false, results: [] };
+  const logic = (side === 'entry' ? rules.entryLogic : rules.exitLogic) === 'any' ? 'any' : 'all';
+  const results = list.map(rule => ({ rule, ...evaluateRule(bars, rule) }));
+  const ready = results.every(r => r.ready);
+  const pass = ready && (logic === 'all' ? results.every(r => r.pass) : results.some(r => r.pass));
+  return { ready, pass, results };
+}
+
+export function ruleWarmupBars(s) {
+  const all = [...(s.rules?.entry ?? []), ...(s.rules?.exit ?? [])];
+  let max = s.mode === 'custom' && all.length ? 2 : (s.period ?? 12);
+  for (const r of all) {
+    for (const side of [r.left, r.right]) {
+      if (!side) continue;
+      if (side.indicator === 'macd' || side.indicator === 'macd_signal') max = Math.max(max, 36);
+      else if (side.indicator !== 'number' && side.indicator !== 'close' && side.indicator !== 'volume') {
+        max = Math.max(max, (side.period ?? 14) + 2);
+      }
+    }
+  }
+  return Math.min(200, max);
+}
+
 export function contiguousBars(bars, period, maxGapMs = 180000) {
   if (!Array.isArray(bars) || !bars.length) return [];
   const slice = [bars.at(-1)];
@@ -130,6 +249,39 @@ export function botLedger(orders, symbol, budget) {
   return { qty, cost, boughtQty, invested, bought, sold, realized, buyFills, sellFills, available, complete };
 }
 
+function sanitizeRuleSpec(spec) {
+  if (!spec || typeof spec !== 'object' || !ruleIndicators.includes(spec.indicator)) throw Error('Invalid rule indicator.');
+  if (spec.indicator === 'number') {
+    if (!Number.isFinite(spec.value) || Math.abs(spec.value) > 1e9) throw Error('Invalid rule number value.');
+    return { indicator: 'number', value: spec.value };
+  }
+  const out = { indicator: spec.indicator };
+  if (!['close', 'volume', 'macd', 'macd_signal'].includes(spec.indicator)) {
+    const p = spec.period ?? 14;
+    if (!Number.isInteger(p) || p < 1 || p > 200) throw Error('Rule indicator period must be between 1 and 200.');
+    out.period = p;
+  }
+  return out;
+}
+
+function sanitizeRules(rules) {
+  if (!rules) return null;
+  const parseList = list => {
+    if (!Array.isArray(list) || list.length > 8) throw Error('Use up to 8 conditions per rule group.');
+    return list.map(r => {
+      if (!r || !ruleOperators.includes(r.op)) throw Error('Invalid rule operator.');
+      return { left: sanitizeRuleSpec(r.left), op: r.op, right: sanitizeRuleSpec(r.right) };
+    });
+  };
+  const entry = parseList(rules.entry ?? []);
+  const exit = parseList(rules.exit ?? []);
+  return {
+    entryLogic: rules.entryLogic === 'any' ? 'any' : 'all',
+    exitLogic: rules.exitLogic === 'all' ? 'all' : 'any',
+    entry, exit
+  };
+}
+
 export function strategy(input) {
   const result = { name: String(input.name ?? '').trim().slice(0, 60), symbol: input.symbol, ai: input.ai === true };
   if (!result.name || !Object.hasOwn(instruments, result.symbol)) throw Error('Choose a supported asset and strategy name.');
@@ -152,25 +304,53 @@ export function strategy(input) {
   const atrStop = input.atrStop === undefined ? 0 : input.atrStop;
   if (!Number.isFinite(atrStop) || atrStop < 0 || atrStop > 10) throw Error('Invalid value for atrStop');
   result.atrStop = atrStop;
+  const trailingStop = input.trailingStop === undefined ? 0 : input.trailingStop;
+  if (!Number.isFinite(trailingStop) || trailingStop < 0 || trailingStop > 50) throw Error('Invalid value for trailingStop');
+  result.trailingStop = trailingStop;
+  const maxHoldBars = input.maxHoldBars === undefined ? 0 : input.maxHoldBars;
+  if (!Number.isInteger(maxHoldBars) || maxHoldBars < 0 || maxHoldBars > 1440) throw Error('Invalid value for maxHoldBars');
+  result.maxHoldBars = maxHoldBars;
+  const sizeMode = input.sizeMode === 'usd' ? 'usd' : 'percent';
+  result.sizeMode = sizeMode;
+  const sizeUsd = input.sizeUsd === undefined ? 500 : input.sizeUsd;
+  if (!Number.isFinite(sizeUsd) || sizeUsd < 1 || sizeUsd > 1e9) throw Error('Invalid value for sizeUsd');
+  result.sizeUsd = sizeUsd;
+  result.aiPrompt = typeof input.aiPrompt === 'string' ? input.aiPrompt.trim().slice(0, 300) : '';
+  result.rules = sanitizeRules(input.rules);
+  if (result.mode === 'custom' && (!result.rules || !result.rules.entry.length)) throw Error('Add at least one entry rule for a custom strategy.');
   return result;
 }
 
 export function decision(s, closes, account, position, price, rules = isCrypto(s.symbol) ? cryptoReplayRules : null, options = {}) {
   if (!Number.isFinite(price) || price <= 0) return null;
   const mode = s.mode ?? 'momentum';
-  const warmedUp = options.warmedUp !== false && closes.length >= s.period;
+  const hasCustomRules = Boolean(s.rules?.entry?.length || s.rules?.exit?.length);
+  const evalBars = options.bars ?? closes.map(c => ({ o: c, h: c, l: c, c }));
+  const warmedUp = options.warmedUp !== false && (hasCustomRules ? evalBars.length >= ruleWarmupBars(s) : closes.length >= s.period);
   const pnl = position?.qty > 0 ? 100 * (price / position.entry - 1) : 0;
   const limit = account.equity <= account.dayStart * (1 - s.dailyLoss / 100);
   const effectiveStop = position?.qty > 0 && s.atrStop > 0 && Number.isFinite(options.atr) && options.atr > 0
     ? Math.min(s.stop, 100 * (s.atrStop * options.atr) / position.entry)
     : s.stop;
+  const trailHit = position?.qty > 0 && s.trailingStop > 0 && Number.isFinite(options.highWater) && options.highWater > 0 &&
+    price <= options.highWater * (1 - s.trailingStop / 100);
+  const holdExpired = position?.qty > 0 && s.maxHoldBars > 0 && (options.holdBars ?? 0) >= s.maxHoldBars;
   if (position?.qty > 0) {
-    const protective = limit || pnl <= -effectiveStop || pnl >= s.take;
+    const protective = limit || pnl <= -effectiveStop || pnl >= s.take || trailHit;
     if (protective) {
-      return { side: 'sell', qty: position.qty, protective: true, stopLoss: !limit && pnl <= -effectiveStop,
-        rationale: limit ? 'Maximum daily loss reached' : pnl <= -effectiveStop ? (s.atrStop > 0 ? `ATR stop-loss reached (-${effectiveStop.toFixed(2)}%)` : 'Stop-loss reached') : 'Take-profit reached' };
+      return { side: 'sell', qty: position.qty, protective: true, stopLoss: !limit && (pnl <= -effectiveStop || trailHit),
+        rationale: limit ? 'Maximum daily loss reached' : trailHit ? `Trailing stop reached (-${s.trailingStop}% from peak)` : pnl <= -effectiveStop ? (s.atrStop > 0 ? `ATR stop-loss reached (-${effectiveStop.toFixed(2)}%)` : 'Stop-loss reached') : 'Take-profit reached' };
+    }
+    if (holdExpired) {
+      return { side: 'sell', qty: position.qty, protective: false, rationale: `Max hold time reached (${s.maxHoldBars} bars)` };
     }
     if (!warmedUp) return null;
+    if (hasCustomRules && s.rules.exit?.length) {
+      const check = evaluateRuleSet(evalBars, s.rules, 'exit');
+      if (check.pass) return { side: 'sell', qty: position.qty, protective: false, rationale: 'Custom exit rules matched' };
+      return null;
+    }
+    if (mode === 'custom') return null;
     const window = closes.slice(-s.period);
     const average = window.reduce((sum, value) => sum + value, 0) / window.length;
     const latestClose = closes.at(-1);
@@ -196,34 +376,40 @@ export function decision(s, closes, account, position, price, rules = isCrypto(s
     return null;
   }
   if (!warmedUp || limit || options.cooldown > 0 || (!rules && options.volume === 0)) return null;
-  const window = closes.slice(-s.period);
-  const average = window.reduce((sum, value) => sum + value, 0) / window.length;
-  const latestClose = closes.at(-1);
   let rationale = null;
-  if (mode === 'mean_reversion') {
-    const variance = window.reduce((sum, v) => sum + (v - average) ** 2, 0) / window.length;
-    const std = Math.sqrt(variance);
-    const z = std > 0 ? (latestClose - average) / std : 0;
-    const threshold = Math.max(0.5, s.entry || 1.5);
-    const rsi = computeRSI(closes, Math.min(14, s.period));
-    if (z <= -threshold && (rsi === null || rsi <= 40)) {
-      rationale = `Mean reversion dip (Z ${z.toFixed(2)}, RSI ${(rsi ?? 0).toFixed(0)})`;
-    }
-  } else if (mode === 'breakout') {
-    const prior = window.slice(0, -1);
-    const channelHigh = prior.length ? Math.max(...prior) : average;
-    const breakoutPct = 100 * (latestClose / channelHigh - 1);
-    if (breakoutPct > s.entry) {
-      rationale = `Donchian breakout +${breakoutPct.toFixed(2)}% above ${s.period}-bar high`;
-    }
+  if (hasCustomRules && s.rules.entry?.length) {
+    const check = evaluateRuleSet(evalBars, s.rules, 'entry');
+    if (check.pass) rationale = `Custom entry rules matched (${s.rules.entryLogic === 'any' ? 'ANY' : 'ALL'} of ${s.rules.entry.length})`;
   } else {
-    const momentum = 100 * (latestClose / average - 1);
-    if (momentum > s.entry) {
-      rationale = 'Price is ' + momentum.toFixed(2) + '% above its moving average';
+    const window = closes.slice(-s.period);
+    const average = window.reduce((sum, value) => sum + value, 0) / window.length;
+    const latestClose = closes.at(-1);
+    if (mode === 'mean_reversion') {
+      const variance = window.reduce((sum, v) => sum + (v - average) ** 2, 0) / window.length;
+      const std = Math.sqrt(variance);
+      const z = std > 0 ? (latestClose - average) / std : 0;
+      const threshold = Math.max(0.5, s.entry || 1.5);
+      const rsi = computeRSI(closes, Math.min(14, s.period));
+      if (z <= -threshold && (rsi === null || rsi <= 40)) {
+        rationale = `Mean reversion dip (Z ${z.toFixed(2)}, RSI ${(rsi ?? 0).toFixed(0)})`;
+      }
+    } else if (mode === 'breakout') {
+      const prior = window.slice(0, -1);
+      const channelHigh = prior.length ? Math.max(...prior) : average;
+      const breakoutPct = 100 * (latestClose / channelHigh - 1);
+      if (breakoutPct > s.entry) {
+        rationale = `Donchian breakout +${breakoutPct.toFixed(2)}% above ${s.period}-bar high`;
+      }
+    } else {
+      const momentum = 100 * (latestClose / average - 1);
+      if (momentum > s.entry) {
+        rationale = 'Price is ' + momentum.toFixed(2) + '% above its moving average';
+      }
     }
   }
   if (!rationale) return null;
-  const budget = Math.min(account.equity * s.size / 100, account.equity * s.exposure / 100 - account.exposure, account.cash);
+  const sizeCap = s.sizeMode === 'usd' && Number.isFinite(s.sizeUsd) ? s.sizeUsd : account.equity * s.size / 100;
+  const budget = Math.min(sizeCap, account.equity * s.exposure / 100 - account.exposure, account.cash);
   const qty = entryQty(budget, price, rules);
   return qty > 0 ? { side: 'buy', qty, rationale } : null;
 }
@@ -236,6 +422,7 @@ export function replay(s, bars, options) {
   const budgetCap = Number.isFinite(options.budget) && options.budget > 0 ? options.budget : Infinity;
   const tfMs = timeframes[s.timeframe ?? '1Min'] ?? 60000;
   const maxGapMs = options.maxGapMs ?? Math.max(180000, tfMs * 3);
+  const warmupNeeded = ruleWarmupBars(s);
   const series = aggregateBars(bars, s.timeframe ?? '1Min');
   for (const bar of series) {
     const date = bar.t.slice(0, 10);
@@ -248,22 +435,29 @@ export function replay(s, bars, options) {
       const price = bar.o * (1 + (buy ? 1 : -1) * options.slippage / 10000);
       const unitCost = price * (1 + options.fees / 10000);
       const equity = cash + (position?.qty ?? 0) * bar.o;
+      const sizeCap = s.sizeMode === 'usd' && Number.isFinite(s.sizeUsd) ? s.sizeUsd : equity * s.size / 100;
       const qty = buy ? equity <= dayStart * (1 - s.dailyLoss / 100) ? 0 :
-        Math.min(pending.qty, entryQty(Math.min(cash, budgetCap, equity * s.exposure / 100, equity * s.size / 100), unitCost, rules)) : position.qty;
+        Math.min(pending.qty, entryQty(Math.min(cash, budgetCap, equity * s.exposure / 100, sizeCap), unitCost, rules)) : position.qty;
       if (qty > 0 && (!buy || !rules || qty * price >= rules.minValue)) {
         const fee = qty * price * options.fees / 10000;
         const pnl = buy ? null : qty * (price - position.entry) - fee - position.fee;
         cash += (buy ? -1 : 1) * qty * price - fee;
-        position = buy ? { qty, entry: price, fee } : null;
+        position = buy ? { qty, entry: price, fee, highWater: price, holdBars: 0 } : null;
         if (!buy && pending.stopLoss) cooldown = s.cooldown ?? 0;
         trades.push({ t: bar.t, side: pending.side, qty, price, fee, pnl });
       }
       pending = null;
     }
+    if (position) {
+      position.highWater = Math.max(position.highWater ?? position.entry, Number.isFinite(bar.h) ? bar.h : bar.c);
+      position.holdBars = (position.holdBars ?? 0) + 1;
+    }
     if (position && Number.isFinite(bar.l) && Number.isFinite(bar.h) && bar.l > 0 && bar.h >= bar.l) {
       const atr = s.atrStop > 0 ? computeATR(historyBars, Math.min(14, s.period)) : null;
       const stopPct = s.atrStop > 0 && atr > 0 ? Math.min(s.stop, 100 * (s.atrStop * atr) / position.entry) : s.stop;
-      const stopPrice = position.entry * (1 - stopPct / 100);
+      const fixedStopPrice = position.entry * (1 - stopPct / 100);
+      const trailStopPrice = s.trailingStop > 0 ? position.highWater * (1 - s.trailingStop / 100) : 0;
+      const stopPrice = Math.max(fixedStopPrice, trailStopPrice);
       const takePrice = position.entry * (1 + s.take / 100);
       const stopped = bar.l <= stopPrice;
       const trigger = stopped ? Math.min(bar.o, stopPrice) : bar.h >= takePrice ? Math.max(bar.o, takePrice) : null;
@@ -283,12 +477,15 @@ export function replay(s, bars, options) {
     peak = Math.max(peak, equity);
     curve.push({ t: bar.t, value: equity, drawdown: 100 * (equity / peak - 1) });
     historyBars.push(bar);
-    const window = contiguousBars(historyBars, s.period, maxGapMs);
+    const window = contiguousBars(historyBars, warmupNeeded, maxGapMs);
     const atr = s.atrStop > 0 ? computeATR(window, Math.min(14, s.period)) : null;
     pending = decision(s, window.map(b => b.c), { equity, cash: Math.min(cash, budgetCap), dayStart, exposure }, position, bar.c, rules, {
-      warmedUp: window.length >= s.period,
+      warmedUp: window.length >= warmupNeeded,
       cooldown,
       atr,
+      bars: window,
+      highWater: position?.highWater,
+      holdBars: position?.holdBars ?? 0,
       volume: Number.isFinite(bar.v) ? bar.v : undefined
     });
     if (cooldown > 0) cooldown--;

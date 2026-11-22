@@ -40,7 +40,7 @@ const ranges={'15M':15,'1H':60,'4H':240,'1D':1440};
 const screen={search:'',volume:0,volatility:0};
 const cryptoScreen={search:'',volume:0,volatility:0};
 let botFilter='all', launchVersion=null, launchInstrument=null, launchBudget='', fundBudget=null;
-let notifOpen=false, notifFilter='all', lastSeenNotif='';
+let notifOpen=false, notifFilter='all', lastSeenNotif='', avatarDraft=null;
 let tvStyle='Candles', tvRange='1H', tvBotId='';
 let historyTab='orders';
 const historyFilter={asset:'',strategy:'',side:'',status:'',start:'',end:''};
@@ -80,9 +80,10 @@ function chrome(){
  $('#workspace-source').textContent=online?'Broker '+state.broker:syncLabel();
  $('#profile-name').textContent=state.profile.name;
  const initials=state.profile.name.split(/ +/).slice(0,2).map(x=>x[0]).join('').toUpperCase()||'PT';
- $('#avatar').textContent=initials;
+ const avatarHtml=state.profile.avatar?`<img src="${esc(state.profile.avatar)}" alt="" class="avatar-img">`:esc(initials);
+ $('#avatar').innerHTML=avatarHtml;
  const mobileAvatar=$('#mobile-avatar');
- if(mobileAvatar)mobileAvatar.textContent=initials;
+ if(mobileAvatar)mobileAvatar.innerHTML=avatarHtml;
  renderNotifDrawer();
 }
 function renderNotifDrawer(){
@@ -201,6 +202,9 @@ function tradingView(symbol, botOrders, position, label='Trading View'){
  const legend=`<div class="tv-legend"><span><i class="tv-dot buy"></i>Buy (${buys})</span><span><i class="tv-dot sell"></i>Sell (${sells})</span>${position?.qty>0?`<span><i class="tv-dot entry"></i>Avg entry ${usd(position.entry)}</span>`:''}</div>`;
  return panel(label,desc,legend+`<div class="plot" tabindex="0" aria-label="Bot trading view chart" data-points="${esc(JSON.stringify(points))}" data-unit="price" data-low="${low}" data-high="${high}"><svg viewBox="0 0 790 265" role="img" aria-label="Trading view chart"><defs><linearGradient id="${id}" x1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#43e2ae" stop-opacity=".23"/><stop offset="100%" stop-color="#43e2ae" stop-opacity="0"/></linearGradient></defs>${grids}${ticks}${seriesSvg}${entryLine}${markers}<line class="crosshair" y1="12" y2="230" stroke="#7e98b5" stroke-dasharray="4 4" visibility="hidden"/><circle class="point" r="4" fill="#4be4b2" stroke="#0b1018" stroke-width="2" visibility="hidden"/></svg><div class="tooltip" role="status" hidden></div></div>`,controls,'chart-panel');
 }
+function unmanagedPositions(){
+ return state.positions.filter(p=>p.qty>0&&!Object.values(state.bots).some(b=>b.symbol===p.symbol&&((state.botSessions?.[b.id]?.qty??0)>1e-8||b.desired==='running')));
+}
 function trading(){
  const bots=Object.values(state.bots);
  if(!bots.some(b=>b.id===tvBotId))tvBotId=bots.find(b=>b.desired==='running')?.id??bots[0]?.id??'';
@@ -209,6 +213,7 @@ function trading(){
  const tvPos=activeTvBot?state.positions.find(p=>p.symbol===activeTvBot.symbol):null;
  const tvSwitch=bots.length>1?`<div class="tv-bot-tabs">${bots.map(b=>btn(esc(b.name)+' · '+esc(b.symbol),'tv-bot',b.id,false,`aria-pressed="${b.id===tvBotId}"`)).join('')}</div>`:'';
  const tvPanel=activeTvBot?tvSwitch+tradingView(activeTvBot.symbol,tvBotOrders,tvPos,'Bot Trading View · '+esc(activeTvBot.name)):'';
+ const unmanaged=unmanagedPositions();
  const groups=[['all','All bots'],['running','Active'],['paused','Paused'],['stopped','Stopped']];
  const counts=Object.fromEntries(groups.map(([k])=>[k,k==='all'?bots.length:bots.filter(b=>b.desired===k).length]));
  const filters=`<div class="tabs" role="group" aria-label="Filter bots">${groups.map(([k,label])=>btn(label+' '+counts[k],'bot-filter',k,false,`aria-pressed="${botFilter===k}"`)).join('')}</div>`;
@@ -234,12 +239,18 @@ function trading(){
    ];
  });
  const mode=state.mode==='demo'?'Demo paper trading':'Alpaca Paper';
+ const adoptPanel=unmanaged.length&&options.length?panel('Assign unmanaged open position','Allot an existing broker position that no bot is trading and optionally add extra USD funds to keep trading it.',
+   form('adopt-position',
+     select('Open broker position','symbol',unmanaged.map(p=>[p.symbol,`${p.symbol} · ${qtyText(p.qty)} units (${usd(p.qty*p.price)})`]),unmanaged[0].symbol,true)+
+     select('Strategy to manage position','version',[['','Choose a strategy version'],...options],chosen,true)+
+     numeric('Additional funds to add (USD)','addFunds',0,0,1e9),
+     submit('Assign position & start bot',!online))):'';
  return page('Automated execution','Live Trading','Launch and manage paper bots from saved strategy versions.',badge(mode,'good'))+
    (!online?'<div class="notice">Showing cached bot status · '+syncLabel()+'</div>':'')+
    '<div class="metrics">'+metric('Active bots',counts.running,counts.running?bots.filter(b=>b.status==='Running'&&b.desired==='running').length+' processing signals':'No active bots','bot',true)+
    metric('Paused bots',counts.paused,'Available to resume','strategies')+metric('Stopped bots',counts.stopped,'Available to restart','portfolio')+
    metric('Paper broker',esc(online?state.broker:'cached'),esc(state.feedName)+' · '+esc(online?state.feed:'cached'),'equity')+'</div>'+
-   '<div class="stack">'+tvPanel+panel('Launch a bot','Choose the saved trading rules, the instrument to trade, and the maximum USD budget.',
+   '<div class="stack">'+tvPanel+adoptPanel+panel('Launch a bot','Choose the saved trading rules, the instrument to trade, and the maximum USD budget.',
      options.length&&instruments.length?form('launch-bot',select('Strategy version','version',[['','Choose a strategy version'],...options],chosen,true)+
        select('Ticker or crypto pair','instrument',[['','Choose an instrument'],...instruments],target,true)+numeric('Bot budget (USD)','budget',launchBudget,1,1e9),
        unavailable+submit('Launch bot',!online)):
@@ -267,8 +278,9 @@ function session(){
  const command=(label,action)=>btn(label,'bot-command',action,false,`data-bot="${esc(bot.id)}" data-version="${bot.version}" ${!online?'disabled':''}`);
  const controls=bot.desired==='running'?'<div class="form"><div class="actions">'+command('Pause','paused')+command('Stop','stopped')+'</div></div>':
    bot.desired==='paused'?'<div class="form">'+command('Stop','stopped')+'</div>':'';
- const risk=bot.desired==='running'&&bot.budget?'':form('fund-bot',select('Strategy version','version',[['','Choose a strategy version'],...versions],selectedVersion,true)+numeric('Bot budget (USD)','budget',fundBudget??bot.budget??'',1,1e9),
-       submit(bot.desired==='running'?'Set budget':bot.desired==='paused'?'Resume bot':'Restart bot',!online));
+ const topUpForm=form('topup-bot',numeric('Add additional funds (USD)','addFunds','',1,1e9),submit('Add funds to bot',!online));
+ const risk=bot.desired==='running'&&bot.budget?topUpForm:form('fund-bot',select('Strategy version','version',[['','Choose a strategy version'],...versions],selectedVersion,true)+numeric('Bot budget (USD)','budget',fundBudget??bot.budget??'',1,1e9),
+       submit(bot.desired==='running'?'Set budget':bot.desired==='paused'?'Resume bot':'Restart bot',!online))+topUpForm;
  const positionRows=holding?[[esc(bot.symbol),qtyText(book.qty),book.complete?usd(book.cost/book.qty):'—',usd(book.mark),
    Number.isFinite(book.mark)?usd(book.qty*book.mark):'—',moneyChange(book.unrealized)]]:[];
  const filled=botOrders.filter(order=>order.filled>0);
@@ -306,11 +318,117 @@ function screener(){
  form('screen',field('Search','search',filter.search,'type="search" placeholder="Search symbols or names"')+numeric(crypto?'Minimum turnover (USD)':'Minimum volume','volume',filter.volume,0,1e12,1)+numeric('Minimum volatility (%)','volatility',filter.volatility,0,100),submit('Apply filters'))+
  table(['Asset','Price','Change','Volatility',crypto?'USD turnover':'Volume','Source / freshness',''],rows,'No instruments match these filters.'));
 }
-const fields=[['Lookback (bars)','period',2,60,1],['Entry threshold (%)','entry',0,25],['Exit threshold (%)','exit',-25,0],['Position size (% equity)','size',.1,100],['Maximum exposure (% equity)','exposure',.1,100],['Maximum daily loss (%)','dailyLoss',.1,50],['Stop-loss (%)','stop',.1,50],['Take-profit (%)','take',.1,100],['ATR stop multiplier (0=off)','atrStop',0,10,.1],['Stop-loss cooldown (bars)','cooldown',0,60,1]];
-const defaultParams={mode:'momentum',timeframe:'1Min',period:12,entry:0.1,exit:-0.1,size:10,exposure:20,dailyLoss:3,stop:2,take:4,atrStop:0,cooldown:5,ai:false};
-const fresh=(symbol='')=>({...defaultParams,id:'',version:0,name:'',symbol});
-const modeLabels={momentum:'Momentum (SMA)',mean_reversion:'Mean Reversion (Bollinger + RSI)',breakout:'Breakout (Donchian Channel)'};
+const fields=[['Lookback (bars)','period',2,60,1],['Entry threshold (%)','entry',0,25],['Exit threshold (%)','exit',-25,0],['Position size (% equity)','size',.1,100],['Fixed size (USD)','sizeUsd',1,1e9,1],['Maximum exposure (% equity)','exposure',.1,100],['Maximum daily loss (%)','dailyLoss',.1,50],['Stop-loss (%)','stop',.1,50],['Trailing stop (%, 0=off)','trailingStop',0,50,.1],['Take-profit (%)','take',.1,100],['ATR stop multiplier (0=off)','atrStop',0,10,.1],['Stop-loss cooldown (bars)','cooldown',0,60,1],['Max hold (bars, 0=off)','maxHoldBars',0,1440,1]];
+const defaultParams={mode:'momentum',timeframe:'1Min',period:12,entry:0.1,exit:-0.1,sizeMode:'percent',size:10,sizeUsd:500,exposure:20,dailyLoss:3,stop:2,trailingStop:0,take:4,atrStop:0,cooldown:5,maxHoldBars:0,ai:false,aiPrompt:'',rules:null};
+const fresh=(symbol='')=>({...defaultParams,id:'',version:0,name:'',symbol,rules:null});
+const modeLabels={momentum:'Momentum (SMA)',mean_reversion:'Mean Reversion (Bollinger + RSI)',breakout:'Breakout (Donchian Channel)',custom:'Custom Rule Builder'};
 const tfOptions=[['1Min','1 Minute'],['5Min','5 Minutes'],['15Min','15 Minutes'],['1Hour','1 Hour']];
+const tfMsMap={'1Min':60000,'5Min':300000,'15Min':900000,'1Hour':3600000};
+const ruleIndLabels={close:'Close',sma:'SMA',ema:'EMA',rsi:'RSI',bb_upper:'BB Upper',bb_lower:'BB Lower',macd:'MACD',macd_signal:'MACD Signal',donchian_high:'Donchian High',donchian_low:'Donchian Low',atr:'ATR',volume:'Volume',avg_volume:'Avg Volume',pct_change:'% Change',number:'Number'};
+const leftIndicators=['close','sma','ema','rsi','bb_upper','bb_lower','macd','macd_signal','donchian_high','donchian_low','atr','volume','avg_volume','pct_change'];
+const rightIndicators=['number','close','sma','ema','rsi','bb_upper','bb_lower','macd','macd_signal','donchian_high','donchian_low','avg_volume'];
+const opLabels={gt:'>',lt:'<',gte:'≥',lte:'≤',crosses_above:'Crosses Above',crosses_below:'Crosses Below'};
+const noPeriodInd=new Set(['close','volume','macd','macd_signal','number']);
+const strategyTemplates={
+ ema_cross:{label:'EMA Crossover',name:'EMA 9/21 Crossover',mode:'custom',timeframe:'5Min',trailingStop:1.5,stop:2,take:5,rules:{entryLogic:'all',exitLogic:'any',entry:[{left:{indicator:'ema',period:9},op:'crosses_above',right:{indicator:'ema',period:21}}],exit:[{left:{indicator:'ema',period:9},op:'crosses_below',right:{indicator:'ema',period:21}}]}},
+ trend_pullback:{label:'Trend Pullback',name:'Trend Pullback RSI',mode:'custom',timeframe:'5Min',trailingStop:1.5,stop:2,take:4.5,rules:{entryLogic:'all',exitLogic:'any',entry:[{left:{indicator:'close'},op:'gt',right:{indicator:'ema',period:50}},{left:{indicator:'rsi',period:14},op:'lt',right:{indicator:'number',value:38}}],exit:[{left:{indicator:'rsi',period:14},op:'gt',right:{indicator:'number',value:70}}]}},
+ bb_reversion:{label:'Bollinger Reversion',name:'Bollinger RSI Dip',mode:'custom',timeframe:'5Min',trailingStop:0,stop:2.5,take:4,rules:{entryLogic:'all',exitLogic:'any',entry:[{left:{indicator:'close'},op:'lt',right:{indicator:'bb_lower',period:20}},{left:{indicator:'rsi',period:14},op:'lt',right:{indicator:'number',value:35}}],exit:[{left:{indicator:'close'},op:'gt',right:{indicator:'sma',period:20}}]}},
+ donchian:{label:'Donchian Breakout',name:'Donchian 20 Breakout',mode:'custom',timeframe:'15Min',trailingStop:2,stop:2.5,take:6,rules:{entryLogic:'all',exitLogic:'any',entry:[{left:{indicator:'close'},op:'gt',right:{indicator:'donchian_high',period:20}}],exit:[{left:{indicator:'close'},op:'lt',right:{indicator:'donchian_low',period:10}}]}},
+ crypto_swing:{label:'Crypto Swing 15m',name:'Crypto Fee-Safe Swing',mode:'custom',timeframe:'15Min',sizeMode:'usd',sizeUsd:500,trailingStop:1.8,stop:2.5,take:5.5,cooldown:4,rules:{entryLogic:'all',exitLogic:'any',entry:[{left:{indicator:'close'},op:'gt',right:{indicator:'ema',period:20}},{left:{indicator:'rsi',period:14},op:'gt',right:{indicator:'number',value:52}},{left:{indicator:'rsi',period:14},op:'lt',right:{indicator:'number',value:72}}],exit:[{left:{indicator:'close'},op:'crosses_below',right:{indicator:'ema',period:20}},{left:{indicator:'rsi',period:14},op:'gt',right:{indicator:'number',value:78}}]}}
+};
+function clientAgg(bars,tf){
+ const ms=tfMsMap[tf]??60000;
+ if(!bars?.length||ms<=60000)return bars??[];
+ const out=[];
+ for(const b of bars){
+   const ts=Date.parse(b.t),bucket=Math.floor(ts/ms)*ms,prev=out.at(-1);
+   const h=Number.isFinite(b.h)?b.h:Math.max(b.o,b.c),l=Number.isFinite(b.l)?b.l:Math.min(b.o,b.c);
+   if(prev&&prev._b===bucket){prev.h=Math.max(prev.h,h);prev.l=Math.min(prev.l,l);prev.c=b.c;prev.v=(prev.v??0)+(b.v??0);prev.t=b.t}
+   else out.push({_b:bucket,t:b.t,o:b.o,h,l,c:b.c,v:b.v??0});
+ }
+ return out;
+}
+function clientEma(vals,p){if(vals.length<p)return null;const k=2/(p+1);let e=vals.slice(0,p).reduce((a,b)=>a+b,0)/p;for(let i=p;i<vals.length;i++)e=vals[i]*k+e*(1-k);return e}
+function clientRsi(vals,p){if(vals.length<=p)return null;const s=vals.slice(-(p+1));let g=0,l=0;for(let i=1;i<s.length;i++){const d=s[i]-s[i-1];if(d>0)g+=d;else l-=d}const ag=g/p,al=l/p;return al===0?(ag===0?50:100):100-100/(1+ag/al)}
+function clientInd(bars,spec,off=0){
+ if(!spec)return null;
+ if(spec.indicator==='number')return Number.isFinite(spec.value)?spec.value:null;
+ const end=(bars?.length??0)-off;if(end<=0)return null;
+ const sl=bars.slice(0,end),cs=sl.map(b=>b.c),p=Math.max(1,Math.round(spec.period??14)),last=sl.at(-1);
+ if(spec.indicator==='close')return last.c;
+ if(spec.indicator==='volume')return last.v??0;
+ if(spec.indicator==='sma')return cs.length>=p?cs.slice(-p).reduce((a,b)=>a+b,0)/p:null;
+ if(spec.indicator==='ema')return clientEma(cs,p);
+ if(spec.indicator==='rsi')return clientRsi(cs,p);
+ if(spec.indicator==='bb_upper'||spec.indicator==='bb_lower'){if(cs.length<p)return null;const w=cs.slice(-p),m=w.reduce((a,b)=>a+b,0)/p,sd=Math.sqrt(w.reduce((a,v)=>a+(v-m)**2,0)/p);return spec.indicator==='bb_upper'?m+2*sd:m-2*sd}
+ if(spec.indicator==='macd'||spec.indicator==='macd_signal'){if(cs.length<35)return null;const s=[];for(let i=26;i<=cs.length;i++){const sub=cs.slice(0,i);s.push(clientEma(sub,12)-clientEma(sub,26))}return spec.indicator==='macd'?s.at(-1):clientEma(s,9)}
+ if(spec.indicator==='donchian_high'||spec.indicator==='donchian_low'){if(sl.length<=p)return null;const pr=sl.slice(-(p+1),-1);return spec.indicator==='donchian_high'?Math.max(...pr.map(b=>b.h??Math.max(b.o,b.c))):Math.min(...pr.map(b=>b.l??Math.min(b.o,b.c)))}
+ if(spec.indicator==='atr'){if(sl.length<=p)return null;const s=sl.slice(-(p+1));let sum=0;for(let i=1;i<s.length;i++){const h=s[i].h??Math.max(s[i].o,s[i].c),l=s[i].l??Math.min(s[i].o,s[i].c);sum+=Math.max(h-l,Math.abs(h-s[i-1].c),Math.abs(l-s[i-1].c))}return sum/p}
+ if(spec.indicator==='avg_volume')return sl.length>=p?sl.slice(-p).reduce((a,b)=>a+(b.v??0),0)/p:null;
+ if(spec.indicator==='pct_change'){if(cs.length<=p)return null;const pr=cs[cs.length-1-p];return pr>0?100*(last.c/pr-1):null}
+ return null;
+}
+function clientEvalRule(bars,rule){
+ const lv=clientInd(bars,rule.left,0),rv=clientInd(bars,rule.right,0);
+ if(!Number.isFinite(lv)||!Number.isFinite(rv))return{ready:false,pass:false,lv,rv};
+ if(rule.op==='crosses_above'||rule.op==='crosses_below'){
+   const pl=clientInd(bars,rule.left,1),pr=clientInd(bars,rule.right,1);
+   if(!Number.isFinite(pl)||!Number.isFinite(pr))return{ready:false,pass:false,lv,rv};
+   return{ready:true,pass:rule.op==='crosses_above'?pl<=pr&&lv>rv:pl>=pr&&lv<rv,lv,rv};
+ }
+ return{ready:true,pass:rule.op==='gt'?lv>rv:rule.op==='lt'?lv<rv:rule.op==='gte'?lv>=rv:lv<=rv,lv,rv};
+}
+const specLabel=sp=>!sp?'—':sp.indicator==='number'?String(sp.value??0):noPeriodInd.has(sp.indicator)?(ruleIndLabels[sp.indicator]??sp.indicator):`${ruleIndLabels[sp.indicator]??sp.indicator}(${sp.period??14})`;
+function ensureRules(){editor.rules??={entryLogic:'all',exitLogic:'any',entry:[],exit:[]};return editor.rules}
+function renderRuleGroup(side,title){
+ const r=editor.rules??{entryLogic:'all',exitLogic:'any',entry:[],exit:[]};
+ const list=r[side]??[], logic=side==='entry'?(r.entryLogic??'all'):(r.exitLogic??'any');
+ const logicBtns=`<div class="segmented">${[['all','ALL (AND)'],['any','ANY (OR)']].map(([k,l])=>`<button type="button" class="${logic===k?'selected':''}" data-action="rule-logic" data-side="${side}" data-value="${k}">${l}</button>`).join('')}</div>`;
+ const rows=list.map((row,idx)=>{
+   const lOpts=leftIndicators.map(k=>`<option value="${k}" ${row.left?.indicator===k?'selected':''}>${ruleIndLabels[k]}</option>`).join('');
+   const opOpts=Object.entries(opLabels).map(([k,l])=>`<option value="${k}" ${row.op===k?'selected':''}>${l}</option>`).join('');
+   const rOpts=rightIndicators.map(k=>`<option value="${k}" ${row.right?.indicator===k?'selected':''}>${ruleIndLabels[k]}</option>`).join('');
+   const lPer=noPeriodInd.has(row.left?.indicator)?'':`<input type="number" class="rule-num" min="1" max="200" step="1" value="${row.left?.period??14}" data-rule-side="${side}" data-rule-idx="${idx}" data-rule-part="left.period" aria-label="Left period">`;
+   const rPer=row.right?.indicator==='number'
+     ?`<input type="number" class="rule-num" step="any" value="${row.right?.value??0}" data-rule-side="${side}" data-rule-idx="${idx}" data-rule-part="right.value" aria-label="Right value">`
+     :noPeriodInd.has(row.right?.indicator)?'':`<input type="number" class="rule-num" min="1" max="200" step="1" value="${row.right?.period??14}" data-rule-side="${side}" data-rule-idx="${idx}" data-rule-part="right.period" aria-label="Right period">`;
+   return `<div class="rule-row"><select data-rule-side="${side}" data-rule-idx="${idx}" data-rule-part="left.indicator">${lOpts}</select>${lPer}<select data-rule-side="${side}" data-rule-idx="${idx}" data-rule-part="op">${opOpts}</select><select data-rule-side="${side}" data-rule-idx="${idx}" data-rule-part="right.indicator">${rOpts}</select>${rPer}<button type="button" class="button rule-del" data-action="rule-remove" data-side="${side}" data-value="${idx}" aria-label="Remove rule">✕</button></div>`;
+ }).join('');
+ return `<div class="rule-box"><div class="rule-head"><b>${title}</b><div class="actions">${logicBtns}${btn('+ Add rule','rule-add',side)}</div></div>${rows||'<small class="muted">No custom '+side+' conditions. Click + Add rule or choose a template above.</small>'}</div>`;
+}
+function renderLiveDebugger(){
+ const sym=editor.symbol, tf=editor.timeframe??'1Min', mode=editor.mode??'momentum';
+ const tfBars=sym?clientAgg(state.bars[sym]??[],tf):[];
+ const rules=editor.rules;
+ const hasCustom=Boolean(rules?.entry?.length||rules?.exit?.length);
+ const sizeText=(editor.sizeMode==='usd'?usd(editor.sizeUsd??500)+' fixed':(editor.size??10)+'% equity');
+ const riskBits=[`SL ${editor.stop??2}%`,editor.trailingStop>0?`Trail ${editor.trailingStop}%`:null,editor.atrStop>0?`ATR×${editor.atrStop}`:null,`TP ${editor.take??4}%`,editor.cooldown>0?`Cooldown ${editor.cooldown}b`:null,editor.maxHoldBars>0?`Max hold ${editor.maxHoldBars}b`:null].filter(Boolean).join(' · ');
+ const summary=hasCustom
+   ?`Trades ${esc(sym||'selected asset')} on ${esc(tf)} candles using ${(rules.entry?.length??0)} custom entry (${(rules.entryLogic??'all').toUpperCase()}) & ${(rules.exit?.length??0)} exit (${(rules.exitLogic??'any').toUpperCase()}) rules · Size ${sizeText} · ${riskBits}.`
+   :`Trades ${esc(sym||'selected asset')} on ${esc(tf)} candles using ${esc(modeLabels[mode]??mode)} (period ${editor.period??12}) · Size ${sizeText} · ${riskBits}.`;
+ let checks='';
+ if(!sym||tfBars.length<2){
+   checks=empty('Select an instrument with candle history to see live PASS/WAIT condition values.');
+ } else if(hasCustom){
+   const evalSection=(side,label)=>{
+     const list=rules[side]??[];if(!list.length)return '';
+     const items=list.map(rule=>{
+       const res=clientEvalRule(tfBars,rule);
+       const valText=res.ready?`${num(res.lv)} ${opLabels[rule.op]} ${num(res.rv)}`:'Warming up';
+       return `<div class="bot-row"><span><b>${esc(specLabel(rule.left))} ${opLabels[rule.op]} ${esc(specLabel(rule.right))}</b><small class="mono">${valText}</small></span>${badge(res.ready?(res.pass?'PASS':'WAIT'):'WARMUP',res.pass?'good':'')}</div>`;
+     }).join('');
+     return `<div class="section-label" style="padding:10px 16px 4px">${label} (${(side==='entry'?rules.entryLogic:rules.exitLogic).toUpperCase()})</div>${items}`;
+   };
+   checks=evalSection('entry','Entry conditions')+evalSection('exit','Exit conditions');
+ } else {
+   const p=editor.period??12, cs=tfBars.map(b=>b.c), last=cs.at(-1), sma=clientInd(tfBars,{indicator:'sma',period:p});
+   const mom=sma?100*(last/sma-1):null, rsi=clientInd(tfBars,{indicator:'rsi',period:Math.min(14,p)});
+   checks=`<div class="bot-row"><span><b>Latest ${esc(tf)} Close</b><small class="mono">${usd(last)} · ${tfBars.length} bars loaded</small></span>${badge(tfBars.length>=p?'READY':'WARMUP',tfBars.length>=p?'good':'')}</div>`+
+     `<div class="bot-row"><span><b>Momentum vs SMA(${p})</b><small class="mono">${pct(mom)} (entry > ${editor.entry??0.1}%)</small></span>${badge(mom!==null&&mom>(editor.entry??0.1)?'PASS':'WAIT',mom!==null&&mom>(editor.entry??0.1)?'good':'')}</div>`+
+     `<div class="bot-row"><span><b>RSI(${Math.min(14,p)})</b><small class="mono">${num(rsi)}</small></span>${badge(rsi!==null&&rsi<40?'OVERSOLD':rsi!==null&&rsi>65?'OVERBOUGHT':'NEUTRAL')}</div>`;
+ }
+ return panel('Live rule debugger','Real-time check on '+esc(sym||'current')+' · '+esc(tf)+' candles',`<div class="form"><p class="sub" style="margin:0">${summary}</p></div>`+checks);
+}
 function strategies(){
  const route=location.hash, requested=params().get('symbol');
  if(editorRoute!==route){
@@ -322,20 +440,25 @@ function strategies(){
  const saved=editor.id&&version(key(editor)),bot=saved&&state.bots[editor.id];
  const options=state.strategies.slice().reverse().map(s=>[key(s),s.name+' · '+s.symbol+' · v'+s.version]);
  const asset=state.market.find(m=>m.symbol===editor.symbol);
- const inputs=field('Strategy name','name',editor.name,'required maxlength="60"')+select('Instrument or pair','symbol',[['','Choose an instrument'],...state.market.map(m=>[m.symbol,m.symbol+' · '+m.name])],asset?.symbol??'',true)+
+ const templatesBar=`<div class="template-bar"><span class="section-label">1-Click Templates</span><div class="actions">${Object.entries(strategyTemplates).map(([k,t])=>btn(t.label,'apply-template',k)).join('')}</div></div>`;
+ const baseInputs=field('Strategy name','name',editor.name,'required maxlength="60"')+select('Instrument or pair','symbol',[['','Choose an instrument'],...state.market.map(m=>[m.symbol,m.symbol+' · '+m.name])],asset?.symbol??'',true)+
  select('Saved version','version',[['','New draft'],...options],saved?key(saved):'')+
  select('Strategy mode','mode',Object.entries(modeLabels),editor.mode??'momentum',true)+
  select('Candle timeframe','timeframe',tfOptions,editor.timeframe??'1Min',true)+
- fields.map(([label,k,min,max,step])=>numeric(label,k,editor[k]??defaultParams[k],min,max,step)).join('');
+ select('Position sizing mode','sizeMode',[['percent','% of Equity'],['usd','Fixed USD per trade']],editor.sizeMode??'percent',true);
+ const riskInputs=fields.map(([label,k,min,max,step])=>numeric(label,k,editor[k]??defaultParams[k],min,max,step)).join('');
+ const ruleBuilder=renderRuleGroup('entry','Entry Rules (Buy)')+renderRuleGroup('exit','Exit Rules (Sell)');
+ const aiSection=check('Require AI confirmation for non-protective signals','ai',editor.ai)+
+ field('Custom AI confirmation rule (optional)','aiPrompt',editor.aiPrompt??'','maxlength="300" placeholder="e.g. Veto buys if news is bearish or candle jumped >2%"')+
+ '<small>'+(state.aiConfigured?esc(state.aiProvider ?? 'AI provider')+' configured (with live Alpaca News headlines). Historical replay uses deterministic rules.':'Configure a Gemini or OpenAI key in the server environment to enable AI confirmation.')+'</small>';
  const startTrade=s=>link('Start trade','trading?version='+encodeURIComponent(key(s)),true);
  const botActions=saved?`<div class="actions">${link('Backtest v'+saved.version,'backtesting?version='+key(saved))}${bot?link('Open bot session',sessionRoute(bot)+'&version='+saved.version):''}${startTrade(saved)}</div>`:'';
- return page('Automated trading','Strategy Editor','Configure a minute-bar strategy and control its paper bot.',btn(icon('plus')+' New strategy','new','',true))+
- `<div class="grid">${panel('Strategy configuration','Long-only moving-average momentum · 1-minute bars',form('strategy',inputs,check('Require AI confirmation for non-protective signals','ai',editor.ai)+
- '<small>'+(state.aiConfigured?esc(state.aiProvider ?? 'AI provider')+' configured. Historical replay uses deterministic strategy versions.':'Configure a Gemini or OpenAI key in the server environment to enable AI confirmation.')+'</small>'+
+ return page('Automated trading','Strategy Editor','Build custom indicator rules, risk guardrails, and AI filters.',btn(icon('plus')+' New strategy','new','',true))+
+ `<div class="grid">${panel('Strategy & rule builder','Pick a template or stack custom Entry/Exit conditions',templatesBar+form('strategy',baseInputs+riskInputs,ruleBuilder+aiSection+
  submit(online?'Save version':'Queue draft sync')+`<small id="draft-status">${editor.queued?'Queued for sync':editor.dirty?'Local draft':''}</small>`))}
- <div class="stack">${panel('Paper bot',bot?'Pinned to version '+bot.version:'Select a saved strategy version',
- (bot?`<div class="bot-row"><span>${bot.symbol}</span>${badge(botStatus(bot))}</div>`:empty('Save a strategy to enable paper bot controls.'))+'<div class="form">'+botActions+'</div>')}
- ${panel('Saved strategies','Latest versions',latest().map(s=>`<div class="bot-row"><div><b>${esc(s.name)}</b><small>${s.symbol} · v${s.version}</small></div><div class="actions">${btn('Edit','edit',key(s))}${startTrade(s)}</div></div>`).join(''))}</div></div>`;
+ <div class="stack">${renderLiveDebugger()}${panel('Paper bot',bot?'Pinned to version '+bot.version:'Select a saved strategy version',
+ (bot?`<div class="bot-row"><span>${esc(bot.symbol)}</span>${badge(botStatus(bot))}</div>`:empty('Save a strategy to enable paper bot controls.'))+'<div class="form">'+botActions+'</div>')}
+ ${panel('Saved strategies','Latest versions',latest().map(s=>`<div class="bot-row"><div><b>${esc(s.name)}</b><small>${esc(s.symbol)} · ${esc(s.timeframe??'1Min')} · v${s.version}</small></div><div class="actions">${btn('Edit','edit',key(s))}${startTrade(s)}</div></div>`).join(''))}</div></div>`;
 }
 function backtesting(){
  const runs=state.runs,eligible=state.strategies.filter(s=>!s.ai).reverse(),requested=params().get('version');
@@ -373,17 +496,53 @@ function portfolio(){
 function settings(){
  const row=(label,desc,status)=>`<div class="bot-row"><div><b>${label}</b><small>${desc}</small></div>${badge(status)}</div>`;
  const events=state.events.map(e=>`<div class="activity-item">${esc(e.message)}<small>${stamp(e.t)}</small></div>`).join('');
- return page('Workspace preferences','Settings','Review data providers, paper connectivity, and in-app notifications.')+
- `<div class="grid equal"><div class="stack">${panel('Integrations','Credentials are configured in the server environment.',row('Stock data',esc(state.feedName),state.feed)+row('Paper broker',state.mode==='demo'?'Local simulated fills':'Alpaca Paper API',state.broker)+row('AI signal confirmation',esc(state.aiProvider ?? 'Gemini or OpenAI'),state.aiConfigured?'configured':'unconfigured')+row('Crypto data',state.mode==='demo'?'Synthetic market':'Alpaca Crypto US',state.cryptoFeed??'connecting')+row('Forex provider','Provider pending','unconfigured'))}
+ return page('Workspace preferences','Settings','Review data providers, paper connectivity, and in-app / Telegram notifications.')+
+ `<div class="grid equal"><div class="stack">${panel('Integrations','Credentials are configured in the server environment.',row('Stock data',esc(state.feedName),state.feed)+row('Paper broker',state.mode==='demo'?'Local simulated fills':'Alpaca Paper API',state.broker)+row('AI signal confirmation',esc(state.aiProvider ?? 'Gemini or OpenAI'),state.aiConfigured?'configured':'unconfigured')+row('Telegram alerts',state.telegramConfigured?'Bot connected':'Set TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID',state.telegramConfigured?'configured':'unconfigured')+row('Crypto data',state.mode==='demo'?'Synthetic market':'Alpaca Crypto US',state.cryptoFeed??'connecting')+row('Forex provider','Provider pending','unconfigured'))}
  ${state.mode==='demo'?panel('Connection simulator','Exercise bot behavior during feed or broker outages.',`<div class="form"><div class="actions">${btn('Disconnect feed','outage','feed')}${btn('Disconnect broker','outage','broker')}${btn('Reconnect both','outage','clear',true)}</div></div>`):''}</div>
- <div class="stack">${panel('Notifications','Choose which events appear in the workspace.',`<form id="settings" class="form">${Object.entries({signals:'Trade signals',fills:'Order fills',risk:'Risk limits',connections:'Connection failures'}).map(([k,v])=>check(v,k,state.alerts[k])).join('')}${submit('Save preferences',!online)}</form>`)}
+ <div class="stack">${panel('Notifications','Choose which events appear in the workspace and push to Telegram.',`<form id="settings" class="form">${Object.entries({signals:'Trade signals',fills:'Order fills',risk:'Risk limits',connections:'Connection failures',telegram:'Push alerts to Telegram'}).map(([k,v])=>check(v,k,k==='telegram'?state.alerts[k]!==false:state.alerts[k])).join('')}<div class="actions">${submit('Save preferences',!online)}${state.telegramConfigured?btn('Send test alert','test-telegram','',false,!online?'disabled':''):''}</div></form>`)}
  ${panel('Recent notifications',syncLabel(),events?'<div class="activity">'+events+'</div>':empty('No notifications yet.'))}</div></div>`;
 }
 function profile(){
- return page('Workspace preferences','Profile','Manage local workspace details and offline data access.')+
- `<div class="grid">${panel('Account details','Local workspace profile',form('profile',field('Display name','name',state.profile.name,'required maxlength="80"')+
- field('Email','email',state.profile.email,'type="email"'),(authInfo?.required?'<small>Signed-in workspace data and drafts are kept in this tab during a disconnect.</small>':check('Cache workspace data in this browser','offlineSync',state.profile.offlineSync))+submit('Save profile',!online)))}
- ${panel('Subscription','Current workspace tier','<div class="bot-row"><b>Paper trading</b>'+badge('Local workspace','good')+'</div>'+empty(syncLabel()))}</div>`;
+ const p=state.profile??{};
+ const photo=avatarDraft!==null?avatarDraft:(p.avatar||'');
+ const initials=(p.name||'PT').split(/ +/).slice(0,2).map(x=>x[0]).join('').toUpperCase()||'PT';
+ const avatarPreview=photo?`<img src="${esc(photo)}" alt="Profile picture" class="profile-photo-img">`:`<span class="profile-photo-fallback">${esc(initials)}</span>`;
+ const tzOptions=[['UTC','UTC'],['America/New_York','New York (ET)'],['America/Chicago','Chicago (CT)'],['America/Los_Angeles','Los Angeles (PT)'],['Europe/London','London (GMT/BST)'],['Europe/Paris','Central Europe (CET)'],['Africa/Lagos','Lagos (WAT)'],['Asia/Tokyo','Tokyo (JST)']];
+ const filledOrders=state.orders.filter(o=>o.owned&&o.filled>0);
+ const closedPnl=filledOrders.filter(o=>o.side==='sell'&&Number.isFinite(o.pnl));
+ const wins=closedPnl.filter(o=>o.pnl>0).length, losses=closedPnl.filter(o=>o.pnl<0).length, decided=wins+losses;
+ const winRate=decided?100*wins/decided:null;
+ const winRatio=losses>0?(wins/losses).toFixed(2)+'x':wins>0?wins+':0':'—';
+ const activeBots=Object.values(state.bots).filter(b=>b.desired==='running').length;
+ const equityPts=state.equity??[];
+ const eqStart=equityPts[0]?.value, eqNow=state.account?.equity;
+ const eqRet=eqStart&&Number.isFinite(eqNow)?100*(eqNow/eqStart-1):null;
+ const hero=`<section class="panel profile-hero">
+   <div class="profile-hero-left">
+     <div class="profile-photo">${avatarPreview}</div>
+     <div>
+       <h2>${esc(p.name||'Paper Trader')}</h2>
+       <small>${p.username?'@'+esc(p.username)+' · ':''}${esc(p.email||'No email set')}</small>
+       <div class="actions" style="margin-top:8px">${badge(p.riskTier||'moderate','good')}${badge((p.tradingStyle||'swing')+' trader')}${badge(activeBots+' active bots')}</div>
+     </div>
+   </div>
+   <div class="actions">
+     <label class="button primary" for="avatar-file">Upload photo</label>
+     <input type="file" id="avatar-file" accept="image/*" hidden>
+     ${photo?btn('Remove photo','remove-avatar'):''}
+   </div>
+ </section>`;
+ const profileFields=field('Display name','name',p.name??'Paper Trader','required maxlength="80"')+
+   field('Username','username',p.username??'','maxlength="32" placeholder="trader_handle"')+
+   field('Email','email',p.email??'','type="email" maxlength="120"')+
+   select('Timezone','timezone',tzOptions,p.timezone??'UTC')+
+   select('Risk profile','riskTier',[['conservative','Conservative'],['moderate','Moderate'],['aggressive','Aggressive']],p.riskTier??'moderate')+
+   select('Trading style','tradingStyle',[['scalp','Scalping'],['day','Day trading'],['swing','Swing trading'],['position','Position trading']],p.tradingStyle??'swing');
+ const bioField=`<label class="field">Bio &amp; trading notes<textarea name="bio" rows="3" maxlength="280" placeholder="Strategy focus, risk rules, or personal trading notes...">${esc(p.bio??'')}</textarea></label>`;
+ const equityCurve=panel('Portfolio equity curve',eqRet!==null?`<span class="${color(eqRet)}">${pct(eqRet)}</span> since first snapshot · ${syncLabel()}`:'Paper account equity over time · '+syncLabel(),plot(equityPts),'','chart-panel');
+ return page('Trader identity','Profile','Manage your trader profile, photo, performance metrics, and trading preferences.')+
+ `<div class="stack">${hero}<div class="metrics">${metric('Account equity',usd(state.account?.equity),'Paper portfolio','equity',true)}${metric('Buying power',usd(state.account?.buyingPower),'Available for orders','wallet')}${metric('Win / loss rate',winRate!==null?winRate.toFixed(1)+'%':'—',decided?`${wins}W / ${losses}L · ratio ${winRatio}`:'Awaiting closed trades','equity',true)}${metric('Account trades',filledOrders.length,activeBots+' active bots','portfolio')}</div>${equityCurve}<div class="grid">${panel('Profile details','Saved per isolated account',form('profile',profileFields,bioField+(authInfo?.required?'<small>Signed-in workspace data and drafts are kept in this tab during a disconnect.</small>':check('Cache workspace data in this browser','offlineSync',p.offlineSync))+submit('Save profile',!online)))}
+ <div class="stack">${panel('Account isolation','Your trades are strictly partitioned by account key',`<div class="bot-row"><span><b>Account key</b><small class="mono">${esc(state.accountKey??state.mode)}</small></span>${badge('Isolated','good')}</div><div class="bot-row"><span><b>Broker environment</b><small>${state.mode==='demo'?'Local simulated broker':'Alpaca Paper API'}</small></span>${badge(state.broker)}</div><div class="bot-row"><span><b>Last sync</b><small>${syncLabel()}</small></span>${badge(online?'online':'offline',online?'good':'bad')}</div>`)}</div></div></div>`;
 }
 function historyPage(){
  const filteredOrders=state.orders.filter(item=>(!historyFilter.asset||item.symbol===historyFilter.asset)&&(!historyFilter.strategy||item.strategy===historyFilter.strategy)&&(!historyFilter.side||item.side===historyFilter.side)&&(!historyFilter.status||item.status===historyFilter.status)&&(!historyFilter.start||item.t?.slice(0,10)>=historyFilter.start)&&(!historyFilter.end||item.t?.slice(0,10)<=historyFilter.end));
@@ -569,6 +728,15 @@ document.addEventListener('click',async event=>{
  if(action==='close-notifs'){notifOpen=false;chrome();return}
  if(action==='notif-filter'){notifFilter=value;renderNotifDrawer();return}
  if(action==='mark-notifs-read'){if(state.events?.[0])lastSeenNotif=state.events[0].t;chrome();toast('Notifications marked read.');return}
+ if(action==='remove-avatar'){avatarDraft='';render(true);toast('Photo removed. Click Save profile to confirm.');return}
+ if(action==='test-telegram'){
+   if(!online||pending){toast('The workspace is reconnecting.');return}
+   pending=true;el.disabled=true;
+   try{await api('settings',{testTelegram:true});toast('Test Telegram alert sent!')}
+   catch(error){toast(error.message)}
+   finally{pending=false;el.disabled=false}
+   return;
+ }
  if(action==='watch'){selected=value;chartMode='Price'}
  if(action==='range')range=value;
  if(action==='chart')chartMode=value;
@@ -584,8 +752,28 @@ document.addEventListener('click',async event=>{
  }
  if(action==='asset')assetClass=value;
  if(action==='bot-filter')botFilter=value;
- if(action==='edit')editor={...version(value)};
+ if(action==='edit')editor=structuredClone(version(value));
  if(action==='new')editor=fresh();
+ if(action==='apply-template'){
+   const tpl=strategyTemplates[value];
+   if(tpl){editor={...editor,...structuredClone(tpl),id:editor?.id??'',version:editor?.version??0,symbol:editor?.symbol||state.market[0]?.symbol||'',dirty:true,mutation:crypto.randomUUID()};toast('Loaded template: '+tpl.label)}
+ }
+ if(action==='rule-logic'){
+   const r=ensureRules();
+   if(el.dataset.side==='entry')r.entryLogic=value;else r.exitLogic=value;
+   editor.mode='custom';editor.dirty=true;editor.mutation=crypto.randomUUID();
+ }
+ if(action==='rule-add'){
+   const r=ensureRules();
+   const def=value==='entry'?{left:{indicator:'rsi',period:14},op:'lt',right:{indicator:'number',value:35}}:{left:{indicator:'rsi',period:14},op:'gt',right:{indicator:'number',value:70}};
+   r[value].push(def);
+   editor.mode='custom';editor.dirty=true;editor.mutation=crypto.randomUUID();
+ }
+ if(action==='rule-remove'){
+   const r=ensureRules();
+   r[el.dataset.side].splice(+value,1);
+   editor.dirty=true;editor.mutation=crypto.randomUUID();
+ }
  if(action==='bot-command'||action==='outage'){
    if(!online||pending){toast('The workspace is reconnecting.');return}
    pending=true;el.disabled=true;
@@ -600,12 +788,63 @@ document.addEventListener('click',async event=>{
  render(true);
 });
 document.addEventListener('input',event=>{
- const form=event.target.closest('#strategy');
- if(form&&event.target.name!=='version')capture(form);
- if(event.target.matches('#launch-bot [name=budget]'))launchBudget=event.target.value;
- if(event.target.matches('#fund-bot [name=budget]'))fundBudget=event.target.value;
+ const t=event.target;
+ if(t.dataset?.ruleSide){
+   const r=ensureRules(), row=r[t.dataset.ruleSide][+t.dataset.ruleIdx];
+   if(row){
+     const [p1,p2]=t.dataset.rulePart.split('.');
+     if(p2)row[p1][p2]=p2==='indicator'?t.value:+t.value;
+     else row[p1]=t.value;
+     editor.mode='custom';editor.dirty=true;editor.mutation=crypto.randomUUID();
+   }
+   return;
+ }
+ const form=t.closest('#strategy');
+ if(form&&t.name!=='version')capture(form);
+ if(t.matches('#launch-bot [name=budget]'))launchBudget=t.value;
+ if(t.matches('#fund-bot [name=budget]'))fundBudget=t.value;
 });
 document.addEventListener('change',event=>{
+ const t=event.target;
+ if(t.id==='avatar-file'&&t.files?.[0]){
+   const reader=new FileReader();
+   reader.onload=()=>{
+     const img=new Image();
+     img.onload=()=>{
+       const size=160, canvas=document.createElement('canvas');
+       canvas.width=size;canvas.height=size;
+       const ctx=canvas.getContext('2d');
+       const min=Math.min(img.width,img.height), sx=(img.width-min)/2, sy=(img.height-min)/2;
+       ctx.drawImage(img,sx,sy,min,min,0,0,size,size);
+       avatarDraft=canvas.toDataURL('image/jpeg',0.82);
+       render(true);
+       toast('Photo ready. Click Save profile to upload.');
+     };
+     img.src=reader.result;
+   };
+   reader.readAsDataURL(t.files[0]);
+   return;
+ }
+ if(t.dataset?.ruleSide){
+   const r=ensureRules(), row=r[t.dataset.ruleSide][+t.dataset.ruleIdx];
+   if(row){
+     const [p1,p2]=t.dataset.rulePart.split('.');
+     if(p2){
+       row[p1][p2]=p2==='indicator'?t.value:+t.value;
+       if(p2==='indicator'){
+         if(t.value==='number')row[p1]={indicator:'number',value:row[p1].value??50};
+         else if(noPeriodInd.has(t.value))row[p1]={indicator:t.value};
+         else row[p1]={indicator:t.value,period:row[p1].period??14};
+       }
+     } else row[p1]=t.value;
+     editor.mode='custom';editor.dirty=true;editor.mutation=crypto.randomUUID();
+     render(true);
+   }
+   return;
+ }
+ if(t.matches('#strategy [name=symbol], #strategy [name=timeframe], #strategy [name=mode]')){
+   capture(t.form);render(true);return;
+ }
  if(event.target.matches('#launch-bot [name=version]')){
    launchVersion=event.target.value;
    const form=event.target.form;
@@ -653,6 +892,20 @@ document.addEventListener('submit',async event=>{
      toast(selected.name+' launched.');
      location.hash=sessionRoute(launched);
    }
+   if(form.id==='adopt-position'){
+     const selected=version(data.version);
+     if(!selected)throw Error('Choose a saved strategy version.');
+     const adopted=await api('bot',{adopt:true,id:selected.id,version:selected.version,symbol:data.symbol,addFunds:+data.addFunds||0});
+     toast(selected.name+' assigned to '+data.symbol+' position.');
+     location.hash=sessionRoute(adopted);
+   }
+   if(form.id==='topup-bot'){
+     const bot=state.bots[params().get('id')];
+     if(!bot)throw Error('Bot not found.');
+     await api('bot',{topUp:true,id:bot.id,addFunds:+data.addFunds});
+     form.reset();
+     toast('Added '+usd(+data.addFunds)+' to '+bot.name+'.');
+   }
    if(form.id==='fund-bot'){
      const bot=state.bots[params().get('id')];
      const selected=bot&&version(bot.id+'@'+data.version);
@@ -673,7 +926,12 @@ document.addEventListener('submit',async event=>{
      runA=result.id;toast('Backtest complete.');
    }
    if(form.id==='settings'){await api('settings',Object.fromEntries(Object.keys(data).map(k=>[k,true])));toast('Notifications saved.')}
-   if(form.id==='profile'){await api('profile',{...data,offlineSync:Boolean(form.elements.offlineSync?.checked)});toast('Profile saved.')}
+   if(form.id==='profile'){
+     const avatar=avatarDraft!==null?avatarDraft:(state.profile?.avatar??'');
+     await api('profile',{...data,avatar,offlineSync:Boolean(form.elements.offlineSync?.checked)});
+     avatarDraft=null;
+     toast('Profile saved.');
+   }
    await refresh(true);
  }catch(error){toast(error.message)}
  finally{pending=false;if(control){control.disabled=false;if(form.id==='backtest')control.textContent='Run backtest'}}

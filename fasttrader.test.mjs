@@ -9,8 +9,9 @@ import { runInNewContext } from 'node:vm';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { defaults, decision, replay, botLedger, contiguousBars, aggregateBars, computeATR } from './engine.mjs';
+import { defaults, decision, replay, botLedger, contiguousBars, aggregateBars, computeATR, strategy, evaluateRuleSet } from './engine.mjs';
 import { signalProvider } from './signal-ai.mjs';
+import { createTelegram } from './telegram.mjs';
 import { handleBridge } from './api/bridge.js';
 
 test('replay decides at the close and fills at the next open with costs and sizing limits', () => {
@@ -115,6 +116,61 @@ test('timeframe aggregation, mean reversion, breakout, and ATR stops work determ
   assert.equal(atrExit?.stopLoss, true);
 });
 
+test('custom rule builder supports indicator comparisons, crosses, trailing stop, maxHoldBars, and USD sizing', () => {
+  const custom = strategy({
+    ...defaults, name: 'Custom EMA Cross', mode: 'custom', sizeMode: 'usd', sizeUsd: 450,
+    trailingStop: 2, maxHoldBars: 3, aiPrompt: 'Skip if news is bearish',
+    rules: {
+      entryLogic: 'all', exitLogic: 'any',
+      entry: [
+        { left: { indicator: 'close' }, op: 'gt', right: { indicator: 'sma', period: 3 } },
+        { left: { indicator: 'rsi', period: 3 }, op: 'gt', right: { indicator: 'number', value: 50 } }
+      ],
+      exit: [{ left: { indicator: 'close' }, op: 'lt', right: { indicator: 'sma', period: 3 } }]
+    }
+  });
+  const bars = [
+    { t: '2026-10-01T12:00:00Z', o: 100, h: 100, l: 99, c: 100, v: 500 },
+    { t: '2026-10-01T12:01:00Z', o: 100, h: 101, l: 99, c: 100, v: 500 },
+    { t: '2026-10-01T12:02:00Z', o: 100, h: 102, l: 100, c: 101, v: 500 },
+    { t: '2026-10-01T12:03:00Z', o: 101, h: 106, l: 101, c: 105, v: 500 },
+    { t: '2026-10-01T12:04:00Z', o: 105, h: 108, l: 105, c: 107, v: 500 },
+    { t: '2026-10-01T12:05:00Z', o: 107, h: 112, l: 107, c: 112, v: 500 }
+  ];
+  const check = evaluateRuleSet(bars, custom.rules, 'entry');
+  assert.equal(check.ready, true);
+  assert.equal(check.pass, true);
+  const account = { equity: 10000, cash: 10000, dayStart: 10000, exposure: 0 };
+  const buy = decision(custom, bars.map(b => b.c), account, null, 112, null, { bars, warmedUp: true });
+  assert.equal(buy?.side, 'buy');
+  assert.equal(buy?.qty, 4); // floor(450 / 112) = 4
+  // Trailing stop triggers when price drops >2% from highWater 120
+  const trail = decision(custom, bars.map(b => b.c), account, { qty: 4, entry: 112 }, 117, null, { bars, warmedUp: true, highWater: 120 });
+  assert.equal(trail?.side, 'sell');
+  assert.match(trail?.rationale, /Trailing stop/);
+  // Max hold bars triggers when holdBars >= 3
+  const maxHold = decision(custom, bars.map(b => b.c), account, { qty: 4, entry: 112 }, 113, null, { bars, warmedUp: true, highWater: 113, holdBars: 3 });
+  assert.equal(maxHold?.side, 'sell');
+  assert.match(maxHold?.rationale, /Max hold/);
+});
+
+test('telegram notifier formats HTML safely, throttles connection spam, and sends test messages', async () => {
+  const sent = [];
+  const mockFetch = async (url, init) => {
+    sent.push({ url, body: JSON.parse(init.body) });
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  };
+  const tg = createTelegram({ TELEGRAM_BOT_TOKEN: '123:abc', TELEGRAM_CHAT_ID: '999' }, mockFetch);
+  assert.equal(tg.configured, true);
+  assert.equal(await tg.notify('fills', 'BUY filled · BTC/USD', ['Filled: 0.01 @ <$60000>']), true);
+  assert.match(sent[0].body.text, /&lt;\$60000&gt;/);
+  assert.equal(await tg.notify('connections', 'Feed dropped'), true);
+  assert.equal(await tg.notify('connections', 'Feed dropped'), false); // throttled
+  const res = await tg.sendTest('alpaca');
+  assert.equal(res.sent, true);
+  assert.equal(sent.length, 3);
+});
+
 async function withDemo(run, mockAI, env = {}) {
   const cwd = await mkdtemp(join(tmpdir(), 'fasttrader-test-'));
   const preload = mockAI ? ['--import=data:text/javascript,' + encodeURIComponent(`
@@ -214,6 +270,9 @@ test('screen, version, replay and execute a demo strategy, then pause safely thr
     snapshot = await api('state');
     assert.equal(snapshot.bots[qqq.id].desired,'stopped');
     assert.equal(snapshot.bots.default.desired,'running');
+    // Top up additional funds while bot is running
+    const topped = await api('bot',{topUp:true,id:version.id,addFunds:350});
+    assert.equal(topped.budget, 1000);
   });
 });
 

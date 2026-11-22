@@ -1,9 +1,11 @@
 import { createServer } from 'node:http';
 import { readFile, mkdir, writeFile, rename } from 'node:fs/promises';
 import { randomUUID, createHash } from 'node:crypto';
-import { instruments, defaults, strategy, decision, replay, synthetic, botLedger, isCrypto, cryptoReplayRules, roundDown, contiguousBars, aggregateBars, computeATR, timeframes } from './engine.mjs';
+import { instruments, defaults, strategy, decision, replay, synthetic, botLedger, isCrypto, cryptoReplayRules, roundDown, contiguousBars, aggregateBars, computeATR, timeframes, ruleWarmupBars } from './engine.mjs';
 import { assessSignal, signalProvider } from './signal-ai.mjs';
 import { createAuth, sameSecret } from './auth.mjs';
+import { createStore } from './store.mjs';
+import { createTelegram } from './telegram.mjs';
 
 const mode = process.env.FASTTRADER_MODE || 'demo';
 const aiProvider = signalProvider(process.env);
@@ -21,13 +23,16 @@ if ((bridgeSecret && bridgeSecret.length < 32) || (host !== '127.0.0.1' && !brid
 const signupCode = process.env.FASTTRADER_SIGNUP_CODE;
 if (signupCode && signupCode.length < 24) throw Error('FASTTRADER_SIGNUP_CODE must have at least 24 characters.');
 const directory = process.env.FASTTRADER_DATA_DIR || '.fasttrader';
-const file = directory + '/' + (demo ? 'demo' : 'alpaca-' + createHash('sha256').update(headers['APCA-API-KEY-ID']).digest('hex').slice(0, 16)) + '.json';
+const storeKey = demo ? 'demo' : 'alpaca-' + createHash('sha256').update(headers['APCA-API-KEY-ID']).digest('hex').slice(0, 16);
+const file = directory + '/' + storeKey + '.json';
+const remoteStore = createStore(process.env);
+const telegram = createTelegram(process.env);
 const terminal = new Set(['filled', 'canceled', 'expired', 'rejected', 'replaced', 'done_for_day']);
 const time = () => new Date().toISOString();
 let state = {
   cash: 100000, account: { equity: 100000, cash: 100000, buyingPower: 100000, dayStart: 100000, exposure: 0 },
   strategies: [{ ...defaults, id: 'default', version: 1 }], bots: {}, positions: [], orders: [], signals: [], runs: [],
-  equity: [], profile: { name: 'Paper Trader', email: '', offlineSync: true }, alerts: {}, events: [], quotes: {}, bars: {},
+  equity: [], profile: { name: 'Paper Trader', username: '', email: '', bio: '', avatar: '', timezone: 'UTC', riskTier: 'moderate', tradingStyle: 'swing', offlineSync: true }, alerts: {}, events: [], quotes: {}, bars: {},
   feed: 'connecting', broker: 'connecting', sessionOpen: demo, synced: null
 };
 await mkdir(directory, { recursive: true });
@@ -35,10 +40,19 @@ const auth = await createAuth({
   file: directory + '/auth.json', signupCode,
   ownerEmail: process.env.FASTTRADER_OWNER_EMAIL,
   ownerPassword: process.env.FASTTRADER_OWNER_PASSWORD,
+  remoteStore, storeKey: 'auth',
   required: Boolean(bridgeSecret || signupCode || process.env.FASTTRADER_AUTH === 'required'),
   secure: Boolean(bridgeSecret)
 });
-try { state = JSON.parse(await readFile(file, 'utf8')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+const remoteState = remoteStore.enabled ? await remoteStore.load('state:' + storeKey) : null;
+if (remoteState && typeof remoteState === 'object') {
+  state = { ...state, ...remoteState, bars: remoteState.bars ?? {} };
+} else {
+  try { state = JSON.parse(await readFile(file, 'utf8')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+}
+const remoteProfile = remoteStore.enabled ? await remoteStore.loadProfile(storeKey) : null;
+if (remoteProfile) state.profile = { ...state.profile, ...remoteProfile };
+else if (remoteStore.enabled) await remoteStore.saveProfile(storeKey, state.profile);
 for (const signal of state.signals.filter(item => !item.strategyId)) {
   const matches = state.strategies.filter(item => item.name === signal.strategy && item.symbol === signal.symbol && item.version === signal.version);
   if (matches.length === 1) signal.strategyId = matches[0].id;
@@ -75,11 +89,20 @@ function serial(task) {
 async function persist() {
   await writeFile(file + '.tmp', JSON.stringify(state));
   await rename(file + '.tmp', file);
+  if (remoteStore.enabled) {
+    const { bars, quotes, synced, feed: _f, cryptoFeed: _cf, broker: _b, ...durable } = state;
+    await remoteStore.save('state:' + storeKey, durable);
+    await remoteStore.saveProfile(storeKey, state.profile);
+    await remoteStore.syncTrades(storeKey, state.orders);
+  }
 }
-function event(kind, message) {
+function event(kind, message, details = []) {
   if (!state.alerts[kind]) return;
   state.events.unshift({ t: time(), kind, message });
   state.events.length = Math.min(state.events.length, 50);
+  if (telegram.configured && state.alerts.telegram !== false) {
+    void telegram.notify(kind, message, details);
+  }
 }
 async function request(host, path, opts = {}) {
   const response = await fetch(host + path, { ...opts, headers: { ...headers, 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(6500) });
@@ -216,7 +239,15 @@ function normalize(order) {
 }
 function updateOrder(order) {
   const prior = state.orders.find(item => item.client === order.client);
-  if (order.status === 'filled' && prior?.status !== 'filled') event('fills', order.symbol + ' ' + order.side + ' filled');
+  if (order.status === 'filled' && prior?.status !== 'filled') {
+    const val = Number.isFinite(order.price) && order.filled > 0 ? `$${(order.filled * order.price).toFixed(2)}` : '';
+    const details = [
+      order.strategy ? `Bot: ${order.strategy}` : null,
+      Number.isFinite(order.price) ? `Filled: ${order.filled} @ $${order.price.toFixed(4)} ${val ? '(' + val + ')' : ''}` : null,
+      Number.isFinite(order.pnl) ? `Realized P&L: ${order.pnl >= 0 ? '+' : ''}$${order.pnl.toFixed(2)}` : null
+    ];
+    event('fills', `${order.side.toUpperCase()} filled · ${order.symbol}`, details);
+  }
   if (prior) Object.assign(prior, order);
   else state.orders.unshift(order);
 }
@@ -362,14 +393,23 @@ function orderContext(bot, s, bars) {
   const botReserved = reservedBuys(botOrders(bot.id)) ?? 0;
   const botExposure = (position ? position.qty * price : 0) + botReserved;
   const account = { ...state.account, cash, exposure: botExposure };
-  const window = contiguousBars(series, s.period, Math.max(180000, tfMs * 3));
-  const warmedUp = window.length >= s.period;
+  const warmupNeeded = ruleWarmupBars(s);
+  const window = contiguousBars(series, warmupNeeded, Math.max(180000, tfMs * 3));
+  const warmedUp = window.length >= warmupNeeded;
   const cooldown = bot.cooldownBars ?? 0;
   const volume = Number.isFinite(bar?.v) ? bar.v : undefined;
   const atr = s.atrStop > 0 ? computeATR(window, Math.min(14, s.period)) : null;
+  if (position?.qty > 0) {
+    bot.highWater = Math.max(bot.highWater ?? position.entry, price);
+  } else {
+    bot.highWater = null;
+    bot.holdBars = 0;
+  }
   return {
-    position, price, ledger, cash, rules, warmedUp, warmupCount: window.length, cooldown, volume, atr, timeframe: tf,
-    proposal: decision(s, window.map(b => b.c), account, position, price, rules, { warmedUp, cooldown, volume, atr })
+    position, price, ledger, cash, rules, warmedUp, warmupCount: window.length, warmupNeeded, cooldown, volume, atr, timeframe: tf,
+    proposal: decision(s, window.map(b => b.c), account, position, price, rules, {
+      warmedUp, cooldown, volume, atr, bars: window, highWater: bot.highWater, holdBars: bot.holdBars ?? 0
+    })
   };
 }
 
@@ -400,6 +440,7 @@ async function completeAI(job) {
     const headlines = await recentNews(s.symbol);
     model = await assessSignal(aiProvider, s.symbol, proposal.side, bars, fetch, {
       price, rationale: proposal.rationale, period: s.period, mode: s.mode ?? 'momentum', timeframe: s.timeframe ?? '1Min',
+      ...(s.aiPrompt ? { aiPrompt: s.aiPrompt } : {}),
       ...(headlines.length ? { headlines } : {}),
       position: position ? { qty: position.qty, entry: position.entry, pnlPct: Number((100 * (price / position.entry - 1)).toFixed(2)) } : null
     });
@@ -470,14 +511,15 @@ async function evaluate(bot) {
   const minimum = context.rules ? Math.max(context.rules.minValue, context.price * context.rules.minimum) : context.price;
   bot.status = !hasBudget(bot.budget) ? 'Budget required for new buys' :
     !context.ledger.complete ? 'Awaiting complete fill history' :
-    !context.warmedUp && !context.position ? `Warming up candles (${context.warmupCount}/${s.period})` :
+    !context.warmedUp && !context.position ? `Warming up candles (${context.warmupCount}/${context.warmupNeeded})` :
     context.cooldown > 0 && !context.position ? `Stop-loss cooldown (${context.cooldown} bars)` :
     !context.position && context.ledger.available < minimum ? 'Budget below minimum order size' : 'Running';
   const { proposal } = context;
   if (!proposal) {
     bot.lastBar = bar.t;
+    if (context.position?.qty > 0) bot.holdBars = (bot.holdBars ?? 0) + 1;
     if ((bot.cooldownBars ?? 0) > 0) bot.cooldownBars--;
-    const rationale = !context.warmedUp && !context.position ? `Warming up: ${context.warmupCount}/${s.period} contiguous 1-minute candles` :
+    const rationale = !context.warmedUp && !context.position ? `Warming up: ${context.warmupCount}/${context.warmupNeeded} contiguous ${context.timeframe} candles` :
       context.cooldown > 0 && !context.position ? `Post-stop-loss cooldown (${context.cooldown} bars remaining)` :
       context.volume === 0 && !context.position ? 'Skipped zero-volume bar' :
       bot.status !== 'Running' ? bot.status :
@@ -512,8 +554,8 @@ async function applySignal(candidate, model = null) {
   state.signals.unshift(signal);
   bot.lastEvaluation = { ...bot.lastEvaluation, t: bar.t, direction: signal.direction, rationale: signal.rationale };
   state.signals.length = Math.min(100, state.signals.length);
-  event('signals', signal.symbol + ' ' + signal.direction + ' signal');
-  if (proposal.protective) event('risk', proposal.rationale);
+  event('signals', `${signal.direction.toUpperCase()} signal · ${signal.symbol}`, [`Bot: ${s.name} v${s.version} · Source: ${signal.source}`, signal.rationale]);
+  if (proposal.protective) event('risk', `${s.symbol} protective exit`, [`Bot: ${s.name}`, proposal.rationale]);
   if (model && model.side !== proposal.side) return;
   if (!currentCandidate(candidate) || unresolvedFor(s.symbol)) return;
   const context = orderContext(bot, s, state.bars[s.symbol]);
@@ -676,14 +718,14 @@ function snapshot() {
     ...run, curve: curve.filter((_, idx) => idx % Math.ceil(curve.length / 650) === 0 || idx === curve.length - 1),
     tradeCount: trades.length, trades: trades.slice(-250)
   })),
-    mode, market, aiConfigured: Boolean(aiProvider), aiProvider: aiProvider?.name ?? null,
+    mode, accountKey: storeKey, supabaseConnected: remoteStore.enabled, telegramConfigured: telegram.configured, market, aiConfigured: Boolean(aiProvider), aiProvider: aiProvider?.name ?? null,
     feedName: demo ? 'Synthetic market' : 'Alpaca ' + feed.toUpperCase() };
 }
-async function body(req) {
+async function body(req, limit = 20000) {
   let raw = '';
   for await (const chunk of req) {
     raw += chunk;
-    if (raw.length > 20000) throw Error('Request too large');
+    if (raw.length > limit) throw Error('Request too large');
   }
   return JSON.parse(raw || '{}');
 }
@@ -701,6 +743,75 @@ async function change(path, input) {
     return item;
   }
   if (path === '/api/bot') {
+    if (input.adopt === true) {
+      const symbol = canonicalSymbol(input.symbol);
+      const position = state.positions.find(p => p.symbol === symbol && p.qty > 0);
+      if (!position) throw Error('No open broker position found for ' + symbol + '.');
+      const source = state.strategies.find(item => item.id === input.id && item.version === input.version);
+      if (!source) throw Error('Choose a saved strategy version to manage this position.');
+      const extra = input.addFunds === undefined ? 0 : Number(input.addFunds);
+      if (!Number.isFinite(extra) || extra < 0 || extra > 1e9 || Math.abs(extra * 100 - Math.round(extra * 100)) > 0.0001) {
+        throw Error('Additional funds must be $0 or more, in dollars and cents.');
+      }
+      const existingOwner = Object.values(state.bots).find(bot => {
+        if (bot.symbol !== symbol) return false;
+        const l = botLedger(botOrders(bot.id), symbol, bot.budget);
+        return Math.abs(l.qty) > (isCrypto(symbol) ? 1e-8 : 1e-6);
+      });
+      if (existingOwner) throw Error('Bot "' + existingOwner.name + '" already manages this ' + symbol + ' position.');
+      const active = Object.values(state.bots).find(bot => bot.desired === 'running' && bot.symbol === symbol);
+      if (active) throw Error('Pause or stop the existing ' + symbol + ' bot before assigning this position.');
+      if (!eligible.has(symbol)) throw Error('This instrument is awaiting Alpaca eligibility confirmation.');
+      if (!demo && isCrypto(symbol) && !state.cryptoSessionOpen) throw Error('Crypto trading is unavailable on this Alpaca Paper account.');
+      if (source.ai && !aiProvider) throw Error('Configure a Gemini or OpenAI API key before starting this bot.');
+      let s = source;
+      if (source.symbol !== symbol) {
+        const rootId = source.sourceStrategy?.rootId ?? source.id;
+        const reused = state.strategies.find(item => item.symbol === symbol &&
+          (item.sourceStrategy?.rootId ?? item.sourceStrategy?.id ?? item.id) === rootId);
+        if (reused) s = reused;
+        else {
+          s = { ...strategy({ ...source, symbol }), id: randomUUID(), version: 1,
+            sourceStrategy: { id: source.id, version: source.version, symbol: source.symbol, rootId } };
+          state.strategies.push(s);
+        }
+      }
+      const adoptPrice = Number.isFinite(position.entry) && position.entry > 0 ? position.entry : position.price;
+      if (!Number.isFinite(adoptPrice) || adoptPrice <= 0) throw Error('Position price is unavailable for adoption.');
+      const priorLedger = botLedger(botOrders(s.id), symbol, null);
+      const adoptedCost = position.qty * adoptPrice;
+      const budget = Math.min(1e9, Number(Math.max(1, priorLedger.invested + adoptedCost + extra).toFixed(2)));
+      const nowIso = time();
+      state.orders.unshift({
+        client: 'ft-adopt-' + randomUUID().slice(0, 12),
+        owned: true, adopted: true, strategyId: s.id, strategy: s.name, version: s.version,
+        symbol, side: 'buy', qty: position.qty, filled: position.qty,
+        status: 'filled', price: adoptPrice, limitPrice: null, filledAt: nowIso, t: nowIso
+      });
+      const prev = state.bots[s.id];
+      state.bots[s.id] = {
+        id: s.id, version: s.version, name: s.name, symbol, desired: 'running', status: 'Running',
+        budget, createdAt: prev?.createdAt ?? Date.now(), started: Date.now(),
+        highWater: Math.max(adoptPrice, position.price ?? adoptPrice), holdBars: 0,
+        lastBar: prev?.symbol === symbol ? prev.lastBar : undefined,
+        lastEvaluation: { t: nowIso, price: position.price ?? adoptPrice, direction: 'hold', rationale: 'Adopted open broker position (' + position.qty + ' ' + symbol + ')' }
+      };
+      event('fills', s.name + ' adopted open ' + symbol + ' position' + (extra > 0 ? ' + $' + extra.toFixed(2) + ' funds' : ''));
+      return state.bots[s.id];
+    }
+    if (input.topUp === true) {
+      const bot = state.bots[input.id];
+      if (!bot) throw Error('Bot not found.');
+      const add = Number(input.addFunds);
+      if (!Number.isFinite(add) || add < 1 || add > 1e9 || Math.abs(add * 100 - Math.round(add * 100)) > 0.0001) {
+        throw Error('Enter an additional amount of at least $1, in dollars and cents.');
+      }
+      const nextBudget = Number(((bot.budget ?? 0) + add).toFixed(2));
+      if (!hasBudget(nextBudget)) throw Error('Total bot budget cannot exceed $1,000,000,000.');
+      bot.budget = nextBudget;
+      event('fills', 'Added $' + add.toFixed(2) + ' to ' + bot.name + ' budget');
+      return bot;
+    }
     const source = state.strategies.find(item => item.id === input.id && item.version === input.version);
     if (!source || !['running','paused','stopped'].includes(input.action)) throw Error('Invalid bot command.');
     if (input.symbol !== undefined && input.symbol !== source.symbol) throw Error('The instrument does not match this strategy version.');
@@ -756,11 +867,27 @@ async function change(path, input) {
     return state.bots[s.id];
   }
   if (path === '/api/settings') {
-    state.alerts = Object.fromEntries(['signals','fills','risk','connections'].map(key => [key, input[key] === true]));
+    if (input.testTelegram === true) return telegram.sendTest(mode);
+    state.alerts = Object.fromEntries(['signals','fills','risk','connections','telegram'].map(key => [key, input[key] === true]));
     return state.alerts;
   }
   if (path === '/api/profile') {
-    state.profile = { name: String(input.name || 'Paper Trader').slice(0, 80), email: String(input.email || '').slice(0, 120), offlineSync: input.offlineSync === true };
+    const rawAvatar = typeof input.avatar === 'string' ? input.avatar.trim() : (state.profile?.avatar ?? '');
+    const validAvatar = rawAvatar === '' || /^data:image\/(png|jpeg|webp);base64,[a-zA-Z0-9+/=]+$/.test(rawAvatar) || /^https:\/\/\S+$/.test(rawAvatar);
+    if (!validAvatar || rawAvatar.length > 180000) throw Error('Use a valid image under 160 KB for the profile photo.');
+    const riskTier = ['conservative', 'moderate', 'aggressive'].includes(input.riskTier) ? input.riskTier : (state.profile?.riskTier ?? 'moderate');
+    const tradingStyle = ['scalp', 'day', 'swing', 'position'].includes(input.tradingStyle) ? input.tradingStyle : (state.profile?.tradingStyle ?? 'swing');
+    state.profile = {
+      name: String(input.name || 'Paper Trader').trim().slice(0, 80),
+      username: String(input.username || '').trim().replace(/^@+/, '').replace(/[^a-zA-Z0-9_.-]/g, '').slice(0, 32),
+      email: String(input.email || '').trim().slice(0, 120),
+      bio: String(input.bio || '').trim().slice(0, 280),
+      avatar: rawAvatar,
+      timezone: String(input.timezone || state.profile?.timezone || 'UTC').slice(0, 60),
+      riskTier,
+      tradingStyle,
+      offlineSync: input.offlineSync === true
+    };
     return state.profile;
   }
   if (path === '/api/demo' && demo) {
@@ -816,7 +943,7 @@ const server = createServer(async (req, res) => {
     if (url.pathname.startsWith('/api/') && !auth.authenticated(req.headers.cookie)) return respond(401, { error: 'Sign in to FastTrader.' });
     if (req.method === 'GET' && url.pathname === '/api/state') return respond(200, snapshot());
     if (req.method === 'POST' && url.pathname.startsWith('/api/')) {
-      const input = await body(req);
+      const input = await body(req, url.pathname === '/api/profile' ? 220000 : 20000);
       const result = url.pathname === '/api/backtest' ? await backtest(input) : await serial(async () => {
         if (!auth.authenticated(req.headers.cookie)) throw Object.assign(Error('Sign in to FastTrader.'), { status: 401 });
         const value = await change(url.pathname, input);

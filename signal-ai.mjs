@@ -10,7 +10,8 @@ export function signalProvider(env) {
 
 export async function assessSignal(provider, symbol, side, bars, request = fetch, context = null) {
   if (!provider) throw Error('AI provider is unconfigured');
-  const instruction = 'Analyze the recent minute bars, price action, and proposed direction. Return JSON with side (buy, sell, or hold) and rationale (one sentence). Use hold if the proposed direction lacks support.';
+  const customRule = typeof context?.aiPrompt === 'string' && context.aiPrompt.trim() ? ' User confirmation rule: ' + context.aiPrompt.trim().slice(0, 300) : '';
+  const instruction = 'Analyze the recent minute bars, price action, and proposed direction. Return JSON with side (buy, sell, or hold) and rationale (one sentence). Use hold if the proposed direction lacks support.' + customRule;
   const recent = bars.slice(-20);
   const payload = {
     symbol,
