@@ -813,6 +813,61 @@ async function change(path, input) {
       event('fills', s.name + ' adopted open ' + symbol + ' position' + (extra > 0 ? ' + $' + extra.toFixed(2) + ' funds' : ''));
       return state.bots[s.id];
     }
+    if (input.liquidate === true) {
+      const bot = state.bots[input.id];
+      if (!bot) throw Error('Bot not found.');
+      const symbol = bot.symbol;
+      if (unresolvedFor(symbol)) throw Error('Wait for the existing ' + symbol + ' order to reconcile first.');
+      const position = state.positions.find(p => p.symbol === symbol && p.qty > 0);
+      if (!position) throw Error('No open ' + symbol + ' position to close.');
+      const rules = isCrypto(symbol) ? cryptoRules.get(symbol) : null;
+      const qty = rules ? roundDown(position.qty, rules.increment) : position.qty;
+      if (qty <= 0 || (rules && qty + 1e-10 < rules.minimum)) throw Error('Open position is below the minimum tradable size.');
+      const latest = quotePrice(symbol, state.bars[symbol]?.at(-1) ?? { c: position.price ?? position.entry });
+      const client = 'ft-close-' + randomUUID().slice(0, 16);
+      const order = {
+        client, owned: true, strategyId: bot.id, strategy: bot.name, version: bot.version, symbol,
+        side: 'sell', qty, filled: 0, status: 'unknown', t: time(), price: null, limitPrice: null
+      };
+      if (demo) {
+        order.status = 'filled';
+        order.filled = qty;
+        order.price = latest;
+        order.filledAt = time();
+        order.pnl = qty * (latest - position.entry);
+        state.cash += qty * latest;
+        if (position.qty - qty > 1e-9) position.qty = Number((position.qty - qty).toFixed(9));
+        else state.positions = state.positions.filter(p => p !== position);
+        updateOrder(order);
+        await reconcile();
+      } else {
+        state.orders.unshift(order);
+        await persist();
+        try {
+          const decimal = value => value.toFixed(9).replace(/\.?0+$/, '');
+          const submitted = await broker('/orders', {
+            method: 'POST',
+            body: JSON.stringify({
+              symbol, qty: rules ? decimal(qty) : String(qty), side: 'sell',
+              type: 'market', time_in_force: rules ? 'gtc' : 'day', client_order_id: client
+            })
+          });
+          updateOrder(normalize(submitted));
+        } catch (error) {
+          if ([400, 403, 422].includes(error.status)) {
+            try { updateOrder(normalize(await broker('/orders:by_client_order_id?client_order_id=' + client))); }
+            catch (lookup) { if (lookup.status === 404) order.status = 'rejected'; else throw lookup; }
+          }
+          throw error;
+        }
+      }
+      bot.highWater = null;
+      bot.holdBars = 0;
+      if (input.pause === true) { bot.desired = 'paused'; bot.status = 'paused'; }
+      bot.lastEvaluation = { t: time(), price: latest, direction: 'sell', rationale: 'Manual position liquidation requested' };
+      event('risk', `Manual liquidation · ${symbol}`, [`Bot: ${bot.name}`, `Submitted market sell for ${qty} ${symbol}`]);
+      return { bot, order };
+    }
     if (input.topUp === true) {
       const bot = state.bots[input.id];
       if (!bot) throw Error('Bot not found.');

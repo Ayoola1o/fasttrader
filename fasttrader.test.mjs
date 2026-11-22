@@ -273,6 +273,14 @@ test('screen, version, replay and execute a demo strategy, then pause safely thr
     // Top up additional funds while bot is running
     const topped = await api('bot',{topUp:true,id:version.id,addFunds:350});
     assert.equal(topped.budget, 1000);
+    // Manual liquidation closes open position if held, or rejects cleanly if flat
+    const cur = await api('state');
+    if (cur.positions.some(p => p.symbol === 'SPY' && p.qty > 0)) {
+      const closed = await api('bot', { liquidate: true, id: version.id, pause: true });
+      assert.equal(closed.order.side, 'sell');
+      assert.equal(closed.bot.desired, 'paused');
+      assert.ok(!(await api('state')).positions.some(p => p.symbol === 'SPY' && p.qty > 0));
+    }
   });
 });
 

@@ -278,6 +278,9 @@ function session(){
  const command=(label,action)=>btn(label,'bot-command',action,false,`data-bot="${esc(bot.id)}" data-version="${bot.version}" ${!online?'disabled':''}`);
  const controls=bot.desired==='running'?'<div class="form"><div class="actions">'+command('Pause','paused')+command('Stop','stopped')+'</div></div>':
    bot.desired==='paused'?'<div class="form">'+command('Stop','stopped')+'</div>':'';
+ const hasOpenPos=holding||state.positions.some(p=>p.symbol===bot.symbol&&p.qty>0);
+ const liquidateControls=hasOpenPos&&!open.some(o=>o.side==='sell')
+   ?`<div class="form"><div class="actions">${btn('Close position','liquidate-bot',bot.id,false,`data-symbol="${esc(bot.symbol)}" data-pause="false" style="background:#39212e;color:#ff8191;border-color:#592e42" ${!online?'disabled':''}`)}${bot.desired==='running'?btn('Close &amp; Pause','liquidate-bot',bot.id,false,`data-symbol="${esc(bot.symbol)}" data-pause="true" style="background:#39212e;color:#ff8191;border-color:#592e42" ${!online?'disabled':''}`):''}</div></div>`:'';
  const topUpForm=form('topup-bot',numeric('Add additional funds (USD)','addFunds','',1,1e9),submit('Add funds to bot',!online));
  const risk=bot.desired==='running'&&bot.budget?topUpForm:form('fund-bot',select('Strategy version','version',[['','Choose a strategy version'],...versions],selectedVersion,true)+numeric('Bot budget (USD)','budget',fundBudget??bot.budget??'',1,1e9),
        submit(bot.desired==='running'?'Set budget':bot.desired==='paused'?'Resume bot':'Restart bot',!online))+topUpForm;
@@ -295,7 +298,7 @@ function session(){
    '<div class="grid equal">'+panel('Position',positionStatus,table(['Asset','Units held','Average cost','Mark','Market value','Open P&L'],positionRows,'No open position held by this bot.'))+
    panel('Bot controls','Last evaluated '+stamp(bot.lastBar)+' · '+open.length+' open orders',
      '<div class="form"><div class="actions">'+badge(botStatus(bot))+'<small>Started '+stamp(bot.started)+'</small></div>'+
-     '<small>'+usd(book.reserved)+' reserved for pending buys</small></div>'+controls+risk)+'</div>'+
+     '<small>'+usd(book.reserved)+' reserved for pending buys</small></div>'+controls+liquidateControls+risk)+'</div>'+
    '<div class="stack">'+panel('Latest evaluation',bot.lastEvaluation?stamp(bot.lastEvaluation.t)+' · '+usd(bot.lastEvaluation.price):'Waiting for an evaluated bar',
      bot.lastEvaluation?'<div class="bot-row"><span>'+esc(bot.lastEvaluation.rationale)+'</span>'+badge(bot.lastEvaluation.direction)+'</div>':empty(botStatus(bot)))+
    panel('Orders and executions',`${filled.length} filled or partially filled orders · ${usd(book.bought)} bought · ${usd(book.sold)} sold`,
@@ -728,6 +731,19 @@ document.addEventListener('click',async event=>{
  if(action==='close-notifs'){notifOpen=false;chrome();return}
  if(action==='notif-filter'){notifFilter=value;renderNotifDrawer();return}
  if(action==='mark-notifs-read'){if(state.events?.[0])lastSeenNotif=state.events[0].t;chrome();toast('Notifications marked read.');return}
+ if(action==='liquidate-bot'){
+   if(!online||pending){toast('The workspace is reconnecting.');return}
+   const sym=el.dataset.symbol||'position', pause=el.dataset.pause==='true';
+   if(!confirm(`Liquidate open ${sym} position at market price${pause?' and pause this bot':''}?`))return;
+   pending=true;el.disabled=true;
+   try{
+     await api('bot',{liquidate:true,id:value,pause});
+     toast(`Submitted market sell to close ${sym}${pause?' & paused bot':''}.`);
+     await refresh(true);
+   }catch(error){toast(error.message)}
+   finally{pending=false;el.disabled=false}
+   return;
+ }
  if(action==='remove-avatar'){
    if(!online||pending){toast('The workspace is reconnecting.');return}
    pending=true;
