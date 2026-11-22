@@ -86,14 +86,18 @@ function serial(task) {
   queue = job.catch(() => { });
   return job;
 }
-async function persist() {
+async function persist(force = true) {
   await writeFile(file + '.tmp', JSON.stringify(state));
   await rename(file + '.tmp', file);
   if (remoteStore.enabled) {
     const { bars, quotes, synced, feed: _f, cryptoFeed: _cf, broker: _b, ...durable } = state;
-    await remoteStore.save('state:' + storeKey, durable);
-    await remoteStore.saveProfile(storeKey, state.profile);
-    await remoteStore.syncTrades(storeKey, state.orders);
+    const sync = Promise.all([
+      remoteStore.save('state:' + storeKey, durable, { force }),
+      remoteStore.saveProfile(storeKey, state.profile),
+      remoteStore.syncTrades(storeKey, state.orders)
+    ]);
+    if (force) await sync;
+    else void sync;
   }
 }
 function event(kind, message, details = []) {
@@ -695,7 +699,7 @@ async function cycle() {
         state.equity.push({ t: state.synced, value: state.account.equity });
         if (state.equity.length > 4500) state.equity.shift();
       }
-      await persist();
+      await persist(false);
     });
   } catch (error) { console.error('Engine cycle:', error.message); }
   finally { busy = false; }

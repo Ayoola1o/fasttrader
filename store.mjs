@@ -1,3 +1,7 @@
+import dns from 'node:dns';
+
+try { dns.setDefaultResultOrder('ipv4first'); } catch {}
+
 export function createStore(env = process.env) {
   const rawUrl = env.SUPABASE_URL?.trim();
   const key = (env.SUPABASE_SERVICE_ROLE_KEY || env.SUPABASE_SECRET_KEY)?.trim();
@@ -24,13 +28,28 @@ export function createStore(env = process.env) {
     'Content-Type': 'application/json'
   };
   const lastSaved = new Map();
+  const lastAt = new Map();
+  const inFlight = new Map();
+  const timeoutMs = 15000;
+
+  async function requestWithRetry(url, init) {
+    let lastError;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const res = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+        if (res.ok || (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429)) return res;
+        lastError = Error('HTTP ' + res.status);
+      } catch (error) {
+        lastError = error;
+      }
+      if (attempt === 0) await new Promise(r => setTimeout(r, 1000));
+    }
+    throw lastError;
+  }
 
   async function load(storeKey) {
     try {
-      const res = await fetch(rest('fasttrader_store') + '?key=eq.' + encodeURIComponent(storeKey) + '&select=value', {
-        headers,
-        signal: AbortSignal.timeout(8000)
-      });
+      const res = await requestWithRetry(rest('fasttrader_store') + '?key=eq.' + encodeURIComponent(storeKey) + '&select=value', { headers });
       if (!res.ok) return null;
       const rows = await res.json();
       return rows?.[0]?.value ?? null;
@@ -40,29 +59,31 @@ export function createStore(env = process.env) {
     }
   }
 
-  async function save(storeKey, value) {
+  async function save(storeKey, value, { force = false } = {}) {
     const serialized = JSON.stringify(value);
     if (lastSaved.get(storeKey) === serialized) return;
+    if (!force && Date.now() - (lastAt.get(storeKey) ?? 0) < 15000) return;
+    if (inFlight.get(storeKey)) return;
+    inFlight.set(storeKey, true);
     try {
-      const res = await fetch(rest('fasttrader_store') + '?on_conflict=key', {
+      const res = await requestWithRetry(rest('fasttrader_store') + '?on_conflict=key', {
         method: 'POST',
         headers: { ...headers, Prefer: 'resolution=merge-duplicates,return=minimal' },
-        body: JSON.stringify([{ key: storeKey, value, updated_at: new Date().toISOString() }]),
-        signal: AbortSignal.timeout(8000)
+        body: JSON.stringify([{ key: storeKey, value, updated_at: new Date().toISOString() }])
       });
       if (!res.ok) throw Error('HTTP ' + res.status);
       lastSaved.set(storeKey, serialized);
+      lastAt.set(storeKey, Date.now());
     } catch (error) {
       console.error('Supabase save failed (' + storeKey + '):', error.message);
+    } finally {
+      inFlight.delete(storeKey);
     }
   }
 
   async function loadProfile(accountKey) {
     try {
-      const res = await fetch(rest('user_profiles') + '?account_key=eq.' + encodeURIComponent(accountKey) + '&select=*', {
-        headers,
-        signal: AbortSignal.timeout(8000)
-      });
+      const res = await requestWithRetry(rest('user_profiles') + '?account_key=eq.' + encodeURIComponent(accountKey) + '&select=*', { headers });
       if (!res.ok) return null;
       const rows = await res.json();
       const row = rows?.[0];
@@ -101,11 +122,10 @@ export function createStore(env = process.env) {
     const serialized = JSON.stringify({ ...row, updated_at: '' });
     if (lastSaved.get('profile:' + accountKey) === serialized) return;
     try {
-      const res = await fetch(rest('user_profiles') + '?on_conflict=account_key', {
+      const res = await requestWithRetry(rest('user_profiles') + '?on_conflict=account_key', {
         method: 'POST',
         headers: { ...headers, Prefer: 'resolution=merge-duplicates,return=minimal' },
-        body: JSON.stringify([row]),
-        signal: AbortSignal.timeout(8000)
+        body: JSON.stringify([row])
       });
       if (!res.ok) throw Error('HTTP ' + res.status);
       lastSaved.set('profile:' + accountKey, serialized);
@@ -139,11 +159,10 @@ export function createStore(env = process.env) {
     const fingerprint = JSON.stringify(rows.map(({ updated_at, ...r }) => r));
     if (lastSaved.get('trades:' + accountKey) === fingerprint) return;
     try {
-      const res = await fetch(rest('user_trades') + '?on_conflict=account_key,client_order_id', {
+      const res = await requestWithRetry(rest('user_trades') + '?on_conflict=account_key,client_order_id', {
         method: 'POST',
         headers: { ...headers, Prefer: 'resolution=merge-duplicates,return=minimal' },
-        body: JSON.stringify(rows),
-        signal: AbortSignal.timeout(8000)
+        body: JSON.stringify(rows)
       });
       if (!res.ok) throw Error('HTTP ' + res.status);
       lastSaved.set('trades:' + accountKey, fingerprint);
