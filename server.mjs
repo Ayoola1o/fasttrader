@@ -469,11 +469,11 @@ async function completeAI(job) {
         bot.status = 'Running';
         if (model.side === proposal.side && !unresolvedFor(s.symbol)) {
           try { await reconcile(); }
-          catch {
+          catch (failure) {
             state.broker = 'offline';
             brokerAt = 0;
             bot.status = 'Waiting for fresh feed and broker';
-            event('connections', 'Broker reconciliation failed');
+            event('connections', 'Broker reconciliation failed', [failure?.message || 'Unknown error']);
           }
         }
         if (!currentCandidate(job)) return;
@@ -670,8 +670,8 @@ async function cycle() {
         await Promise.all([pollMarket('feed'), pollMarket('cryptoFeed')]);
       }
       try { await reconcile(); }
-      catch {
-        if (state.broker !== 'offline') event('connections', 'Broker reconciliation failed');
+      catch (failure) {
+        if (state.broker !== 'offline') event('connections', 'Broker reconciliation failed', [failure?.message || 'Unknown error']);
         state.broker = 'offline';
         brokerAt = 0;
       }
