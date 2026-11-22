@@ -728,7 +728,18 @@ document.addEventListener('click',async event=>{
  if(action==='close-notifs'){notifOpen=false;chrome();return}
  if(action==='notif-filter'){notifFilter=value;renderNotifDrawer();return}
  if(action==='mark-notifs-read'){if(state.events?.[0])lastSeenNotif=state.events[0].t;chrome();toast('Notifications marked read.');return}
- if(action==='remove-avatar'){avatarDraft='';render(true);toast('Photo removed. Click Save profile to confirm.');return}
+ if(action==='remove-avatar'){
+   if(!online||pending){toast('The workspace is reconnecting.');return}
+   pending=true;
+   try{
+     await api('profile',{...(state.profile??{}),avatar:''});
+     avatarDraft=null;
+     toast('Profile photo removed.');
+     await refresh(true);
+   }catch(error){toast(error.message)}
+   finally{pending=false}
+   return;
+ }
  if(action==='test-telegram'){
    if(!online||pending){toast('The workspace is reconnecting.');return}
    pending=true;el.disabled=true;
@@ -810,15 +821,25 @@ document.addEventListener('change',event=>{
    const reader=new FileReader();
    reader.onload=()=>{
      const img=new Image();
-     img.onload=()=>{
+     img.onload=async()=>{
        const size=160, canvas=document.createElement('canvas');
        canvas.width=size;canvas.height=size;
        const ctx=canvas.getContext('2d');
        const min=Math.min(img.width,img.height), sx=(img.width-min)/2, sy=(img.height-min)/2;
        ctx.drawImage(img,sx,sy,min,min,0,0,size,size);
-       avatarDraft=canvas.toDataURL('image/jpeg',0.82);
+       const dataUrl=canvas.toDataURL('image/jpeg',0.82);
+       avatarDraft=dataUrl;
        render(true);
-       toast('Photo ready. Click Save profile to upload.');
+       if(online&&!pending){
+         pending=true;
+         try{
+           await api('profile',{...(state.profile??{}),avatar:dataUrl});
+           avatarDraft=null;
+           toast('Profile photo saved.');
+           await refresh(true);
+         }catch(error){toast(error.message)}
+         finally{pending=false}
+       }else toast('Photo ready. Click Save profile to upload.');
      };
      img.src=reader.result;
    };
