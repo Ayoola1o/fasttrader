@@ -41,26 +41,45 @@ function decryptSecret(enc) {
     const decipher = createDecipheriv('aes-256-gcm', secretKey, Buffer.from(enc.iv, 'base64'));
     decipher.setAuthTag(Buffer.from(enc.tag, 'base64'));
     const raw = Buffer.concat([decipher.update(Buffer.from(enc.data, 'base64')), decipher.final()]).toString('utf8');
-    const parsed = JSON.parse(raw);
-    return parsed?.key && ['Gemini', 'OpenAI'].includes(parsed?.name) ? parsed : null;
+    return JSON.parse(raw);
   } catch { return null; }
 }
+const validProvider = p => (p?.key && ['Gemini', 'OpenAI'].includes(p?.name) ? p : null);
 const maskKey = k => (typeof k === 'string' && k.length > 8 ? k.slice(0, 4) + '…' + k.slice(-4) : '••••');
 let botAiProvider = null;
+const perBotAiProviders = new Map();
 async function loadBotAiProvider() {
-  const remote = remoteStore.enabled ? await remoteStore.load('secrets:' + storeKey) : null;
-  if (remote) { botAiProvider = decryptSecret(remote); return; }
-  try { botAiProvider = decryptSecret(JSON.parse(await readFile(secretsFile, 'utf8'))); }
-  catch (err) { if (err.code !== 'ENOENT') console.error('Load bot AI key:', err.message); }
+  let raw = remoteStore.enabled ? await remoteStore.load('secrets:' + storeKey) : null;
+  if (!raw) {
+    try { raw = JSON.parse(await readFile(secretsFile, 'utf8')); }
+    catch (err) { if (err.code !== 'ENOENT') console.error('Load bot AI key:', err.message); }
+  }
+  const parsed = decryptSecret(raw);
+  if (!parsed) return;
+  if (validProvider(parsed)) {
+    botAiProvider = parsed;
+  } else {
+    botAiProvider = validProvider(parsed.defaultKey);
+    if (parsed.bots && typeof parsed.bots === 'object') {
+      for (const [id, entry] of Object.entries(parsed.bots)) {
+        const clean = validProvider(entry);
+        if (clean) perBotAiProviders.set(id, clean);
+      }
+    }
+  }
 }
-async function saveBotAiProvider(provider) {
-  botAiProvider = provider;
-  const payload = provider ? encryptSecret(provider) : { cleared: true };
+async function saveAiSecrets() {
+  const hasAny = Boolean(botAiProvider) || perBotAiProviders.size > 0;
+  const payload = hasAny ? encryptSecret({ defaultKey: botAiProvider, bots: Object.fromEntries(perBotAiProviders) }) : { cleared: true };
   await writeFile(secretsFile + '.tmp', JSON.stringify(payload));
   await rename(secretsFile + '.tmp', secretsFile);
   if (remoteStore.enabled) await remoteStore.save('secrets:' + storeKey, payload, { force: true });
 }
-const providerFor = s => (s?.mode === 'ai_autonomous' && botAiProvider ? botAiProvider : aiProvider);
+async function saveBotAiProvider(provider) {
+  botAiProvider = provider;
+  await saveAiSecrets();
+}
+const providerFor = (s, botId = s?.id) => (botId && perBotAiProviders.get(botId)) || (s?.mode === 'ai_autonomous' && botAiProvider) || aiProvider;
 const terminal = new Set(['filled', 'canceled', 'expired', 'rejected', 'replaced', 'done_for_day']);
 const time = () => new Date().toISOString();
 let state = {
@@ -853,6 +872,7 @@ function snapshot() {
     aiConfigured: Boolean(aiProvider), aiProvider: aiProvider?.name ?? null,
     botAiConfigured: Boolean(botAiProvider),
     botAiInfo: botAiProvider ? { provider: botAiProvider.name, model: botAiProvider.model, masked: maskKey(botAiProvider.key) } : null,
+    botAiKeys: Object.fromEntries([...perBotAiProviders].map(([id, p]) => [id, { provider: p.name, model: p.model, masked: maskKey(p.key) }])),
     feedName: demo ? 'Synthetic market' : 'Alpaca ' + feed.toUpperCase()
   };
 }
@@ -999,6 +1019,7 @@ async function change(path, input) {
         order = closed.order;
       }
       delete state.bots[bot.id];
+      if (perBotAiProviders.delete(bot.id)) await saveAiSecrets();
       const details = order
         ? [`Bot: ${bot.name}`, `Liquidated ${order.qty} ${symbol} at market`]
         : position
@@ -1088,14 +1109,20 @@ async function change(path, input) {
   if (path === '/api/settings') {
     if (input.testTelegram === true) return telegram.sendTest(mode);
     if (input.removeBotAiKey === true) {
+      if (typeof input.botId === 'string' && input.botId) {
+        perBotAiProviders.delete(input.botId);
+        await saveAiSecrets();
+        return { configured: false, botId: input.botId };
+      }
       await saveBotAiProvider(null);
       return { configured: false };
     }
     if (input.testBotAiKey === true) {
+      const saved = typeof input.botId === 'string' && input.botId ? perBotAiProviders.get(input.botId) : botAiProvider;
       const candidate = input.key?.trim()
         ? { name: input.provider === 'OpenAI' ? 'OpenAI' : 'Gemini', key: input.key.trim(), model: input.model?.trim() || (input.provider === 'OpenAI' ? 'gpt-4.1-mini' : 'gemini-2.5-flash') }
-        : botAiProvider;
-      if (!candidate) throw Error('Save or enter an AI Bot Trading Key first.');
+        : saved;
+      if (!candidate) throw Error('Save or enter an API key first.');
       return testProviderKey(candidate);
     }
     if (input.botAiKey && typeof input.botAiKey === 'object') {
@@ -1103,6 +1130,12 @@ async function change(path, input) {
       const key = String(input.botAiKey.key ?? '').trim();
       if (key.length < 10 || key.length > 300) throw Error('Enter a valid Gemini or OpenAI API key.');
       const model = String(input.botAiKey.model ?? '').trim().slice(0, 80) || (name === 'OpenAI' ? 'gpt-4.1-mini' : 'gemini-2.5-flash');
+      if (typeof input.botAiKey.botId === 'string' && input.botAiKey.botId) {
+        if (!state.bots[input.botAiKey.botId]) throw Error('Bot not found.');
+        perBotAiProviders.set(input.botAiKey.botId, { name, key, model });
+        await saveAiSecrets();
+        return { configured: true, botId: input.botAiKey.botId, provider: name, model, masked: maskKey(key) };
+      }
       await saveBotAiProvider({ name, key, model });
       return { configured: true, provider: name, model, masked: maskKey(key) };
     }

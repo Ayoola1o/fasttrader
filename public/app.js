@@ -285,6 +285,8 @@ function session(){
  const risk=bot.desired==='running'&&bot.budget?topUpForm:form('fund-bot',select('Strategy version','version',[['','Choose a strategy version'],...versions],selectedVersion,true)+numeric('Bot budget (USD)','budget',fundBudget??bot.budget??'',1,1e9),
        submit(bot.desired==='running'?'Set budget':bot.desired==='paused'?'Resume bot':'Restart bot',!online))+topUpForm;
  const aiCallsBadge=strategy?.mode==='ai_autonomous'?badge(`AI calls today: ${bot.aiCallsToday??0}${strategy.aiDailyCap?' / '+strategy.aiDailyCap:''}`):'';
+ const personalKey=state.botAiKeys?.[bot.id];
+ const advKeyBox=`<details class="form" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--line)"><summary style="cursor:pointer;font-weight:600;font-size:.88rem;color:var(--text);display:flex;align-items:center;justify-content:space-between;gap:8px"><span>Advanced: Personal Bot API Key</span>${badge(personalKey?personalKey.provider+' · '+personalKey.masked:'Fallback to main key',personalKey?'good':'')}</summary><div style="margin-top:10px"><small style="display:block;margin-bottom:8px;color:var(--muted)">Assign this bot its own dedicated Gemini or OpenAI key so it never shares rate limits with other bots. Leave empty to fall back to your main key.</small><form id="per-bot-ai-key" data-bot="${esc(bot.id)}" class="form"><div class="fields">${select('Provider','provider',[['Gemini','Google Gemini'],['OpenAI','OpenAI']],personalKey?.provider??'Gemini',true)}${field('Model (optional)','model',personalKey?.model??'','maxlength="80" placeholder="e.g. gemini-2.5-flash"')}${field('Personal API Key','key','','type="password" autocomplete="off" maxlength="300" placeholder="'+(personalKey?'Enter new key to replace':'Paste dedicated API key')+'"')}</div><div class="actions">${submit('Save bot key',!online)}${btn('Test key','test-per-bot-ai-key',bot.id,false,!online?'disabled':'')}${personalKey?btn('Use main key','remove-per-bot-ai-key',bot.id,false,`style="color:#ff8191;border-color:#592e42" ${!online?'disabled':''}`):''}</div></form></div></details>`;
  const deleteControl=`<div class="form" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--line)"><div class="actions">${btn('Delete bot','open-delete-bot',bot.id,false,`style="background:#39212e;color:#ff8191;border-color:#592e42" ${!online?'disabled':''}`)}</div><small style="color:var(--muted)">Choose whether to liquidate any open position or leave it open when deleting.</small></div>`;
  const positionRows=holding?[[esc(bot.symbol),qtyText(book.qty),book.complete?usd(book.cost/book.qty):'—',usd(book.mark),
    Number.isFinite(book.mark)?usd(book.qty*book.mark):'—',moneyChange(book.unrealized)]]:[];
@@ -300,7 +302,7 @@ function session(){
    '<div class="grid equal">'+panel('Position',positionStatus,table(['Asset','Units held','Average cost','Mark','Market value','Open P&L'],positionRows,'No open position held by this bot.'))+
    panel('Bot controls','Last evaluated '+stamp(bot.lastBar)+' · '+open.length+' open orders',
      '<div class="form"><div class="actions">'+badge(botStatus(bot))+aiCallsBadge+'<small>Started '+stamp(bot.started)+'</small></div>'+
-     '<small>'+usd(book.reserved)+' reserved for pending buys</small></div>'+controls+liquidateControls+risk+deleteControl)+'</div>'+
+     '<small>'+usd(book.reserved)+' reserved for pending buys</small></div>'+controls+liquidateControls+risk+advKeyBox+deleteControl)+'</div>'+
    '<div class="stack">'+panel('Latest evaluation',bot.lastEvaluation?stamp(bot.lastEvaluation.t)+' · '+usd(bot.lastEvaluation.price):'Waiting for an evaluated bar',
      bot.lastEvaluation?'<div class="bot-row"><span>'+esc(bot.lastEvaluation.rationale)+'</span>'+badge(bot.lastEvaluation.direction)+'</div>':empty(botStatus(bot)))+
    panel('Orders and executions',`${filled.length} filled or partially filled orders · ${usd(book.bought)} bought · ${usd(book.sold)} sold`,
@@ -576,13 +578,15 @@ function settings(){
  const row=(label,desc,status)=>`<div class="bot-row"><div><b>${label}</b><small>${desc}</small></div>${badge(status)}</div>`;
  const events=state.events.map(e=>`<div class="activity-item">${esc(e.message)}<small>${stamp(e.t)}</small></div>`).join('');
  const bai=state.botAiInfo;
- const botAiPanel=panel('AI Bot Trading Key','Dedicated API key for Autonomous AI bots (saved encrypted in Supabase so it never shares quota with your general key).',
+ const perBotEntries=Object.entries(state.botAiKeys??{}).filter(([id])=>state.bots[id]);
+ const perBotList=perBotEntries.length?'<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--line)"><small style="display:block;margin-bottom:6px;color:var(--muted)">Per-bot personal API keys</small>'+perBotEntries.map(([id,k])=>`<div class="bot-row"><div><b>${esc(state.bots[id].name)}</b><small>${esc(k.provider)} · ${esc(k.model)} · ${esc(k.masked)}</small></div><div class="actions">${link('Open bot',sessionRoute(state.bots[id]))}${btn('Remove','remove-per-bot-ai-key',id,false,`style="color:#ff8191;border-color:#592e42" ${!online?'disabled':''}`)}</div></div>`).join('')+'</div>':'';
+ const botAiPanel=panel('AI Bot Trading Key','Dedicated API key for Autonomous AI bots (saved encrypted in Supabase). Individual bots can also override this with their own personal key in Bot Session → Advanced.',
    row('Dedicated key status',bai?`${esc(bai.provider)} · ${esc(bai.model)} · ${esc(bai.masked)}`:'Not set — Autonomous AI falls back to server .env key',bai?'configured':'unconfigured')+
    `<form id="bot-ai-key" class="form"><div class="fields">`+
    select('AI Provider','provider',[['Gemini','Google Gemini'],['OpenAI','OpenAI']],bai?.provider??'Gemini',true)+
    field('Model (optional)','model',bai?.model??'','maxlength="80" placeholder="e.g. gemini-2.5-flash or gemini-2.5-flash-lite"')+
    field('API Key','key','','type="password" autocomplete="off" maxlength="300" placeholder="'+(bai?'Enter new key to replace saved key':'Paste Gemini or OpenAI API key')+'"')+
-   `</div><div class="actions">${submit('Save trading key',!online)}${btn('Test key','test-bot-ai-key','',false,!online?'disabled':'')}${bai?btn('Remove key','remove-bot-ai-key','',false,`style="color:#ff8191;border-color:#592e42" ${!online?'disabled':''}`):''}</div></form>`);
+   `</div><div class="actions">${submit('Save trading key',!online)}${btn('Test key','test-bot-ai-key','',false,!online?'disabled':'')}${bai?btn('Remove key','remove-bot-ai-key','',false,`style="color:#ff8191;border-color:#592e42" ${!online?'disabled':''}`):''}</div></form>`+perBotList);
  return page('Workspace preferences','Settings','Review data providers, dedicated AI Bot Trading Key, paper connectivity, and notifications.')+
  `<div class="grid equal"><div class="stack">${panel('Integrations','Credentials are configured in the server environment.',row('Stock data',esc(state.feedName),state.feed)+row('Paper broker',state.mode==='demo'?'Local simulated fills':'Alpaca Paper API',state.broker)+row('General AI confirmation',esc(state.aiProvider ?? 'Gemini or OpenAI'),state.aiConfigured?'configured':'unconfigured')+row('Dedicated AI Bot Key',bai?esc(bai.provider+' · '+bai.masked):'Using fallback key',bai?'configured':'unconfigured')+row('Telegram alerts',state.telegramConfigured?'Bot connected':'Set TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID',state.telegramConfigured?'configured':'unconfigured')+row('Crypto data',state.mode==='demo'?'Synthetic market':'Alpaca Crypto US',state.cryptoFeed??'connecting'))}
  ${botAiPanel}
@@ -892,6 +896,29 @@ document.addEventListener('click',async event=>{
    finally{pending=false}
    return;
  }
+ if(action==='test-per-bot-ai-key'){
+   if(!online||pending){toast('The workspace is reconnecting.');return}
+   const f=$('#per-bot-ai-key'), d=f?values(f):{};
+   pending=true;el.disabled=true;
+   try{
+     const res=await api('settings',{testBotAiKey:true,botId:value,provider:d.provider,model:d.model,key:d.key});
+     toast(`${res.provider} (${res.model}) personal bot key verified!`);
+   }catch(error){toast(error.message)}
+   finally{pending=false;el.disabled=false}
+   return;
+ }
+ if(action==='remove-per-bot-ai-key'){
+   if(!online||pending){toast('The workspace is reconnecting.');return}
+   if(!confirm('Remove this bot’s personal API key? It will fall back to your main AI key.'))return;
+   pending=true;el.disabled=true;
+   try{
+     await api('settings',{removeBotAiKey:true,botId:value});
+     toast('Personal bot API key removed — falling back to main key.');
+     await refresh(true);
+   }catch(error){toast(error.message)}
+   finally{pending=false;el.disabled=false}
+   return;
+ }
  if(action==='test-bot-ai-key'){
    if(!online||pending){toast('The workspace is reconnecting.');return}
    const f=$('#bot-ai-key'), d=f?values(f):{};
@@ -1151,6 +1178,13 @@ document.addEventListener('submit',async event=>{
      if(data.budget!=='')payload.budget=+data.budget; else delete payload.budget;
      const result=await api('backtest',payload);
      runA=result.id;toast('Backtest complete.');
+   }
+   if(form.id==='per-bot-ai-key'){
+     const botId=form.dataset.bot;
+     if(!data.key?.trim())throw Error('Paste a Gemini or OpenAI API key to save.');
+     await api('settings',{botAiKey:{botId,provider:data.provider,model:data.model,key:data.key.trim()}});
+     form.reset();
+     toast('Personal API key saved for this bot.');
    }
    if(form.id==='bot-ai-key'){
      if(!data.key?.trim())throw Error('Paste a Gemini or OpenAI API key to save.');
