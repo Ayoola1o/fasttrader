@@ -895,6 +895,14 @@ async function change(path, input) {
     if (latest && latest.version !== input.baseVersion) throw Error('Strategy changed. Review the latest version before saving.');
     const item = { ...strategy(input), id, version: (latest?.version ?? 0) + 1, mutation, sourceStrategy: latest?.sourceStrategy };
     state.strategies.push(item);
+    if (item.mode === 'ai_autonomous' && !state.bots[id]) {
+      const now = Date.now();
+      state.bots[id] = {
+        id: item.id, version: item.version, name: item.name, symbol: item.symbol,
+        desired: 'paused', status: 'Set budget to enter market', budget: null,
+        createdAt: now, started: now
+      };
+    }
     return item;
   }
   if (path === '/api/bot') {

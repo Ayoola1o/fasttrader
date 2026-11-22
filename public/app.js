@@ -217,7 +217,7 @@ function trading(){
  const groups=[['all','All bots'],['running','Active'],['paused','Paused'],['stopped','Stopped']];
  const counts=Object.fromEntries(groups.map(([k])=>[k,k==='all'?bots.length:bots.filter(b=>b.desired===k).length]));
  const filters=`<div class="tabs" role="group" aria-label="Filter bots">${groups.map(([k,label])=>btn(label+' '+counts[k],'bot-filter',k,false,`aria-pressed="${botFilter===k}"`)).join('')}</div>`;
- const options=state.strategies.slice().reverse().filter(s=>!s.ai||state.aiConfigured)
+ const options=state.strategies.slice().reverse().filter(s=>!s.ai||state.aiConfigured||(s.mode==='ai_autonomous'&&state.botAiConfigured)||Boolean(state.botAiKeys?.[s.id]))
    .map(s=>[key(s),s.name+' · '+s.symbol+' · v'+s.version]);
  const instruments=state.market.filter(m=>m.eligible).map(m=>[m.symbol,m.symbol+' · '+m.name]);
  const requested=launchVersion??params().get('version');
@@ -228,11 +228,20 @@ function trading(){
  const disabled=!online?'disabled':'';
  const rows=bots.filter(b=>botFilter==='all'||b.desired===botFilter).map(b=>{
    const command=(label,action,primary=false)=>btn(label,'bot-command',action,primary,`data-bot="${esc(b.id)}" data-version="${b.version}" ${disabled}`);
-   const controls=b.desired==='running'?command('Pause','paused'):b.budget?command(b.desired==='paused'?'Resume':'Restart','running',true):link('Set budget',sessionRoute(b));
+   const controls=b.desired==='running'?command('Pause','paused'):b.budget?command(b.desired==='paused'?'Resume':'Restart','running',true):link('Set budget',sessionRoute(b),true);
    const latestOrder=state.orders.find(o=>o.strategyId===b.id);
-   const detail=b.desired==='running'&&b.status.toLowerCase()!=='running'?'<small>'+esc(b.status)+'</small>':'';
+   const strat=version(key(b)), book=state.botSessions?.[b.id]??{};
+   const modeTag=strat?.mode==='ai_autonomous'?' '+badge('Autonomous AI'):strat?.mode==='ai_notepad'?' '+badge('AI Notepad'):'';
+   let liveDetail='';
+   if(!b.budget) liveDetail='Set budget to start trading';
+   else if(b.desired==='running'){
+     if(book.qty>0) liveDetail=`Holding ${qtyText(book.qty)} ${b.symbol}`+(b.status.toLowerCase()!=='running'?' · '+b.status:'');
+     else if(b.status.toLowerCase()!=='running') liveDetail=b.status;
+     else liveDetail='Waiting to enter market'+(b.lastEvaluation?.rationale?' · '+b.lastEvaluation.rationale.slice(0,55):'');
+   } else if(b.desired==='paused') liveDetail='Paused · ready to resume';
+   const detail=liveDetail?'<small style="display:block;margin-top:3px">'+esc(liveDetail)+'</small>':'';
    return [
-     `<a class="bot-name" href="#${sessionRoute(b)}"><b>${esc(b.name)}</b></a>`,esc(b.symbol)+' · v'+b.version,
+     `<a class="bot-name" href="#${sessionRoute(b)}"><b>${esc(b.name)}</b></a>${modeTag}`,esc(b.symbol)+' · v'+b.version,
      badge({running:'Active',paused:'Paused',stopped:'Stopped'}[b.desired],b.desired==='running'&&b.status.toLowerCase()==='running'?'good':'')+detail,
      b.budget?usd(b.budget):badge('Budget required'),stamp(b.lastBar),latestOrder?badge(latestOrder.status)+' <small>'+stamp(latestOrder.t)+'</small>':'—',
      '<div class="actions">'+controls+(b.desired!=='stopped'?command('Stop','stopped'):'')+btn('Delete','open-delete-bot',b.id,false,`style="color:#ff8191;border-color:#592e42" ${disabled}`)+'</div>'
