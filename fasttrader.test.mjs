@@ -9,7 +9,7 @@ import { runInNewContext } from 'node:vm';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { defaults, decision, replay, botLedger, contiguousBars, aggregateBars, computeATR, strategy, evaluateRuleSet } from './engine.mjs';
+import { defaults, decision, replay, downsampleCurve, botLedger, contiguousBars, aggregateBars, computeATR, strategy, evaluateRuleSet } from './engine.mjs';
 import { signalProvider, assessSignal } from './signal-ai.mjs';
 import { createTelegram } from './telegram.mjs';
 import { handleBridge } from './api/bridge.js';
@@ -58,7 +58,40 @@ test('replay honors intrabar stops, budget caps, and default Gemini model', () =
   assert.equal(result.trades[0].qty, 3);
   assert.equal(result.trades[1].side, 'sell');
   assert.ok(result.trades[1].price <= 110 * 0.98 + 1e-9);
+  assert.equal(result.trades[1].reason, 'Stop loss');
+  assert.equal(result.metrics.closedTrades, 1);
+  assert.equal(result.metrics.losses, 1);
+  assert.equal(result.metrics.winRate, 0);
   assert.equal(signalProvider({ GEMINI_API_KEY: 'test-key' }).model, 'gemini-2.5-flash');
+});
+
+test('replay avoids same-bar trailing-stop look-ahead bias, computes quant metrics, and downsamples curves', () => {
+  const rules = { ...defaults, period: 2, entry: 0, stop: 10, take: 30, trailingStop: 5 };
+  const bars = [
+    { t: '2026-10-01T12:00:00Z', o: 100, h: 101, l: 99, c: 100, v: 500 },
+    { t: '2026-10-01T12:01:00Z', o: 100, h: 111, l: 100, c: 110, v: 500 },
+    // Entry fills at 110. Bar dips to 106 (-3.6%, above 5% trail from 110) then rallies to 120.
+    // With look-ahead bias, highWater=120 would put trail at 114 and falsely stop out at 106!
+    { t: '2026-10-01T12:02:00Z', o: 110, h: 120, l: 106, c: 118, v: 500 },
+    // Next bar: highWater is now 120 (trail = 114), bar drops to 113 -> legitimate trailing stop!
+    { t: '2026-10-01T12:03:00Z', o: 118, h: 119, l: 113, c: 114, v: 500 }
+  ];
+  const result = replay(rules, bars, { capital: 10000, fees: 10, slippage: 0 });
+  assert.equal(result.trades.length, 2);
+  assert.equal(result.trades[0].t, bars[2].t);
+  assert.equal(result.trades[1].t, bars[3].t);
+  assert.equal(result.trades[1].reason, 'Trailing stop');
+  assert.equal(result.metrics.wins, 1);
+  assert.equal(result.metrics.winRate, 100);
+  assert.ok(result.metrics.totalFees > 0);
+  assert.ok(Math.abs(result.metrics.buyAndHold - 14) < 0.001);
+  // Downsample preserves endpoints and worst drawdown point
+  const big = Array.from({ length: 2000 }, (_, i) => ({ t: String(i), value: 100, drawdown: i === 777 ? -25 : -1 }));
+  const sampled = downsampleCurve(big, 200);
+  assert.ok(sampled.length <= 203);
+  assert.equal(sampled[0].t, '0');
+  assert.equal(sampled.at(-1).t, '1999');
+  assert.ok(sampled.some(p => p.t === '777' && p.drawdown === -25));
 });
 
 test('contiguous candle warmup blocks gapped entries while allowing protective exits and stop-loss cooldown', () => {

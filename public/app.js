@@ -493,20 +493,32 @@ function strategies(){
 function backtesting(){
  const runs=state.runs,eligible=state.strategies.filter(s=>!s.ai).reverse(),requested=params().get('version');
  const chosen=eligible.some(s=>key(s)===requested)?requested:'';
- const option=run=>[run.id,run.name+' v'+run.version+' · '+run.symbol+' · '+stamp(run.t)];
+ const chosenStrat=eligible.find(s=>key(s)===chosen);
+ const cryptoDefault=chosenStrat?.symbol?.includes('/');
+ const option=run=>[run.id,run.name+' v'+run.version+' · '+run.symbol+' ('+(run.timeframe??'1Min')+') · '+stamp(run.t)];
  if(!runs.some(r=>r.id===runA))runA=runs[0]?.id??'';
  if(runB===null&&runs.length>1)runB=runs[1].id;
  const a=runs.find(r=>r.id===runA),b=runs.find(r=>r.id===runB);
- const inputs=select('Saved strategy','version',[['','Choose a saved strategy'],...eligible.map(s=>[key(s),s.name+' v'+s.version+' · '+s.symbol])],chosen,true)+
- field('Start date','start',date(Date.now()-86400000*2),'type="date" required')+field('End date','end',date(Date.now()),'type="date" required')+
- numeric('Starting capital ($)','capital',100000,100,1e9,1)+numeric('Fees (bps)','fees',1,0,500)+numeric('Slippage (bps)','slippage',2,0,500);
- const summary=r=>r?panel(esc(r.name)+' v'+r.version,esc(r.source)+' · '+esc(r.start)+' to '+esc(r.end),
- `<div class="form"><b class="mono">${usd(r.final)} &nbsp; <span class="${color(r.final-r.capital)}">${pct(100*(r.final/r.capital-1))}</span></b><small>Maximum drawdown ${pct(r.drawdown)} · ${r.tradeCount??r.trades.length} executions</small></div>`+plot(r.curve)):empty('Choose a second run to compare.');
- return page('Strategy research','Backtesting','Replay a saved strategy with next-bar-open fills and modeled trading costs.')+
- `<div class="stack">${panel('Run configuration','Signals use completed minute bars. The next available open determines simulated execution.',form('backtest',inputs,submit('Run backtest',!online||!eligible.length)))}
- ${a?panel('Run comparison','Compare equity and execution results.',`<div id="run-select" class="form"><div class="fields">${select('First run','runA',runs.map(option),runA)}${select('Second run','runB',[['','Select run'],...runs.map(option)],runB)}</div></div><div class="form comparison">${summary(a)}${summary(b)}</div>`):''}
+ const inputs=select('Saved strategy','version',[['','Choose a saved strategy'],...eligible.map(s=>[key(s),s.name+' v'+s.version+' · '+s.symbol+' ('+(s.timeframe??'1Min')+')'])],chosen,true)+
+ field('Start date','start',date(Date.now()-86400000*7),'type="date" required')+field('End date','end',date(Date.now()),'type="date" required')+
+ numeric('Starting capital ($)','capital',100000,100,1e9,1)+
+ field('Bot budget cap ($, optional)','budget','','type="number" min="1" max="1000000000" step="0.01" placeholder="Optional cap"')+
+ numeric('Fees (bps)','fees',cryptoDefault?25:1,0,500)+numeric('Slippage (bps)','slippage',cryptoDefault?5:2,0,500);
+ const pfText=m=>!m?'—':m.profitFactor!==null?m.profitFactor.toFixed(2):(m.wins>0&&m.losses===0?'∞':'—');
+ const summary=r=>{
+   if(!r)return empty('Choose a second run to compare.');
+   const m=r.metrics, ret=100*(r.final/r.capital-1);
+   const stats=m?`<small>Win rate <b>${m.winRate!==null?m.winRate.toFixed(1)+'%':'—'}</b> (${m.wins}W/${m.losses}L) · Profit factor <b>${pfText(m)}</b> · Sharpe <b>${m.sharpe!==null?m.sharpe.toFixed(2):'—'}</b></small>`+
+     `<small>Buy &amp; Hold <b class="${color(m.buyAndHold)}">${pct(m.buyAndHold)}</b> · Fees <b>${usd(m.totalFees)}</b> · ${m.bars} ${esc(m.timeframe??r.timeframe??'1Min')} bars${m.openPosition?' · <span class="badge warn">Open at end ('+usd(m.openPosition.unrealized)+')</span>':''}</small>`:'';
+   return panel(esc(r.name)+' v'+r.version,esc(r.source)+' · '+esc(r.timeframe??'1Min')+' · '+esc(r.start)+' to '+esc(r.end)+(r.budget?' · Budget '+usd(r.budget):''),
+   `<div class="form"><b class="mono">${usd(r.final)} &nbsp; <span class="${color(r.final-r.capital)}">${pct(ret)}</span></b><small>Max drawdown ${pct(r.drawdown)} · ${m?m.closedTrades+' closed trades ('+(r.tradeCount??r.trades.length)+' fills)':(r.tradeCount??r.trades.length)+' executions'} · ${r.fees} bps fee / ${r.slippage} bps slip</small>${stats}</div>`+plot(r.curve));
+ };
+ const openNote=a?.metrics?.openPosition?`<small style="display:block;margin-bottom:8px;color:var(--muted)">Open position at end of test: ${qtyText(a.metrics.openPosition.qty)} @ ${usd(a.metrics.openPosition.entry)} (mark ${usd(a.metrics.openPosition.mark)}, unrealized <b class="${color(a.metrics.openPosition.unrealized)}">${usd(a.metrics.openPosition.unrealized)}</b>).</small>`:'';
+ return page('Strategy research','Backtesting','Replay a saved strategy with next-bar-open fills, intrabar stops, and modeled trading costs.')+
+ `<div class="stack">${panel('Run configuration','Signals evaluate on each strategy’s configured timeframe (1m / 5m / 15m / 1h). Next-bar open determines simulated execution; crypto defaults to 25 bps taker fees.',form('backtest',inputs,submit('Run backtest',!online||!eligible.length)))}
+ ${a?panel('Run comparison','Compare equity curves and risk-adjusted metrics.',`<div id="run-select" class="form"><div class="fields">${select('First run','runA',runs.map(option),runA)}${select('Second run','runB',[['','Select run'],...runs.map(option)],runB)}</div></div><div class="form comparison">${summary(a)}${summary(b)}</div>`):''}
  ${a?panel('Drawdown','First run · decline from the equity high-water mark',plot(a.curve.map(p=>({t:p.t,value:p.drawdown})),'percent')):''}
- ${a?panel('Trade log','First run · latest 250 modeled fills and fees',table(['Time','Side','Quantity','Fill price','Fees','Realized P&L'],a.trades.slice(-250).reverse().map(t=>[stamp(t.t),badge(t.side),qtyText(t.qty),usd(t.price),usd(t.fee),usd(t.pnl)]),'No executions in this run.')):''}</div>`;
+ ${a?panel('Trade log','First run · latest 250 modeled fills, fees, and exit reasons',openNote+table(['Time','Side','Quantity','Fill price','Fees','Realized P&L','Reason'],a.trades.slice(-250).reverse().map(t=>[stamp(t.t),badge(t.side),qtyText(t.qty),usd(t.price),usd(t.fee),usd(t.pnl),esc(t.reason??'—')]),'No executions in this run.')):''}</div>`;
 }
 function portfolio(){
  const {positions,equity,account}=state;
@@ -933,6 +945,14 @@ document.addEventListener('change',event=>{
    editor=event.target.value?{...version(event.target.value)}:fresh();
    render(true);
  }
+ if(event.target.matches('#backtest [name=version]')){
+   const strat=version(event.target.value);
+   if(strat&&event.target.form){
+     const isCryptoAsset=strat.symbol?.includes('/');
+     event.target.form.elements.fees.value=isCryptoAsset?25:1;
+     event.target.form.elements.slippage.value=isCryptoAsset?5:2;
+   }
+ }
  if(event.target.closest('#run-select')){
    if(event.target.name==='runA')runA=event.target.value;
    else runB=event.target.value;
@@ -997,7 +1017,9 @@ document.addEventListener('submit',async event=>{
    if(form.id==='backtest'){
      if(control)control.textContent='Running…';
      const [id,version]=data.version.split('@');
-     const result=await api('backtest',{...data,id,version:+version,capital:+data.capital,fees:+data.fees,slippage:+data.slippage});
+     const payload={...data,id,version:+version,capital:+data.capital,fees:+data.fees,slippage:+data.slippage};
+     if(data.budget!=='')payload.budget=+data.budget; else delete payload.budget;
+     const result=await api('backtest',payload);
      runA=result.id;toast('Backtest complete.');
    }
    if(form.id==='settings'){await api('settings',Object.fromEntries(Object.keys(data).map(k=>[k,true])));toast('Notifications saved.')}

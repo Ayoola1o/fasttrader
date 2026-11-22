@@ -428,6 +428,18 @@ export function decision(s, closes, account, position, price, rules = isCrypto(s
   return qty > 0 ? { side: 'buy', qty, rationale } : null;
 }
 
+export function downsampleCurve(curve, maxPoints = 650) {
+  if (!Array.isArray(curve) || curve.length <= maxPoints) return curve ?? [];
+  const step = Math.ceil(curve.length / maxPoints);
+  let worstIdx = 0;
+  for (let i = 1; i < curve.length; i++) {
+    if ((curve[i].drawdown ?? 0) < (curve[worstIdx].drawdown ?? 0)) worstIdx = i;
+  }
+  const indices = new Set([0, curve.length - 1, worstIdx]);
+  for (let i = 0; i < curve.length; i += step) indices.add(i);
+  return [...indices].sort((a, b) => a - b).map(i => curve[i]);
+}
+
 export function replay(s, bars, options) {
   let cash = options.capital, dayStart = cash, peak = cash, day, position, pending, cooldown = 0;
   const curve = [], trades = [];
@@ -458,19 +470,21 @@ export function replay(s, bars, options) {
         cash += (buy ? -1 : 1) * qty * price - fee;
         position = buy ? { qty, entry: price, fee, highWater: price, holdBars: 0 } : null;
         if (!buy && pending.stopLoss) cooldown = s.cooldown ?? 0;
-        trades.push({ t: bar.t, side: pending.side, qty, price, fee, pnl });
+        trades.push({ t: bar.t, side: pending.side, qty, price, fee, pnl, reason: pending.rationale || (buy ? 'Entry signal' : 'Exit signal') });
       }
       pending = null;
     }
     if (position) {
-      position.highWater = Math.max(position.highWater ?? position.entry, Number.isFinite(bar.h) ? bar.h : bar.c);
       position.holdBars = (position.holdBars ?? 0) + 1;
     }
     if (position && Number.isFinite(bar.l) && Number.isFinite(bar.h) && bar.l > 0 && bar.h >= bar.l) {
-      const atr = s.atrStop > 0 ? computeATR(historyBars, Math.min(14, s.period)) : null;
-      const stopPct = s.atrStop > 0 && atr > 0 ? Math.min(s.stop, 100 * (s.atrStop * atr) / position.entry) : s.stop;
+      const atrWindow = s.atrStop > 0 ? contiguousBars(historyBars, Math.min(14, s.period) + 1, maxGapMs) : [];
+      const atr = s.atrStop > 0 ? computeATR(atrWindow, Math.min(14, s.period)) : null;
+      const atrTighter = s.atrStop > 0 && atr > 0 && 100 * (s.atrStop * atr) / position.entry < s.stop;
+      const stopPct = atrTighter ? 100 * (s.atrStop * atr) / position.entry : s.stop;
       const fixedStopPrice = position.entry * (1 - stopPct / 100);
-      const trailStopPrice = s.trailingStop > 0 ? position.highWater * (1 - s.trailingStop / 100) : 0;
+      // Evaluate trailing stop against prior high-water mark before raising it with this bar's high (avoids same-bar look-ahead bias)
+      const trailStopPrice = s.trailingStop > 0 ? (position.highWater ?? position.entry) * (1 - s.trailingStop / 100) : 0;
       const stopPrice = Math.max(fixedStopPrice, trailStopPrice);
       const takePrice = position.entry * (1 + s.take / 100);
       const stopped = bar.l <= stopPrice;
@@ -483,8 +497,14 @@ export function replay(s, bars, options) {
         cash += qty * price - fee;
         position = null;
         if (stopped) cooldown = s.cooldown ?? 0;
-        trades.push({ t: bar.t, side: 'sell', qty, price, fee, pnl });
+        const reason = stopped
+          ? (trailStopPrice > fixedStopPrice ? 'Trailing stop' : atrTighter ? 'ATR stop' : 'Stop loss')
+          : 'Take profit';
+        trades.push({ t: bar.t, side: 'sell', qty, price, fee, pnl, reason });
       }
+    }
+    if (position) {
+      position.highWater = Math.max(position.highWater ?? position.entry, Number.isFinite(bar.h) ? bar.h : bar.c);
     }
     const exposure = (position?.qty ?? 0) * bar.c;
     const equity = cash + exposure;
@@ -504,7 +524,53 @@ export function replay(s, bars, options) {
     });
     if (cooldown > 0) cooldown--;
   }
-  return { curve, trades, final: curve.at(-1)?.value ?? cash, drawdown: Math.min(0, ...curve.map(p => p.drawdown)) };
+  const final = curve.at(-1)?.value ?? cash;
+  const drawdown = Math.min(0, ...curve.map(p => p.drawdown));
+  const sells = trades.filter(t => t.side === 'sell' && Number.isFinite(t.pnl));
+  const wins = sells.filter(t => t.pnl > 0);
+  const losses = sells.filter(t => t.pnl <= 0);
+  const grossProfit = wins.reduce((sum, t) => sum + t.pnl, 0);
+  const grossLoss = Math.abs(losses.reduce((sum, t) => sum + t.pnl, 0));
+  const totalFees = trades.reduce((sum, t) => sum + (t.fee ?? 0), 0);
+  const dailyClose = new Map();
+  for (const pt of curve) dailyClose.set(pt.t.slice(0, 10), pt.value);
+  const dailyVals = [...dailyClose.values()];
+  let sharpe = null;
+  if (dailyVals.length >= 3) {
+    const rets = [];
+    for (let i = 1; i < dailyVals.length; i++) {
+      if (dailyVals[i - 1] > 0) rets.push(dailyVals[i] / dailyVals[i - 1] - 1);
+    }
+    if (rets.length >= 2) {
+      const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
+      const variance = rets.reduce((sum, r) => sum + (r - mean) ** 2, 0) / (rets.length - 1);
+      const std = Math.sqrt(variance);
+      if (std > 1e-12) sharpe = (mean / std) * Math.sqrt(isCrypto(s.symbol) ? 365 : 252);
+    }
+  }
+  const buyAndHold = series.length >= 2 && series[0].c > 0 ? 100 * (series.at(-1).c / series[0].c - 1) : null;
+  const openPosition = position && series.length
+    ? { qty: position.qty, entry: position.entry, mark: series.at(-1).c, unrealized: position.qty * (series.at(-1).c - position.entry) - position.fee }
+    : null;
+  const metrics = {
+    closedTrades: sells.length,
+    wins: wins.length,
+    losses: losses.length,
+    winRate: sells.length ? 100 * wins.length / sells.length : null,
+    profitFactor: grossLoss > 0 ? grossProfit / grossLoss : null,
+    grossProfit,
+    grossLoss,
+    avgWin: wins.length ? grossProfit / wins.length : null,
+    avgLoss: losses.length ? -grossLoss / losses.length : null,
+    expectancy: sells.length ? (grossProfit - grossLoss) / sells.length : null,
+    totalFees,
+    sharpe,
+    buyAndHold,
+    openPosition,
+    bars: series.length,
+    timeframe: s.timeframe ?? '1Min'
+  };
+  return { curve, trades, final, drawdown, metrics };
 }
 
 export function synthetic(symbol, start, end, interval = 3600000) {
@@ -514,7 +580,9 @@ export function synthetic(symbol, start, end, interval = 3600000) {
   for (let time = Math.ceil(start / interval) * interval; time <= end; time += interval) {
     const i = time / interval;
     const price = j => base * (1 + 0.016 * Math.sin(j / 9) + 0.009 * Math.cos(j / 3.2) + 0.003 * Math.sin(j * 1.9) + change * 0.002);
-    result.push({ t: new Date(time).toISOString(), o: price(i - 1), c: price(i), v: Math.round(80000 + 25000 * Math.sin(i)) });
+    const o = price(i - 1), c = price(i);
+    const wick = Math.abs(c - o) * 0.35 + base * 0.0004;
+    result.push({ t: new Date(time).toISOString(), o, h: Math.max(o, c) + wick, l: Math.max(0.01, Math.min(o, c) - wick), c, v: Math.round(80000 + 25000 * Math.sin(i)) });
   }
   return result;
 }

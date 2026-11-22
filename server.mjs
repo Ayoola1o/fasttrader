@@ -1,7 +1,7 @@
 import { createServer } from 'node:http';
 import { readFile, mkdir, writeFile, rename } from 'node:fs/promises';
 import { randomUUID, createHash } from 'node:crypto';
-import { instruments, defaults, strategy, decision, replay, synthetic, botLedger, isCrypto, cryptoReplayRules, roundDown, contiguousBars, aggregateBars, computeATR, computeRSI, indicatorValue, timeframes, ruleWarmupBars } from './engine.mjs';
+import { instruments, defaults, strategy, decision, replay, downsampleCurve, synthetic, botLedger, isCrypto, cryptoReplayRules, roundDown, contiguousBars, aggregateBars, computeATR, computeRSI, indicatorValue, timeframes, ruleWarmupBars } from './engine.mjs';
 import { assessSignal, signalProvider } from './signal-ai.mjs';
 import { createAuth, sameSecret } from './auth.mjs';
 import { createStore } from './store.mjs';
@@ -121,9 +121,10 @@ async function request(host, path, opts = {}) {
   return response.status === 204 ? null : response.json();
 }
 const broker = (path, opts) => request('https://paper-api.alpaca.markets/v2', path, opts);
-async function history(symbol, start, end) {
-  if (demo) return synthetic(symbol, start, end, 60000);
-  const params = new URLSearchParams({ symbols: symbol, timeframe: '1Min', start: new Date(start).toISOString(), end: new Date(end).toISOString(), limit: '10000' });
+async function history(symbol, start, end, timeframe = '1Min') {
+  const tf = Object.hasOwn(timeframes, timeframe) ? timeframe : '1Min';
+  if (demo) return synthetic(symbol, start, end, timeframes[tf]);
+  const params = new URLSearchParams({ symbols: symbol, timeframe: tf, start: new Date(start).toISOString(), end: new Date(end).toISOString(), limit: '10000' });
   const crypto = isCrypto(symbol);
   if (!crypto) {
     params.set('feed', feed === 'delayed_sip' ? 'sip' : feed);
@@ -986,14 +987,27 @@ async function backtest(input) {
   const s = state.strategies.find(item => item.id === input.id && item.version === input.version);
   if (!s || s.ai) throw Error('Select a saved strategy with deterministic inputs for historical replay.');
   const { capital, fees, slippage } = input;
+  const hasBudget = input.budget !== undefined && input.budget !== null && input.budget !== '';
+  const budget = hasBudget ? Number(input.budget) : undefined;
   const start = Date.parse(input.start), end = Math.min(Date.parse(input.end) + 86400000 - 1, Date.now() - 60000);
   if (![capital, fees, slippage, start, end].every(Number.isFinite) || capital < 100 || capital > 1e9 ||
+    (hasBudget && (!Number.isFinite(budget) || budget < 1 || budget > 1e9)) ||
     Math.min(fees, slippage) < 0 || Math.max(fees, slippage) > 500 || end <= start || end - start > 31 * 86400000) throw Error('Use a valid date range up to 31 days and valid execution costs.');
-  const bars = await history(s.symbol, start, end);
-  if (bars.length <= s.period) throw Error('Insufficient historical bars for this strategy.');
-  const result = replay(s, bars, { capital, fees, slippage });
+  const tf = s.timeframe ?? '1Min';
+  const bars = await history(s.symbol, start, end, tf);
+  const series = aggregateBars(bars, tf);
+  const warmup = ruleWarmupBars(s);
+  if (series.length <= warmup) throw Error(`Insufficient ${tf} historical bars (${series.length} loaded, need >${warmup} for warmup). Widen the date range.`);
+  const result = replay(s, series, { capital, fees, slippage, budget });
+  const storedCurve = downsampleCurve(result.curve, 650);
+  const storedTrades = result.trades.slice(-250);
   return serial(async () => {
-    const run = { ...result, id: randomUUID(), t: time(), name: s.name, version: s.version, symbol: s.symbol, capital, fees, slippage, start: input.start, end: input.end, source: sourceFor(s.symbol) };
+    const run = {
+      id: randomUUID(), t: time(), name: s.name, version: s.version, symbol: s.symbol, timeframe: tf,
+      capital, ...(hasBudget ? { budget } : {}), fees, slippage, start: input.start, end: input.end,
+      source: sourceFor(s.symbol), final: result.final, drawdown: result.drawdown, metrics: result.metrics,
+      tradeCount: result.trades.length, curve: storedCurve, trades: storedTrades
+    };
     state.runs.unshift(run);
     state.runs.length = Math.min(12, state.runs.length);
     await persist();
