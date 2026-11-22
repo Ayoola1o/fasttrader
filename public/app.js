@@ -1,8 +1,8 @@
-const pages={dashboard:'Dashboard',trading:'Live Trading',session:'Bot Session',screener:'Screener',strategies:'Strategy Editor',backtesting:'Backtesting',portfolio:'Portfolio',history:'History',settings:'Settings',profile:'Profile'};
+const pages={dashboard:'Dashboard',trading:'Live Trading',session:'Bot Session',screener:'Screener',strategies:'Strategy Editor',backtesting:'Backtesting',portfolio:'Portfolio',history:'History',logs:'Logs',settings:'Settings',profile:'Profile'};
 const paths={
 dashboard:'M3 3h7v7H3zm11 0h7v7h-7zM3 14h7v7H3zm11 0h7v7h-7z',screener:'M3 4h18v4l-7 6v5l-4 2v-7L3 8z',
 strategies:'M4 7h16M4 17h16M8 4v6m8 4v6',backtesting:'M3 12a9 9 0 1 0 3-6m-3-2v5h5m4-2v5l3 2',
-portfolio:'M4 8h16v12H4zm4 0V5h8v3M4 13h16m-9 0v2h2v-2',history:'M12 7v5l3 2m6-2a9 9 0 1 1-18 0 9 9 0 0 1 18 0z',settings:'M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm0-5v2m0 14v2m9-9h-2M5 12H3m15-6-2 2m-8 8-2 2m12 0-2-2m-8-8-2-2',
+portfolio:'M4 8h16v12H4zm4 0V5h8v3M4 13h16m-9 0v2h2v-2',history:'M12 7v5l3 2m6-2a9 9 0 1 1-18 0 9 9 0 0 1 18 0z',logs:'M4 5h16v14H4zM8 9h8M8 13h6M8 17h4',settings:'M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm0-5v2m0 14v2m9-9h-2M5 12H3m15-6-2 2m-8 8-2 2m12 0-2-2m-8-8-2-2',
 profile:'M12 4a4 4 0 1 0 0 8 4 4 0 0 0 0-8zM4 21v-2a5 5 0 0 1 5-5h6a5 5 0 0 1 5 5v2',bell:'M5 17h14l-2-3v-4a5 5 0 0 0-10 0v4zm5 3h4',
 trading:'M3 12h4l3-7 4 14 3-7h4',
 equity:'m3 17 5-5 4 3 8-9m-5 0h5v5',wallet:'M3 6h17v13H3zm17 4h-6v5h6',bot:'M5 8h14v11H5zM12 4v4M2 12v3m20-3v3M9 12h.01M15 12h.01M9 16h6',plus:'M12 5v14M5 12h14'};
@@ -44,6 +44,8 @@ let notifOpen=false, notifFilter='all', lastSeenNotif='', avatarDraft=null;
 let tvStyle='Candles', tvRange='1H', tvBotId='';
 let historyTab='orders';
 const historyFilter={asset:'',strategy:'',side:'',status:'',start:'',end:''};
+let logsLive=true;
+const logFilter={category:'all',bot:'',symbol:'',level:'',search:''};
 const key=s=>s.id+'@'+s.version;
 const version=k=>state.strategies.find(s=>key(s)===k);
 const latest=()=>Object.values(Object.fromEntries(state.strategies.map(s=>[s.id,s])));
@@ -52,7 +54,7 @@ const botStatus=b=>b.desired==='running'?b.status:b.desired;
 const syncLabel=()=>state.synced?'Last sync '+stamp(state.synced):'Awaiting first sync';
 function toast(s){const n=$('#toast');n.textContent=s;n.hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>n.hidden=true,4500)}
 function chrome(){
- const groups=[['WORKSPACE',['dashboard','trading','screener','strategies','backtesting','portfolio','history']],['PREFERENCES',['settings','profile']]];
+ const groups=[['WORKSPACE',['dashboard','trading','screener','strategies','backtesting','portfolio','history','logs']],['PREFERENCES',['settings','profile']]];
  const nav=$('#nav');
  if(nav.dataset.page!==active){
    nav.innerHTML=groups.map(([label,items])=>`<span class="nav-label">${label}</span>`+items.map(k=>`<a href="#${k}" class="nav-link ${k===active||k==='trading'&&active==='session'?'active':''}" ${k===active?'aria-current="page"':''}>${icon(k)}${pages[k]}</a>`).join('')).join('');
@@ -673,7 +675,69 @@ function historyPage(){
    `<div class="metrics">${metric('Filled orders',filled.length,filteredOrders.length+' total matching','portfolio')}${metric('Buy volume',usd(buyVol),'Filled purchases','wallet',true)}${metric('Sell volume',usd(sellVol),'Filled sales','equity')}${metric('Signals logged',filteredSignals.length,state.runs.length+' backtests saved','bot',true)}</div>`+
    `<div class="stack">${panel('Filters','Slice executions and signals by asset, strategy, side, or date.',form('history',filterFields,submit('Apply filters')))}${tabs}${content}</div>`;
 }
-const renderers={dashboard,trading,session,screener,strategies,backtesting,portfolio,history:historyPage,settings,profile};
+function combinedLogs(){
+ const raw=Array.isArray(state.logs)?state.logs:[];
+ if(raw.length)return raw;
+ const fallback=[];
+ for(const o of (state.orders??[]).slice(0,40)){
+   fallback.push({t:o.filledAt??o.t,category:'trade',level:o.status==='rejected'?'error':o.status==='filled'?'good':'info',message:`${(o.side??'').toUpperCase()} ${o.status} · ${o.symbol}`,botId:o.strategyId,bot:o.strategy??'External',symbol:o.symbol,detail:`Qty ${qtyText(o.filled)}/${qtyText(o.qty)}${Number.isFinite(o.price)?' @ '+usd(o.price):''}`});
+ }
+ for(const s of (state.signals??[]).slice(0,40)){
+   fallback.push({t:s.t,category:'signal',level:s.direction==='hold'?'info':'good',message:`${(s.direction??'').toUpperCase()} signal · ${s.symbol}`,botId:s.strategyId,bot:s.strategy,symbol:s.symbol,detail:`${s.source}: ${s.rationale}`});
+ }
+ for(const e of (state.events??[]).slice(0,40)){
+   const map={fills:'trade',signals:'signal',risk:'risk',connections:'system'};
+   fallback.push({t:e.t,category:map[e.kind]??'system',level:e.kind==='connections'||e.kind==='risk'?'warn':'info',message:e.message});
+ }
+ return fallback.sort((a,b)=>(b.t??'').localeCompare(a.t??''));
+}
+function logsPage(){
+ const all=combinedLogs();
+ const bots=Object.values(state.bots??{});
+ const activeBots=bots.filter(b=>b.desired==='running').length;
+ const errWarn=all.filter(l=>l.level==='error'||l.level==='warn').length;
+ const tradeSig=all.filter(l=>l.category==='trade'||l.category==='signal').length;
+ const q=logFilter.search.trim().toLowerCase();
+ const filtered=all.filter(l=>{
+   if(logFilter.category!=='all'&&l.category!==logFilter.category)return false;
+   if(logFilter.bot&&(l.bot!==logFilter.bot&&l.botId!==logFilter.bot))return false;
+   if(logFilter.symbol&&l.symbol!==logFilter.symbol)return false;
+   if(logFilter.level&&l.level!==logFilter.level)return false;
+   if(q&&!`${l.message??''} ${l.detail??''} ${l.bot??''} ${l.symbol??''} ${l.category??''}`.toLowerCase().includes(q))return false;
+   return true;
+ });
+ const catCounts=k=>k==='all'?all.length:all.filter(l=>l.category===k).length;
+ const cats=[['all','All'],['bot','Bots'],['trade','Trades'],['signal','Signals'],['ai','AI'],['risk','Risk'],['system','System']];
+ const catTabs=`<div class="tabs" role="tablist">${cats.map(([k,label])=>btn(`${label} (${catCounts(k)})`,'log-cat',k,false,`role="tab" aria-selected="${logFilter.category===k}"`)).join('')}</div>`;
+ const botNames=Array.from(new Set([...bots.map(b=>b.name),...all.map(l=>l.bot).filter(Boolean)]));
+ const syms=Array.from(new Set(all.map(l=>l.symbol).filter(Boolean)));
+ const filterBar=form('logs-filter',
+   select('Bot','bot',[['','All bots'],...botNames.map(n=>[n,n])],logFilter.bot)+
+   select('Asset','symbol',[['','All assets'],...syms.map(s=>[s,s])],logFilter.symbol)+
+   select('Level','level',[['','All levels'],['good','Success'],['info','Info'],['warn','Warning'],['error','Error']],logFilter.level)+
+   field('Search logs','search',logFilter.search,'type="search" placeholder="Search message, rationale, error…"'),
+   `<div class="actions">${submit('Apply')}${btn(logsLive?'Live stream: ON':'Live stream: PAUSED','toggle-logs-live','',logsLive)}${btn('Export CSV','export-logs')}${btn('Clear logs','clear-logs','',false,`style="color:#ff8191;border-color:#592e42" ${!online?'disabled':''}`)}</div>`);
+ const lvlTone=l=>l==='error'?'bad':l==='good'?'good':'';
+ const catLabel={bot:'BOT',trade:'TRADE',signal:'SIGNAL',ai:'AI',risk:'RISK',system:'SYSTEM'};
+ const rows=filtered.slice(0,250).map(l=>{
+   const botObj=l.botId?state.bots[l.botId]:null;
+   const botCell=botObj?`<a class="bot-name" href="#${sessionRoute(botObj)}"><b>${esc(l.bot??botObj.name)}</b></a>`:l.bot?`<b>${esc(l.bot)}</b>`:'<span style="color:var(--muted)">General</span>';
+   const symCell=l.symbol?` <small class="mono">${esc(l.symbol)}</small>`:'';
+   const msgCell=`<div><b>${esc(l.message)}</b>${l.detail?`<small style="display:block;color:var(--muted);margin-top:2px">${esc(l.detail)}</small>`:''}</div>`;
+   return [
+     `<span class="mono" style="white-space:nowrap">${stamp(l.t,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'})}</span>`,
+     badge(catLabel[l.category]??String(l.category??'SYS').toUpperCase(),lvlTone(l.level)),
+     botCell+symCell,
+     badge((l.level??'info').toUpperCase(),lvlTone(l.level)),
+     msgCell
+   ];
+ });
+ return page('System & bot telemetry','Activity Logs','Monitor real-time bot actions, AI decisions, trades, signals, risk alerts, and system events across your workspace.',
+   btn(logsLive?'Live: ON':'Live: PAUSED','toggle-logs-live','',logsLive))+
+   `<div class="metrics">${metric('Total logs',all.length,filtered.length+' matching filters','logs')}${metric('Active bots',activeBots,bots.length+' total bots configured','bot',true)}${metric('Trades & signals',tradeSig,'Executions & decisions','equity')}${metric('Warnings & errors',errWarn,errWarn?'Review alerts & 429s':'All systems clean','portfolio',errWarn>0)}</div>`+
+   `<div class="stack">${panel('Filter stream','Slice by category, bot, asset, severity, or keyword.',catTabs+filterBar)}${panel('Live event stream',`Showing ${Math.min(250,filtered.length)} of ${filtered.length} entries · ${syncLabel()}`,table(['Time','Category','Bot / Asset','Level','Event & details'],rows,'No log entries match your current filters.'))}</div>`;
+}
+const renderers={dashboard,trading,session,screener,strategies,backtesting,portfolio,history:historyPage,logs:logsPage,settings,profile};
 function clearWorkspace(){
  state=null;editor=null;runA='';runB=null;online=false;
  write('ft-cache',null);write('ft-draft',null);
@@ -735,7 +799,7 @@ function render(force=false){
  active=next;chrome();
  if(!state){main.innerHTML=empty('Connect to FastTrader to load the workspace.');main.dataset.html='';return}
  if(!force&&!changed&&(pending||document.activeElement?.closest('form, .plot, #run-select')||main.querySelector('.plot:hover')))return;
- if(!force&&!changed&&['backtesting','profile'].includes(active))return;
+ if(!force&&!changed&&(['backtesting','profile'].includes(active)||(active==='logs'&&!logsLive)))return;
  const markup=renderers[active]()+renderDeleteModal();
  if(markup!==main.dataset.html){main.innerHTML=markup;main.dataset.html=markup}
 }
@@ -965,6 +1029,23 @@ document.addEventListener('click',async event=>{
  if(action==='tv-style')tvStyle=value;
  if(action==='tv-range')tvRange=value;
  if(action==='tv-bot')tvBotId=value;
+ if(action==='log-cat'){logFilter.category=value;render(true);return}
+ if(action==='toggle-logs-live'){logsLive=!logsLive;toast(logsLive?'Live log stream resumed.':'Live log stream paused.');render(true);return}
+ if(action==='export-logs'){
+   const rows=[['Time','Category','Level','Bot','Symbol','Message','Detail'],...combinedLogs().map(l=>[l.t??'',l.category??'',l.level??'',l.bot??'',l.symbol??'',l.message??'',l.detail??''])];
+   const csv=rows.map(r=>r.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(',')).join('\n');
+   const a=document.createElement('a');a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(csv);a.download='fasttrader-logs.csv';a.click();
+   toast('Exported logs CSV.');return;
+ }
+ if(action==='clear-logs'){
+   if(!online||pending){toast('The workspace is reconnecting.');return}
+   if(!confirm('Clear all stored workspace logs?'))return;
+   pending=true;el.disabled=true;
+   try{await api('settings',{clearLogs:true});toast('Logs cleared.');await refresh(true)}
+   catch(error){toast(error.message)}
+   finally{pending=false;el.disabled=false}
+   return;
+ }
  if(action==='history-tab')historyTab=value;
  if(action==='export-history'){
    const rows=[['Time','Asset','Strategy','Side','Qty','Filled','Price','Status'],...state.orders.map(o=>[o.filledAt??o.t??'',o.symbol??'',o.strategy??'External',o.side??'',o.qty??'',o.filled??'',o.price??'',o.status??''])];
@@ -1136,6 +1217,7 @@ document.addEventListener('submit',async event=>{
    render(true);return;
  }
  if(form.id==='history'){Object.assign(historyFilter,data);render(true);return}
+ if(form.id==='logs-filter'){Object.assign(logFilter,data);render(true);return}
  pending=true;if(control)control.disabled=true;
  try{
    if(form.id==='authenticate'){

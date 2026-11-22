@@ -85,7 +85,7 @@ const time = () => new Date().toISOString();
 let state = {
   cash: 100000, account: { equity: 100000, cash: 100000, buyingPower: 100000, dayStart: 100000, exposure: 0 },
   strategies: [{ ...defaults, id: 'default', version: 1 }], bots: {}, positions: [], orders: [], signals: [], runs: [],
-  equity: [], profile: { name: 'Paper Trader', username: '', email: '', bio: '', avatar: '', timezone: 'UTC', riskTier: 'moderate', tradingStyle: 'swing', offlineSync: true }, alerts: {}, events: [], quotes: {}, bars: {},
+  equity: [], profile: { name: 'Paper Trader', username: '', email: '', bio: '', avatar: '', timezone: 'UTC', riskTier: 'moderate', tradingStyle: 'swing', offlineSync: true }, alerts: {}, events: [], logs: [], quotes: {}, bars: {},
   feed: 'connecting', broker: 'connecting', sessionOpen: demo, synced: null
 };
 await mkdir(directory, { recursive: true });
@@ -111,6 +111,7 @@ for (const signal of state.signals.filter(item => !item.strategyId)) {
   const matches = state.strategies.filter(item => item.name === signal.strategy && item.symbol === signal.symbol && item.version === signal.version);
   if (matches.length === 1) signal.strategyId = matches[0].id;
 }
+state.logs = Array.isArray(state.logs) ? state.logs.slice(0, 300) : [];
 state.feed = state.cryptoFeed = state.broker = 'connecting';
 state.cryptoSessionOpen = false;
 const symbols = Object.keys(instruments);
@@ -154,7 +155,25 @@ async function persist(force = true) {
     else void sync;
   }
 }
-function event(kind, message, details = []) {
+function logEntry(category, level, message, meta = {}) {
+  state.logs ??= [];
+  state.logs.unshift({
+    t: time(),
+    category,
+    level,
+    message: String(message ?? '').slice(0, 220),
+    ...(meta.botId ? { botId: meta.botId } : {}),
+    ...(meta.bot ? { bot: String(meta.bot).slice(0, 60) } : {}),
+    ...(meta.symbol ? { symbol: meta.symbol } : {}),
+    ...(meta.detail ? { detail: String(meta.detail).slice(0, 320) } : {})
+  });
+  if (state.logs.length > 300) state.logs.length = 300;
+}
+function event(kind, message, details = [], meta = {}) {
+  const catMap = { fills: 'trade', signals: 'signal', risk: 'risk', connections: 'system' };
+  const lvl = kind === 'connections' ? 'warn' : kind === 'risk' ? 'warn' : kind === 'fills' ? 'good' : 'info';
+  const detailText = Array.isArray(details) ? details.filter(Boolean).join(' · ') : '';
+  logEntry(catMap[kind] ?? 'system', lvl, message, { ...meta, detail: meta.detail ?? detailText });
   if (!state.alerts[kind]) return;
   state.events.unshift({ t: time(), kind, message });
   state.events.length = Math.min(state.events.length, 50);
@@ -542,9 +561,11 @@ async function completeAI(job) {
       if (error) {
         bot.status = error.message;
         if (error.message.includes('(429)')) bot.aiBackoffUntil = Date.now() + 5 * 60000;
+        logEntry('ai', 'error', `${bot.name} AI error: ${error.message}`, { botId: bot.id, bot: bot.name, symbol: s.symbol, detail: provider?.name ? `Provider: ${provider.name} (${provider.model})` : '' });
       } else {
         bot.status = 'Running';
         bot.aiBackoffUntil = 0;
+        logEntry('ai', model.side === 'hold' ? 'info' : 'good', `${bot.name} AI → ${model.side.toUpperCase()}${proposal.aiFreeRoam && model.side !== 'hold' ? ` (${model.allocationPct ?? 100}%)` : ''}`, { botId: bot.id, bot: bot.name, symbol: s.symbol, detail: model.rationale });
         const shouldAct = proposal.aiFreeRoam ? model.side !== 'hold' : model.side === proposal.side;
         if (shouldAct && !unresolvedFor(s.symbol)) {
           try { await reconcile(); }
@@ -634,6 +655,7 @@ async function evaluate(bot) {
       bot.lastBar = bar.t;
       bot.status = `Daily AI call cap reached (${bot.aiCallsToday}/${s.aiDailyCap})`;
       bot.lastEvaluation = { t: bar.t, price: context.price, direction: 'hold', rationale: bot.status };
+      logEntry('bot', 'warn', `${bot.name} paused AI calls (daily cap ${bot.aiCallsToday}/${s.aiDailyCap})`, { botId: bot.id, bot: bot.name, symbol: s.symbol });
       return;
     }
     const richBars = (s.mode === 'ai_notepad' || s.mode === 'ai_autonomous') ? aggregateBars(bars, s.timeframe ?? '1Min').slice(-60) : bars.slice(-20);
@@ -1112,9 +1134,14 @@ async function change(path, input) {
       lastBar: previous?.symbol === s.symbol ? previous.lastBar : undefined,
       lastEvaluation: previous?.version === s.version && previous?.symbol === s.symbol ? previous.lastEvaluation : undefined
     };
+    logEntry('bot', input.action === 'running' ? 'good' : 'info', `${s.name} → ${input.action.toUpperCase()}`, { botId: s.id, bot: s.name, symbol: s.symbol, detail: `Strategy v${s.version}${budget ? ' · Budget $' + budget.toFixed(2) : ''}` });
     return state.bots[s.id];
   }
   if (path === '/api/settings') {
+    if (input.clearLogs === true) {
+      state.logs = [];
+      return { cleared: true };
+    }
     if (input.testTelegram === true) return telegram.sendTest(mode);
     if (input.removeBotAiKey === true) {
       if (typeof input.botId === 'string' && input.botId) {
