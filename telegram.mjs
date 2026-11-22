@@ -1,3 +1,7 @@
+import dns from 'node:dns';
+
+dns.setDefaultResultOrder('ipv4first');
+
 const escHtml = v => String(v ?? '').replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
 
 const icons = {
@@ -20,7 +24,7 @@ export function createTelegram(env = process.env, request = fetch) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: true }),
-      signal: AbortSignal.timeout(5500)
+      signal: AbortSignal.timeout(12000)
     });
     if (!res.ok) {
       let detail = '';
