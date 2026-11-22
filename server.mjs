@@ -80,6 +80,28 @@ async function saveBotAiProvider(provider) {
   await saveAiSecrets();
 }
 const providerFor = (s, botId = s?.id) => (botId && perBotAiProviders.get(botId)) || (s?.mode === 'ai_autonomous' && botAiProvider) || aiProvider;
+const keySourceFor = (s, botId = s?.id) =>
+  (botId && perBotAiProviders.has(botId)) ? 'Personal Bot Key' :
+  (s?.mode === 'ai_autonomous' && botAiProvider) ? 'Dedicated Bot Key' : 'Main .env Key';
+function describeAiError(error, provider, keySource) {
+  const status = error?.status;
+  const prov = provider ? `${provider.name} · ${provider.model}` : 'AI provider';
+  let hint;
+  if (status === 429 || error?.message?.includes('(429)')) {
+    hint = `Rate limit / quota hit on ${keySource} (${prov}). Backing off 5m (hard stops stay active). Tip: add a Personal Bot API Key or use 15Min/1Hour timeframe.`;
+  } else if (status === 401 || status === 403) {
+    hint = `API key rejected (${status}) on ${keySource} (${prov}). Check or replace the key in Settings or Bot Session → Advanced.`;
+  } else if (status === 404) {
+    hint = `Model not found (${prov}) on ${keySource}. Update the model name in Settings or .env.`;
+  } else if (status === 0 || error?.message?.includes('timeout')) {
+    hint = `Connection timeout to ${prov} (${keySource}). Will retry automatically on the next candle.`;
+  } else if (status >= 500) {
+    hint = `Temporary ${provider?.name ?? 'AI'} server error (${status}). Will retry automatically on the next candle.`;
+  } else {
+    hint = `${error?.message || 'AI error'} on ${keySource} (${prov}).`;
+  }
+  return error?.detail ? `${hint} Provider said: "${error.detail}"` : hint;
+}
 const terminal = new Set(['filled', 'canceled', 'expired', 'rejected', 'replaced', 'done_for_day']);
 const time = () => new Date().toISOString();
 let state = {
@@ -560,12 +582,16 @@ async function completeAI(job) {
       if (!currentCandidate(job)) return;
       if (error) {
         bot.status = error.message;
-        if (error.message.includes('(429)')) bot.aiBackoffUntil = Date.now() + 5 * 60000;
-        logEntry('ai', 'error', `${bot.name} AI error: ${error.message}`, { botId: bot.id, bot: bot.name, symbol: s.symbol, detail: provider?.name ? `Provider: ${provider.name} (${provider.model})` : '' });
+        const keySource = keySourceFor(s, bot.id);
+        const detail = describeAiError(error, provider, keySource);
+        if (error.status === 429 || error.message.includes('(429)')) bot.aiBackoffUntil = Date.now() + 5 * 60000;
+        bot.lastAiError = { t: time(), status: error.status ?? null, message: error.message, detail, keySource, provider: provider?.name ?? null, model: provider?.model ?? null };
+        logEntry('ai', 'error', `${bot.name} · ${error.message}`, { botId: bot.id, bot: bot.name, symbol: s.symbol, detail });
       } else {
         bot.status = 'Running';
         bot.aiBackoffUntil = 0;
-        logEntry('ai', model.side === 'hold' ? 'info' : 'good', `${bot.name} AI → ${model.side.toUpperCase()}${proposal.aiFreeRoam && model.side !== 'hold' ? ` (${model.allocationPct ?? 100}%)` : ''}`, { botId: bot.id, bot: bot.name, symbol: s.symbol, detail: model.rationale });
+        bot.lastAiError = null;
+        logEntry('ai', model.side === 'hold' ? 'info' : 'good', `${bot.name} AI → ${model.side.toUpperCase()}${proposal.aiFreeRoam && model.side !== 'hold' ? ` (${model.allocationPct ?? 100}%)` : ''}`, { botId: bot.id, bot: bot.name, symbol: s.symbol, detail: `${model.rationale} [${keySourceFor(s, bot.id)}]` });
         const shouldAct = proposal.aiFreeRoam ? model.side !== 'hold' : model.side === proposal.side;
         if (shouldAct && !unresolvedFor(s.symbol)) {
           try { await reconcile(); }

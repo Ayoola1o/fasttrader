@@ -732,10 +732,27 @@ function logsPage(){
      msgCell
    ];
  });
+ const aiBots=bots.filter(b=>version(key(b))?.ai);
+ const botHealthRows=aiBots.map(b=>{
+   const st=version(key(b));
+   const keySrc=state.botAiKeys?.[b.id]?`Personal (${state.botAiKeys[b.id].provider})`:(st?.mode==='ai_autonomous'&&state.botAiConfigured)?`Dedicated (${state.botAiInfo.provider})`:(state.aiConfigured?`Main .env (${state.aiProvider})`:'No key');
+   const err=b.lastAiError;
+   const backoffMin=b.aiBackoffUntil&&b.aiBackoffUntil>Date.now()?Math.ceil((b.aiBackoffUntil-Date.now())/60000):0;
+   const healthBadge=err
+     ? badge(err.status===429?'Rate Limited (429)':err.status===401||err.status===403?'Key Rejected':'AI Error','bad')
+     : backoffMin?badge(`Backoff (${backoffMin}m)`,'bad')
+     : b.desired!=='running'?badge(b.desired)
+     : badge('AI Healthy','good');
+   const errLine=err
+     ? `<small style="display:block;color:#ff8191;margin-top:3px"><b>${esc(err.message)}</b> (${stamp(err.t)}): ${esc(err.detail)}</small>`
+     : `<small style="display:block;color:var(--muted);margin-top:2px">${esc(b.lastEvaluation?.rationale||'No AI errors — waiting for next evaluation')}</small>`;
+   return `<div class="bot-row" style="align-items:flex-start"><div><a class="bot-name" href="#${sessionRoute(b)}"><b>${esc(b.name)}</b></a> <small class="mono">${esc(b.symbol)} · ${esc(st?.timeframe??'1Min')} · ${esc(keySrc)}${st?.mode==='ai_autonomous'?` · ${b.aiCallsToday??0}${st.aiDailyCap?'/'+st.aiDailyCap:''} calls today`:''}</small>${errLine}</div><div class="actions" style="flex-shrink:0">${healthBadge}${btn('Filter logs','log-bot',b.name)}</div></div>`;
+ }).join('');
+ const botHealthPanel=aiBots.length?panel('Bot AI Health & Error Diagnostics','Live AI provider status, key source, and exact failure reason for each AI bot.',botHealthRows):'';
  return page('System & bot telemetry','Activity Logs','Monitor real-time bot actions, AI decisions, trades, signals, risk alerts, and system events across your workspace.',
    btn(logsLive?'Live: ON':'Live: PAUSED','toggle-logs-live','',logsLive))+
    `<div class="metrics">${metric('Total logs',all.length,filtered.length+' matching filters','logs')}${metric('Active bots',activeBots,bots.length+' total bots configured','bot',true)}${metric('Trades & signals',tradeSig,'Executions & decisions','equity')}${metric('Warnings & errors',errWarn,errWarn?'Review alerts & 429s':'All systems clean','portfolio',errWarn>0)}</div>`+
-   `<div class="stack">${panel('Filter stream','Slice by category, bot, asset, severity, or keyword.',catTabs+filterBar)}${panel('Live event stream',`Showing ${Math.min(250,filtered.length)} of ${filtered.length} entries · ${syncLabel()}`,table(['Time','Category','Bot / Asset','Level','Event & details'],rows,'No log entries match your current filters.'))}</div>`;
+   `<div class="stack">${botHealthPanel}${panel('Filter stream','Slice by category, bot, asset, severity, or keyword.',catTabs+filterBar)}${panel('Live event stream',`Showing ${Math.min(250,filtered.length)} of ${filtered.length} entries · ${syncLabel()}`,table(['Time','Category','Bot / Asset','Level','Event & details'],rows,'No log entries match your current filters.'))}</div>`;
 }
 const renderers={dashboard,trading,session,screener,strategies,backtesting,portfolio,history:historyPage,logs:logsPage,settings,profile};
 function clearWorkspace(){
@@ -1030,6 +1047,7 @@ document.addEventListener('click',async event=>{
  if(action==='tv-range')tvRange=value;
  if(action==='tv-bot')tvBotId=value;
  if(action==='log-cat'){logFilter.category=value;render(true);return}
+ if(action==='log-bot'){logFilter.bot=value;logFilter.category='all';render(true);return}
  if(action==='toggle-logs-live'){logsLive=!logsLive;toast(logsLive?'Live log stream resumed.':'Live log stream paused.');render(true);return}
  if(action==='export-logs'){
    const rows=[['Time','Category','Level','Bot','Symbol','Message','Detail'],...combinedLogs().map(l=>[l.t??'',l.category??'',l.level??'',l.bot??'',l.symbol??'',l.message??'',l.detail??''])];

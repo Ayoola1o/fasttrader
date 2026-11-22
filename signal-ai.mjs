@@ -93,9 +93,16 @@ export async function assessSignal(provider, symbol, side, bars, request = fetch
   try {
     response = await request(url, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(12000) });
   } catch {
-    throw Error('AI provider unavailable');
+    throw Object.assign(Error('AI provider unavailable (timeout)'), { status: 0, detail: `${provider.name} did not respond within 12s.` });
   }
-  if (!response.ok) throw Error('AI provider unavailable (' + response.status + ')');
+  if (!response.ok) {
+    let detail = '';
+    try {
+      const errBody = await response.json();
+      detail = String(errBody?.error?.message ?? errBody?.message ?? '').replace(/\s+/g, ' ').trim().slice(0, 180);
+    } catch {}
+    throw Object.assign(Error('AI provider unavailable (' + response.status + ')'), { status: response.status, detail });
+  }
 
   try {
     const result = await response.json();
