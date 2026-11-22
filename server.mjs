@@ -826,9 +826,7 @@ async function change(path, input) {
       event('fills', s.name + ' adopted open ' + symbol + ' position' + (extra > 0 ? ' + $' + extra.toFixed(2) + ' funds' : ''));
       return state.bots[s.id];
     }
-    if (input.liquidate === true) {
-      const bot = state.bots[input.id];
-      if (!bot) throw Error('Bot not found.');
+    async function liquidateBotPosition(bot, { pause = false, reason = 'Manual position liquidation requested' } = {}) {
       const symbol = bot.symbol;
       if (unresolvedFor(symbol)) throw Error('Wait for the existing ' + symbol + ' order to reconcile first.');
       const position = state.positions.find(p => p.symbol === symbol && p.qty > 0);
@@ -876,8 +874,33 @@ async function change(path, input) {
       }
       bot.highWater = null;
       bot.holdBars = 0;
-      if (input.pause === true) { bot.desired = 'paused'; bot.status = 'paused'; }
-      bot.lastEvaluation = { t: time(), price: latest, direction: 'sell', rationale: 'Manual position liquidation requested' };
+      if (pause) { bot.desired = 'paused'; bot.status = 'paused'; }
+      bot.lastEvaluation = { t: time(), price: latest, direction: 'sell', rationale: reason };
+      return { order, qty, symbol };
+    }
+    if (input.delete === true) {
+      const bot = state.bots[input.id];
+      if (!bot) throw Error('Bot not found.');
+      const symbol = bot.symbol;
+      const position = state.positions.find(p => p.symbol === symbol && p.qty > 0);
+      let order = null;
+      if (input.liquidate === true && position) {
+        const closed = await liquidateBotPosition(bot, { pause: false, reason: 'Bot deleted — position liquidated' });
+        order = closed.order;
+      }
+      delete state.bots[bot.id];
+      const details = order
+        ? [`Bot: ${bot.name}`, `Liquidated ${order.qty} ${symbol} at market`]
+        : position
+          ? [`Bot: ${bot.name}`, `Left open ${position.qty} ${symbol} position unmanaged`]
+          : [`Bot: ${bot.name}`, 'No open position'];
+      event('risk', `Deleted bot · ${bot.name}`, details);
+      return { deleted: bot.id, liquidated: Boolean(order), leftOpen: Boolean(!order && position), order };
+    }
+    if (input.liquidate === true) {
+      const bot = state.bots[input.id];
+      if (!bot) throw Error('Bot not found.');
+      const { order, qty, symbol } = await liquidateBotPosition(bot, { pause: input.pause === true });
       event('risk', `Manual liquidation · ${symbol}`, [`Bot: ${bot.name}`, `Submitted market sell for ${qty} ${symbol}`]);
       return { bot, order };
     }

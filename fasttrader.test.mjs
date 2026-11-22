@@ -327,13 +327,20 @@ test('screen, version, replay and execute a demo strategy, then pause safely thr
     // Top up additional funds while bot is running
     const topped = await api('bot',{topUp:true,id:version.id,addFunds:350});
     assert.equal(topped.budget, 1000);
-    // Manual liquidation closes open position if held, or rejects cleanly if flat
+    // Delete bot (without liquidating QQQ, and deleting SPY bot)
+    const delQqq = await api('bot', { delete: true, id: qqq.id, liquidate: false });
+    assert.equal(delQqq.deleted, qqq.id);
+    assert.equal(delQqq.liquidated, false);
+    assert.equal((await api('state')).bots[qqq.id], undefined);
+    // Manual liquidation closes open position if held, then delete bot
     const cur = await api('state');
     if (cur.positions.some(p => p.symbol === 'SPY' && p.qty > 0)) {
-      const closed = await api('bot', { liquidate: true, id: version.id, pause: true });
-      assert.equal(closed.order.side, 'sell');
-      assert.equal(closed.bot.desired, 'paused');
+      const delSpy = await api('bot', { delete: true, id: version.id, liquidate: true });
+      assert.equal(delSpy.deleted, version.id);
+      assert.equal(delSpy.liquidated, true);
+      assert.equal(delSpy.order.side, 'sell');
       assert.ok(!(await api('state')).positions.some(p => p.symbol === 'SPY' && p.qty > 0));
+      assert.equal((await api('state')).bots[version.id], undefined);
     }
   });
 });

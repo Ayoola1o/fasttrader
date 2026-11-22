@@ -39,7 +39,7 @@ let state=null,online=false,active='',selected='',chartMode='Price',range='1H',a
 const ranges={'15M':15,'1H':60,'4H':240,'1D':1440};
 const screen={search:'',volume:0,volatility:0};
 const cryptoScreen={search:'',volume:0,volatility:0};
-let botFilter='all', launchVersion=null, launchInstrument=null, launchBudget='', fundBudget=null;
+let botFilter='all', launchVersion=null, launchInstrument=null, launchBudget='', fundBudget=null, deleteBotId=null;
 let notifOpen=false, notifFilter='all', lastSeenNotif='', avatarDraft=null;
 let tvStyle='Candles', tvRange='1H', tvBotId='';
 let historyTab='orders';
@@ -235,7 +235,7 @@ function trading(){
      `<a class="bot-name" href="#${sessionRoute(b)}"><b>${esc(b.name)}</b></a>`,esc(b.symbol)+' · v'+b.version,
      badge({running:'Active',paused:'Paused',stopped:'Stopped'}[b.desired],b.desired==='running'&&b.status.toLowerCase()==='running'?'good':'')+detail,
      b.budget?usd(b.budget):badge('Budget required'),stamp(b.lastBar),latestOrder?badge(latestOrder.status)+' <small>'+stamp(latestOrder.t)+'</small>':'—',
-     '<div class="actions">'+controls+(b.desired!=='stopped'?command('Stop','stopped'):'')+'</div>'
+     '<div class="actions">'+controls+(b.desired!=='stopped'?command('Stop','stopped'):'')+btn('Delete','open-delete-bot',b.id,false,`style="color:#ff8191;border-color:#592e42" ${disabled}`)+'</div>'
    ];
  });
  const mode=state.mode==='demo'?'Demo paper trading':'Alpaca Paper';
@@ -284,6 +284,7 @@ function session(){
  const topUpForm=form('topup-bot',numeric('Add additional funds (USD)','addFunds','',1,1e9),submit('Add funds to bot',!online));
  const risk=bot.desired==='running'&&bot.budget?topUpForm:form('fund-bot',select('Strategy version','version',[['','Choose a strategy version'],...versions],selectedVersion,true)+numeric('Bot budget (USD)','budget',fundBudget??bot.budget??'',1,1e9),
        submit(bot.desired==='running'?'Set budget':bot.desired==='paused'?'Resume bot':'Restart bot',!online))+topUpForm;
+ const deleteControl=`<div class="form" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--line)"><div class="actions">${btn('Delete bot','open-delete-bot',bot.id,false,`style="background:#39212e;color:#ff8191;border-color:#592e42" ${!online?'disabled':''}`)}</div><small style="color:var(--muted)">Choose whether to liquidate any open position or leave it open when deleting.</small></div>`;
  const positionRows=holding?[[esc(bot.symbol),qtyText(book.qty),book.complete?usd(book.cost/book.qty):'—',usd(book.mark),
    Number.isFinite(book.mark)?usd(book.qty*book.mark):'—',moneyChange(book.unrealized)]]:[];
  const filled=botOrders.filter(order=>order.filled>0);
@@ -298,7 +299,7 @@ function session(){
    '<div class="grid equal">'+panel('Position',positionStatus,table(['Asset','Units held','Average cost','Mark','Market value','Open P&L'],positionRows,'No open position held by this bot.'))+
    panel('Bot controls','Last evaluated '+stamp(bot.lastBar)+' · '+open.length+' open orders',
      '<div class="form"><div class="actions">'+badge(botStatus(bot))+'<small>Started '+stamp(bot.started)+'</small></div>'+
-     '<small>'+usd(book.reserved)+' reserved for pending buys</small></div>'+controls+liquidateControls+risk)+'</div>'+
+     '<small>'+usd(book.reserved)+' reserved for pending buys</small></div>'+controls+liquidateControls+risk+deleteControl)+'</div>'+
    '<div class="stack">'+panel('Latest evaluation',bot.lastEvaluation?stamp(bot.lastEvaluation.t)+' · '+usd(bot.lastEvaluation.price):'Waiting for an evaluated bar',
      bot.lastEvaluation?'<div class="bot-row"><span>'+esc(bot.lastEvaluation.rationale)+'</span>'+badge(bot.lastEvaluation.direction)+'</div>':empty(botStatus(bot)))+
    panel('Orders and executions',`${filled.length} filled or partially filled orders · ${usd(book.bought)} bought · ${usd(book.sold)} sold`,
@@ -630,6 +631,30 @@ function authenticationView(){
  return `<section class="panel auth-card"><div class="auth-heading"><img src="/mark.svg" alt=""><h1>${title}</h1><p class="sub">${signup?'Use the setup code from your trading worker to claim this workspace.':'Access your paper trading workspace.'}</p></div>
    <form class="form" id="authenticate" method="post" action="/api/auth">${fields}<div class="actions"><button class="button primary">${signup?'Create account':'Sign in'}</button>${switchMode}</div></form></section>`;
 }
+function renderDeleteModal(){
+ if(!deleteBotId||!state?.bots?.[deleteBotId])return '';
+ const bot=state.bots[deleteBotId];
+ const book=state.botSessions?.[bot.id]??{};
+ const brokerPos=state.positions.find(p=>p.symbol===bot.symbol&&p.qty>0);
+ const openQty=brokerPos?.qty||book.qty||0;
+ const hasPos=openQty>0;
+ const posVal=brokerPos&&Number.isFinite(brokerPos.price)?usd(brokerPos.qty*brokerPos.price):'';
+ return `<div style="position:fixed;inset:0;z-index:200;background:rgba(4,9,18,.78);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;padding:16px">
+   <section class="panel" role="dialog" aria-modal="true" style="max-width:460px;width:100%;border-color:#592e42;box-shadow:0 24px 60px rgba(0,0,0,.6)">
+     <div class="panel-head"><div><h2 style="color:#ff8191">Delete "${esc(bot.name)}"?</h2><small>${esc(bot.symbol)} · Strategy v${bot.version}</small></div></div>
+     <div class="form">
+       ${hasPos
+         ? `<div class="notice" style="background:#39212e;border-color:#592e42;color:#ffd0d7"><strong>Warning:</strong> Open ${esc(bot.symbol)} position detected (${qtyText(openQty)} units${posVal?' · '+posVal:''}). Choosing <b>Liquidate &amp; Delete</b> will immediately sell all open ${esc(bot.symbol)} units at market price. Choosing <b>Delete &amp; Leave Position</b> removes the bot while leaving your ${esc(bot.symbol)} position open at the broker.</div>`
+         : `<p style="margin:0;color:var(--muted);font-size:.9rem">This bot has no open ${esc(bot.symbol)} position. Deleting it removes it from Live Trading while keeping your saved strategy version and order history.</p>`}
+       <div class="actions" style="flex-wrap:wrap;gap:8px;margin-top:6px">
+         ${hasPos?btn('Liquidate &amp; Delete bot','confirm-delete-bot',bot.id,false,'data-liquidate="true" style="background:#6e1f32;color:#fff;border-color:#a1304b"'):''}
+         ${btn(hasPos?'Delete bot &amp; Leave position':'Delete bot','confirm-delete-bot',bot.id,false,`data-liquidate="false" style="background:${hasPos?'#2a2418':'#6e1f32'};color:${hasPos?'#ffd68a':'#fff'};border-color:${hasPos?'#6e5726':'#a1304b'}"`)}
+         ${btn('Cancel','cancel-delete-bot')}
+       </div>
+     </div>
+   </section>
+ </div>`;
+}
 function render(force=false){
  const signedOut=authInfo?.required&&!authInfo.authenticated;
  const hostedUnreachable=!localWorkspace&&!authInfo&&!state;
@@ -654,7 +679,7 @@ function render(force=false){
  if(!state){main.innerHTML=empty('Connect to FastTrader to load the workspace.');main.dataset.html='';return}
  if(!force&&!changed&&(pending||document.activeElement?.closest('form, .plot, #run-select')||main.querySelector('.plot:hover')))return;
  if(!force&&!changed&&['backtesting','profile'].includes(active))return;
- const markup=renderers[active]();
+ const markup=renderers[active]()+renderDeleteModal();
  if(markup!==main.dataset.html){main.innerHTML=markup;main.dataset.html=markup}
 }
 async function api(path,data){
@@ -771,6 +796,32 @@ document.addEventListener('click',async event=>{
  if(action==='close-notifs'){notifOpen=false;chrome();return}
  if(action==='notif-filter'){notifFilter=value;renderNotifDrawer();return}
  if(action==='mark-notifs-read'){if(state.events?.[0])lastSeenNotif=state.events[0].t;chrome();toast('Notifications marked read.');return}
+ if(action==='open-delete-bot'){
+   if(!online||pending){toast('The workspace is reconnecting.');return}
+   deleteBotId=value;
+   render(true);
+   return;
+ }
+ if(action==='cancel-delete-bot'){
+   deleteBotId=null;
+   render(true);
+   return;
+ }
+ if(action==='confirm-delete-bot'){
+   if(!online||pending){toast('The workspace is reconnecting.');return}
+   const liquidate=el.dataset.liquidate==='true';
+   const bot=state.bots[value];
+   pending=true;el.disabled=true;
+   try{
+     const res=await api('bot',{delete:true,id:value,liquidate});
+     deleteBotId=null;
+     toast(res.liquidated?`Deleted ${bot?.name??'bot'} & submitted market sell for ${bot?.symbol??'position'}.`:res.leftOpen?`Deleted ${bot?.name??'bot'}. Open ${bot?.symbol??'position'} left unmanaged.`:`Deleted ${bot?.name??'bot'}.`);
+     if(active==='session'&&params().get('id')===value)location.hash='#trading';
+     await refresh(true);
+   }catch(error){toast(error.message)}
+   finally{pending=false;el.disabled=false}
+   return;
+ }
  if(action==='liquidate-bot'){
    if(!online||pending){toast('The workspace is reconnecting.');return}
    const sym=el.dataset.symbol||'position', pause=el.dataset.pause==='true';
@@ -1054,7 +1105,7 @@ document.addEventListener('keydown',event=>{
 });
 window.addEventListener('hashchange',()=>{
  const route=location.hash.split('?')[0];
- notifOpen=false;
+ notifOpen=false;deleteBotId=null;
  if(route==='#trading'){launchVersion=null;launchInstrument=null;launchBudget=''}
  if(route==='#session')fundBudget=null;
  if(state&&route==='#strategies'&&params().has('new')&&!params().has('symbol'))editor=fresh();
