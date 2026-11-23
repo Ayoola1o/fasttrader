@@ -352,11 +352,18 @@ export function strategy(input, supportsSymbol = symbol => Object.hasOwn(instrum
   const aiDailyCap = input.aiDailyCap === undefined ? 100 : input.aiDailyCap;
   if (!Number.isInteger(aiDailyCap) || aiDailyCap < 0 || aiDailyCap > 500) throw Error('Daily AI call cap must be a whole number between 0 and 500.');
   result.aiDailyCap = aiDailyCap;
+  if (input.knowledgeIds !== undefined && (!Array.isArray(input.knowledgeIds) || input.knowledgeIds.length > 3 ||
+    !input.knowledgeIds.every(id => typeof id === 'string' && /^[a-f0-9-]{36}$/.test(id)))) {
+    throw Error('Select up to three uploaded strategy documents.');
+  }
+  if (result.mode === 'ai_notepad' || result.mode === 'ai_autonomous') {
+    result.knowledgeIds = [...new Set(input.knowledgeIds ?? [])];
+  }
   if (Object.hasOwn(strategyPlaybooks, input.playbookId)) result.playbookId = input.playbookId;
   result.rules = sanitizeRules(input.rules);
   if (result.mode === 'custom' && (!result.rules || !result.rules.entry.length)) throw Error('Add at least one entry rule for a custom strategy.');
   if (result.mode === 'ai_notepad') {
-    if (result.aiNotes.length < 10) throw Error('Write your trading strategy instructions in the AI Notepad (at least 10 characters).');
+    if (result.aiNotes.length < 10 && !result.knowledgeIds.length) throw Error('Write at least 10 characters in AI Notepad or select an uploaded strategy document.');
     result.ai = true;
   }
   if (result.mode === 'ai_autonomous') {

@@ -550,6 +550,42 @@ test('AI bots send isolated confirmations concurrently and pausing discards an i
   }
 });
 
+test('AI Notepad evaluates excerpts from selected strategy uploads only', async () => {
+  let input;
+  const gemini = createServer(async (req, res) => {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    input = JSON.parse(JSON.parse(body).contents[0].parts[0].text);
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ candidates: [{ finishReason: 'STOP', content: { parts: [
+      { text: JSON.stringify({ side: 'hold', rationale: 'Waiting for a pullback.' }) }
+    ] } }] }));
+  });
+  await new Promise(resolve => gemini.listen(0, '127.0.0.1', resolve));
+  try {
+    await withWorker(async (api, until) => {
+      const selected = await api('knowledge', { name: 'pullback.md', text: 'Entry: buy after a confirmed pullback.' });
+      await api('knowledge', { name: 'unused.txt', text: 'Entry: unselected document marker.' });
+      const before = await api('state');
+      assert.equal(before.knowledge.length, 2);
+      assert.ok(before.knowledge.every(file => !Object.hasOwn(file, 'text')));
+      const s = await api('strategy', {
+        ...defaults, name: 'Document-only strategy', mode: 'ai_notepad', period: 2, knowledgeIds: [selected.id]
+      });
+      await api('bot', { id: s.id, version: s.version, action: 'running', budget: 2000 });
+      const signal = await until(async () => (await api('state')).signals.find(item => item.strategyId === s.id));
+      assert.deepEqual(input.context.knowledge, [
+        { name: 'pullback.md', excerpts: ['Entry: buy after a confirmed pullback.'] }
+      ]);
+      assert.deepEqual(signal.knowledgeSources, ['pullback.md']);
+      assert.equal(signal.direction, 'hold');
+    }, 'http://127.0.0.1:' + gemini.address().port);
+  } finally {
+    gemini.closeAllConnections();
+    await new Promise(resolve => gemini.close(resolve));
+  }
+});
+
 test('offline navigation can reopen the cached shell while API data stays network-only', async () => {
   const handlers = {};
   const source = await readFile(new URL('./public/sw.js', import.meta.url), 'utf8');

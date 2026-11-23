@@ -547,6 +547,20 @@ function quotePrice(symbol, bar) {
 }
 
 const botOrders = id => state.orders.filter(order => order.owned && order.strategyId === id);
+function strategyKnowledge(s, side, freeRoam) {
+  const focus = freeRoam ? /\b(entry|buy|exit|sell|setup|stop|risk|hold)\b/gi :
+    side === 'buy' ? /\b(entry|buy|setup|stop|risk|avoid)\b/gi : /\b(exit|sell|stop|risk|hold|target)\b/gi;
+  return (s.knowledgeIds ?? []).flatMap(id => {
+    const file = state.knowledge?.find(item => item.id === id);
+    if (!file) return [];
+    const chunks = file.text.split(/\n\s*\n/).flatMap(paragraph => paragraph.match(/[\s\S]{1,1500}/g) ?? []);
+    const ranked = chunks.map((text, index) => ({ text, index, score: (text.match(focus) ?? []).length }));
+    const excerpts = ranked.toSorted((a, b) => b.score - a.score).slice(0, 3)
+      .sort((a, b) => a.index - b.index).map(chunk => chunk.text);
+    return [{ name: file.name, excerpts }];
+  });
+}
+
 const hasBudget = budget => Number.isFinite(budget) && budget >= 1 && budget <= 1e9;
 function reservedBuys(orders) {
   let reserved = 0;
@@ -664,6 +678,7 @@ async function completeAI(job) {
     const recentDecisions = s.mode === 'ai_autonomous'
       ? state.signals.filter(sig => sig.strategyId === bot.id).slice(0, 5).map(sig => ({ t: sig.t, side: sig.direction, rationale: sig.rationale }))
       : undefined;
+    const knowledge = proposal.aiAutonomous ? strategyKnowledge(s, proposal.side, proposal.aiFreeRoam) : [];
     model = await assessSignal(provider, s.symbol, proposal.side, bars, fetch, {
       price, rationale: proposal.rationale, period: s.period, mode: s.mode ?? 'momentum', timeframe: s.timeframe ?? '1Min',
       ...(proposal.aiAutonomous ? { aiAutonomous: true, aiNotes: s.aiNotes, indicators } : {}),
@@ -674,9 +689,11 @@ async function completeAI(job) {
         recentDecisions
       } : {}),
       ...(s.aiPrompt ? { aiPrompt: s.aiPrompt } : {}),
+      ...(knowledge.length ? { knowledge } : {}),
       ...(headlines.length ? { headlines } : {}),
       position: position ? { qty: position.qty, entry: position.entry, pnlPct: Number((100 * (price / position.entry - 1)).toFixed(2)) } : null
     });
+    if (knowledge.length) model.knowledgeSources = knowledge.map(file => file.name);
   } catch (failure) { error = failure; }
   activeAI--;
   drainAI();
@@ -840,7 +857,8 @@ async function applySignal(candidate, model = null) {
   const allocSuffix = proposal.aiFreeRoam && model && model.side !== 'hold' && s.aiSizing === 'dynamic' ? ` [${model.allocationPct ?? 100}% size]` : '';
   const signal = {
     t: time(), symbol: s.symbol, direction: model?.side ?? proposal.side, rationale: (model?.rationale ?? proposal.rationale) + allocSuffix,
-    strategyId: s.id, strategy: s.name, version: s.version, source: model ? (provider?.name ?? 'AI') : 'Strategy rules'
+    strategyId: s.id, strategy: s.name, version: s.version, source: model ? (provider?.name ?? 'AI') : 'Strategy rules',
+    ...(model?.knowledgeSources ? { knowledgeSources: model.knowledgeSources } : {})
   };
   state.signals.unshift(signal);
   bot.lastEvaluation = { ...bot.lastEvaluation, t: bar.t, direction: signal.direction, rationale: signal.rationale };
@@ -1370,7 +1388,8 @@ function snapshot() {
     return [bot.id, { ...ledger, available: reserved === null ? 0 : Math.max(0, ledger.available - reserved), reserved, mark, unrealized }];
   }));
   return {
-    ...state, botSessions, orders: state.orders.toSorted((a, b) => (b.t ?? '').localeCompare(a.t ?? '')).slice(0, 500),
+    ...state, botSessions, knowledge: (state.knowledge ?? []).map(({ text, ...file }) => file),
+    orders: state.orders.toSorted((a, b) => (b.t ?? '').localeCompare(a.t ?? '')).slice(0, 500),
     runs: state.runs.map(({ curve, trades, ...run }) => ({
       ...run, curve: curve.filter((_, idx) => idx % Math.ceil(curve.length / 650) === 0 || idx === curve.length - 1),
       tradeCount: trades.length, trades: trades.slice(-250)
@@ -1392,6 +1411,24 @@ async function body(req, limit = 20000) {
   return JSON.parse(raw || '{}');
 }
 async function change(path, input) {
+  if (path === '/api/knowledge') {
+    const name = typeof input.name === 'string' ? input.name.trim() : '';
+    const text = typeof input.text === 'string' ? input.text.replace(/^\uFEFF/, '').trim() : '';
+    if (name.length > 120 || /[\\/\x00-\x1f]/.test(name) || !/\.(txt|md|markdown)$/i.test(name)) {
+      throw Error('Upload a .txt or .md strategy document with a filename up to 120 characters.');
+    }
+    const bytes = Buffer.byteLength(text);
+    if (bytes < 10 || bytes > 32768 || /[\x00-\x08\x0b\x0c\x0e-\x1f\uFFFD]/.test(text)) {
+      throw Error('Use a UTF-8 text document between 10 bytes and 32 KB.');
+    }
+    state.knowledge ??= [];
+    const existing = state.knowledge.find(file => file.name === name && file.text === text);
+    if (existing) return { id: existing.id, name, bytes, uploadedAt: existing.uploadedAt };
+    if (state.knowledge.length >= 30) throw Error('This workspace already has 30 strategy documents.');
+    const file = { id: randomUUID(), name, bytes, uploadedAt: time() };
+    state.knowledge.unshift({ ...file, text });
+    return file;
+  }
   if (path === '/api/strategy') {
     const mutation = typeof input.mutation === 'string' && /^[a-f0-9-]{36}$/.test(input.mutation) ? input.mutation : null;
     const recorded = mutation && state.strategies.find(item => item.mutation === mutation);
@@ -1401,6 +1438,9 @@ async function change(path, input) {
     const latest = state.strategies.findLast(item => item.id === id);
     if (latest && latest.version !== input.baseVersion) throw Error('Strategy changed. Review the latest version before saving.');
     const item = { ...validateStrategy(input), id, version: (latest?.version ?? 0) + 1, mutation, sourceStrategy: latest?.sourceStrategy };
+    if (item.knowledgeIds?.some(id => !state.knowledge?.some(file => file.id === id))) {
+      throw Error('Select strategy documents from this workspace.');
+    }
     state.strategies.push(item);
     if (item.mode === 'ai_autonomous' && !state.bots[id]) {
       const now = Date.now();
@@ -1787,7 +1827,7 @@ const server = createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/api/state') return respond(200, snapshot());
     if (req.method === 'POST' && url.pathname === '/api/assets') return respond(200, searchAssets(await body(req, 2000)));
     if (req.method === 'POST' && url.pathname.startsWith('/api/')) {
-      const input = await body(req, url.pathname === '/api/profile' ? 220000 : 20000);
+      const input = await body(req, ['/api/profile', '/api/knowledge'].includes(url.pathname) ? 220000 : 20000);
       if (url.pathname === '/api/strategy-preview') return respond(200, await previewStrategy(input));
       const result = url.pathname === '/api/backtest' ? await backtest(input) : await serial(async () => {
         if (!auth.authenticated(req.headers.cookie)) throw Object.assign(Error('Sign in to FastTrader.'), { status: 401 });

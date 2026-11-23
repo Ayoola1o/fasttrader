@@ -403,7 +403,8 @@ function session(){
      ]),'No orders yet.'))+
    panel('Signal history','Trade decisions and AI holds for this bot.',
      table(['Time','Direction','Rationale','Source'],signals.map(signal=>[
-       stamp(signal.t),badge(signal.direction),esc(signal.rationale),esc(signal.source)
+       stamp(signal.t),badge(signal.direction),esc(signal.rationale)+(signal.knowledgeSources?.length?
+         '<small>References supplied to AI: '+esc(signal.knowledgeSources.join(', '))+'</small>':''),esc(signal.source)
      ]),'No signals recorded for this bot yet.'))+'</div>';
 }
 const catalogTypes={us_equity:'US equities & ETFs',crypto:'Spot crypto',us_option:'US options',crypto_perp:'Crypto perpetuals',treasury:'Treasuries',corporate:'Corporate bonds',global_equity:'Global equities',us_index:'US indices',us_equity_chain:'US equity chains',ipo:'IPOs'};
@@ -565,6 +566,25 @@ function renderPlaybooks(){
  }).join('')+'</div>';
 }
 
+function renderKnowledgeLibrary(){
+ const documents=state.knowledge??[];
+ const files=documents.map(file=>'<div class="library-item"><div><b>'+esc(file.name)+'</b><small>'+num(file.bytes/1024)+' KB · '+stamp(file.uploadedAt)+'</small></div></div>').join('');
+ const upload='<form id="knowledge-upload" class="form"><label class="field"><span>Strategy document</span>'+
+   '<input type="file" name="document" accept=".txt,.md,.markdown" required'+(online?'':' disabled')+'></label>'+
+   '<small>UTF-8 text or Markdown, up to 32 KB per file. To use a document, select it in an AI strategy and save a version.</small>'+
+   '<div class="actions">'+submit('Upload document',!online)+'</div></form>';
+ return panel('Trading knowledge base','Upload your own strategy notes, rules, or playbooks.',upload+(files||empty('No documents uploaded yet.')));
+}
+
+function knowledgePicker(){
+ const selected=editor.knowledgeIds??[];
+ const files=state.knowledge??[];
+ const rows=files.map(file=>'<label class="check"><input type="checkbox" name="knowledgeId" value="'+esc(file.id)+'"'+
+   (selected.includes(file.id)?' checked':'')+'><span>'+esc(file.name)+'</span></label>').join('');
+ return '<small>Choose up to three documents. Relevant excerpts from these files are sent to the configured AI provider during evaluation.</small>'+
+   (rows||'<small>No uploaded documents.</small>')+'<div class="actions">'+btn('Manage documents','open-playbook-library')+'</div>';
+}
+
 function strategies(){
  const route=location.hash, requested=params().get('symbol');
  if(editorRoute!==route){
@@ -584,7 +604,8 @@ function strategies(){
  const isAutonomous=editor.mode==='ai_autonomous';
  const editorSwitcher=`<div class="tabs" role="tablist" aria-label="Strategy workspace">${btn('Visual Rule Builder','editor-type','visual',false,`role="tab" aria-selected="${!playbookLibraryOpen&&!isNotepad&&!isAutonomous}"`)}${btn('AI Strategy Notepad','editor-type','ai_notepad',false,`role="tab" aria-selected="${!playbookLibraryOpen&&isNotepad}"`)}${btn('Autonomous AI','editor-type','ai_autonomous',false,`role="tab" aria-selected="${!playbookLibraryOpen&&isAutonomous}"`)}${btn('Strategy Library','open-playbook-library','',false,`role="tab" aria-selected="${playbookLibraryOpen}"`)}</div>`;
  if(playbookLibraryOpen){
-   return '<div class="strategy-page">'+page('Paper trading','Strategy Library','Browse published playbooks and open a draft to edit and backtest.')+editorSwitcher+renderPlaybooks()+'</div>';
+   return '<div class="strategy-page">'+page('Paper trading','Strategy Library','Upload trading knowledge or create a draft from a published playbook.')+editorSwitcher+
+     '<div class="editor-flow">'+renderKnowledgeLibrary()+renderPlaybooks()+'</div></div>';
  }
  const playbook=Object.hasOwn(strategyPlaybooks,editor.playbookId)?strategyPlaybooks[editor.playbookId]:null;
  const startTrade=s=>link('Start trade','trading?version='+encodeURIComponent(key(s)),true);
@@ -623,7 +644,7 @@ function strategies(){
      `<div class="bot-row"><span><b>Hard safety net</b><small>SL -${editor.stop??5}% · Trail ${editor.trailingStop??3}% · Daily cap -${editor.dailyLoss??6}%</small></span>${badge('Hard-coded','good')}</div>`+
      `<div class="bot-row"><span><b>Fee-aware prompting</b><small>${feeInfo} · Cooldown ${editor.cooldown??2} bars</small></span>${badge(editor.aiWakeMode==='fixed'?'Fixed':'Smart Wake')}</div>`+
      `<div class="form" style="padding-top:4px">${link('Manage Dedicated AI Bot Key in Settings','settings')}</div>`);
-   return workspace(group('Strategy setup',autoBase)+group('AI guidance',guidanceBox,'editor-flow')+
+   return workspace(group('Strategy setup',autoBase)+group('AI guidance',guidanceBox,'editor-flow')+group('Knowledge sources',knowledgePicker(),'editor-flow')+
      group('Risk limits',riskButtons+'<div class="fields">'+autoRisk+'</div>','editor-flow'),autoCard,hiddenAuto);
  }
  if(isNotepad){
@@ -634,9 +655,9 @@ function strategies(){
      select('Candle timeframe','timeframe',tfOptions,editor.timeframe??'15Min',true);
    const noteRisk=[['Position size (% equity)','size',.1,100],['Maximum exposure (% equity)','exposure',.1,100],['Stop-loss (%)','stop',.1,50],['Trailing stop (%, 0=off)','trailingStop',0,50,.1],['Take-profit (%)','take',.1,100],['Maximum daily loss (%)','dailyLoss',.1,50],['Stop-loss cooldown (bars)','cooldown',0,60,1],['Max hold (bars, 0=off)','maxHoldBars',0,1440,1]].map(([label,k,min,max,step])=>numeric(label,k,editor[k]??defaultParams[k],min,max,step)).join('');
    const hiddenDefaults=`<input type="hidden" name="mode" value="ai_notepad"><input type="hidden" name="period" value="${editor.period??12}"><input type="hidden" name="entry" value="${editor.entry??0.1}"><input type="hidden" name="exit" value="${editor.exit??-0.1}"><input type="hidden" name="atrStop" value="${editor.atrStop??0}"><input type="checkbox" name="ai" checked hidden>`;
-   const notepadBox=`<label class="field notepad-field"><span>Write your strategy for the AI (plain English rules, entries, exits, news &amp; candle conditions)</span><textarea name="aiNotes" class="ai-notepad" rows="12" required minlength="10" maxlength="4000" placeholder="Example:\nBUY when price is above EMA 20 and RSI(14) pulls back below 40 with no bearish news.\nSELL when RSI(14) > 72 or price drops below EMA 20.\nOtherwise HOLD.">${esc(editor.aiNotes??'')}</textarea><small>${(editor.aiNotes??'').length} / 4000 characters · ${state.aiConfigured?esc(state.aiProvider)+' will read these notes + live candles, EMA/SMA/RSI/ATR, position P&amp;L, and Alpaca News on every bar.':'Configure GEMINI_API_KEY or OPENAI_API_KEY in server env to run AI Notepad bots.'}</small></label>`;
+   const notepadBox=`<label class="field notepad-field"><span>Trading instructions (optional when a document is selected)</span><textarea name="aiNotes" class="ai-notepad" rows="12" maxlength="4000" placeholder="Example:\nBUY when price is above EMA 20 and RSI(14) pulls back below 40 with no bearish news.\nSELL when RSI(14) > 72 or price drops below EMA 20.\nOtherwise HOLD.">${esc(editor.aiNotes??'')}</textarea><small>${(editor.aiNotes??'').length} / 4000 characters · ${state.aiConfigured?esc(state.aiProvider)+' will read these notes + live candles, EMA/SMA/RSI/ATR, position P&amp;L, and Alpaca News on every bar.':'Configure GEMINI_API_KEY or OPENAI_API_KEY in server env to run AI Notepad bots.'}</small></label>`;
    const guardCard=panel('AI Notepad guardrails','Hard risk limits always stay enforced in code',`<div class="bot-row"><span><b>AI engine</b><small>${state.aiConfigured?esc(state.aiProvider)+' active':'API key required'}</small></span>${badge(state.aiConfigured?'Ready':'Unconfigured',state.aiConfigured?'good':'bad')}</div><div class="bot-row"><span><b>Protective exits</b><small>Stop-loss ${editor.stop??2}% · Trail ${editor.trailingStop??0}% · Take-profit ${editor.take??4}%</small></span>${badge('Hard-coded','good')}</div><div class="bot-row"><span><b>Live context sent to AI</b><small>OHLCV candles, SMA12, EMA20/50, RSI14, ATR14, open P&amp;L &amp; Alpaca News</small></span>${badge(editor.timeframe??'15Min')}</div>`);
-   return workspace(group('Strategy setup',noteBase)+group('Trading instructions',noteTemplates+notepadBox,'editor-flow')+
+   return workspace(group('Strategy setup',noteBase)+group('Trading instructions',noteTemplates+notepadBox,'editor-flow')+group('Knowledge sources',knowledgePicker(),'editor-flow')+
      group('Position sizing and risk',sizingMode+numeric('Fixed size (USD)','sizeUsd',editor.sizeUsd??500,1,1e9,1)+noteRisk),guardCard,hiddenDefaults);
  }
  const templatesBar=`<div class="template-bar"><span class="section-label">1-Click Templates</span><div class="actions">${Object.entries(strategyTemplates).map(([k,t])=>btn(t.label,'apply-template',k)).join('')}</div></div>`;
@@ -1157,6 +1178,11 @@ const values=form=>Object.fromEntries(new FormData(form));
 function capture(form){
  const data=values(form);
  delete data.version;
+ delete data.knowledgeId;
+ if(['ai_notepad','ai_autonomous'].includes(data.mode)){
+   const ids=[...form.querySelectorAll('[name="knowledgeId"]:checked')].map(input=>input.value);
+   data.knowledgeIds=JSON.stringify(ids)===JSON.stringify(editor.knowledgeIds??[])?editor.knowledgeIds??[]:ids;
+ }
  if(data.symbol!==undefined)data.symbol=data.symbol.trim().toUpperCase();
  for(const [,k]of fields)if(data[k]!==undefined)data[k]=+data[k];
  if(data.aiDailyCap!==undefined)data.aiDailyCap=+data.aiDailyCap;
@@ -1707,6 +1733,13 @@ document.addEventListener('submit',async event=>{
      if(online)await save();
      else{editor.queued=true;if(!authInfo?.required)write('ft-draft',editor);toast('Draft queued for reconnection.')}
    }
+    if(form.id==='knowledge-upload'){
+      const file=data.document;
+      if(!file?.size||file.size>32768)throw Error('Choose a UTF-8 text or Markdown file up to 32 KB.');
+      await api('knowledge',{name:file.name,text:await file.text()});
+      form.reset();
+      toast('Strategy document uploaded.');
+    }
    if(form.id==='backtest'){
      if(control)control.textContent='Running…';
      const [id,version]=data.version.split('@');

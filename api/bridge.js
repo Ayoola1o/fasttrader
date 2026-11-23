@@ -1,5 +1,5 @@
 const getRoutes = new Set(['auth', 'state']);
-const postRoutes = new Set(['auth', 'assets', 'strategy', 'strategy-preview', 'bot', 'settings', 'profile', 'demo', 'backtest']);
+const postRoutes = new Set(['auth', 'assets', 'strategy', 'strategy-preview', 'knowledge', 'bot', 'settings', 'profile', 'demo', 'backtest']);
 const json = (status, error) => Response.json({ error }, { status, headers: { 'Cache-Control': 'no-store' } });
 const maxBodyBytes = 220000;
 
