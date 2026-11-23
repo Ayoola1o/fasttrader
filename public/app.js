@@ -46,7 +46,7 @@ const portfolioRanges={'1D':1,'1W':7,'1M':30,'3M':90,'1Y':365,'ALL':Infinity};
 const ranges={'15M':15,'1H':60,'4H':240,'1D':1440};
 const screen={search:'',volume:0,volatility:0};
 const cryptoScreen={search:'',volume:0,volatility:0};
-let botFilter='all', launchVersion=null, launchInstrument=null, launchBudget='', fundBudget=null, deleteBotId=null;
+let botFilter='all', launchVersion=null, launchInstrument=null, launchBudget='', fundBudget=null, deleteBotId=null, killSwitchModal=false, stateEtag='';
 let notifOpen=false, notifFilter='all', lastSeenNotif='', avatarDraft=null;
 let tvStyle='Candles', tvRange='1H', tvBotId='';
 let historyTab='orders';
@@ -114,7 +114,7 @@ function renderNotifDrawer(){
   <div class="notif-foot"><a class="button" href="#settings" data-action="close-notifs">Alert preferences &amp; Integrations →</a></div>`;
 }
 let chartId=0;
-function plot(points,unit='price',accent='#4be4b2'){
+function plot(points,unit='price',accent='#4be4b2',markers=[]){
  if(points.length<2)return empty('Chart history will appear as data arrives.');
  const max=Math.max(...points.map(p=>p.value)),min=Math.min(...points.map(p=>p.value));
  const pad=Math.max((max-min)*.15,Math.abs(max)*.0004,.01),low=min-pad,high=max+pad;
@@ -122,8 +122,19 @@ function plot(points,unit='price',accent='#4be4b2'){
  const line=points.map((p,i)=>(i?'L':'M')+x(i).toFixed(2)+' '+y(p.value).toFixed(2)).join(' ');
  const grids=Array.from({length:5},(_,i)=>{const row=12+i*54.5,v=high-(high-low)*i/4;return `<path d="M10 ${row}H700" stroke="#28364a" stroke-dasharray="3 5"/><text x="711" y="${row+4}">${unit==='percent'?v.toFixed(1)+'%':num(v)}</text>`}).join('');
  const ticks=Array.from({length:6},(_,i)=>{const j=Math.round((points.length-1)*i/5),long=Date.parse(points.at(-1).t)-Date.parse(points[0].t)>86400000;return `<text x="${x(j)}" y="253" text-anchor="${i===0?'start':i===5?'end':'middle'}">${esc(stamp(points[j].t,long?{month:'short',day:'numeric'}:{hour:'2-digit',minute:'2-digit',hour12:false}))}</text>`}).join('');
+ let dots='';
+ if(Array.isArray(markers)&&markers.length){
+   const times=points.map(p=>Date.parse(p.t));
+   dots=markers.slice(-120).map(tr=>{
+     const ts=Date.parse(tr.t);if(!Number.isFinite(ts))return '';
+     let best=0,diff=Infinity;
+     for(let i=0;i<times.length;i++){const d=Math.abs(times[i]-ts);if(d<diff){diff=d;best=i}}
+     const cx=x(best).toFixed(1),cy=y(points[best].value).toFixed(1),buy=tr.side==='buy';
+     return `<circle cx="${cx}" cy="${cy}" r="3.4" fill="${buy?'#38e4a8':'#fb7185'}" stroke="#0b1018" stroke-width="1.2"><title>${buy?'BUY':'SELL'} ${qtyText(tr.qty)} @ ${usd(tr.price)}</title></circle>`;
+   }).join('');
+ }
  const id='shade'+(++chartId);
- return `<div class="plot" tabindex="0" aria-label="Interactive chart. Use arrow keys to inspect values." data-points="${esc(JSON.stringify(points))}" data-unit="${unit}" data-low="${low}" data-high="${high}"><svg viewBox="0 0 790 265" role="img" aria-label="Time series chart"><defs><linearGradient id="${id}" x1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="${accent}" stop-opacity=".23"/><stop offset="100%" stop-color="${accent}" stop-opacity="0"/></linearGradient></defs>${grids}${ticks}<path d="${line} L700 230 H10 Z" fill="url(#${id})"/><path d="${line}" fill="none" stroke="${accent}" stroke-width="2" vector-effect="non-scaling-stroke"/><line class="crosshair" y1="12" y2="230" stroke="#7e98b5" stroke-dasharray="4 4" visibility="hidden"/><circle class="point" r="4" fill="${accent}" stroke="#0b1018" stroke-width="2" visibility="hidden"/></svg><div class="tooltip" role="status" hidden></div></div>`;
+ return `<div class="plot" tabindex="0" aria-label="Interactive chart. Use arrow keys to inspect values." data-points="${esc(JSON.stringify(points))}" data-unit="${unit}" data-low="${low}" data-high="${high}"><svg viewBox="0 0 790 265" role="img" aria-label="Time series chart"><defs><linearGradient id="${id}" x1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="${accent}" stop-opacity=".23"/><stop offset="100%" stop-color="${accent}" stop-opacity="0"/></linearGradient></defs>${grids}${ticks}<path d="${line} L700 230 H10 Z" fill="url(#${id})"/><path d="${line}" fill="none" stroke="${accent}" stroke-width="2" vector-effect="non-scaling-stroke"/>${dots}<line class="crosshair" y1="12" y2="230" stroke="#7e98b5" stroke-dasharray="4 4" visibility="hidden"/><circle class="point" r="4" fill="${accent}" stroke="#0b1018" stroke-width="2" visibility="hidden"/></svg><div class="tooltip" role="status" hidden></div></div>`;
 }
 function inspect(node,i){
  const points=node.points??=JSON.parse(node.dataset.points);
@@ -373,7 +384,7 @@ function trading(){
      select('Strategy to manage position','version',[['','Choose a strategy version'],...options],chosen,true)+
      numeric('Additional funds to add (USD)','addFunds',0,0,1e9),
      submit('Assign position & start bot',!online))):'';
- return tradingOverview(bots,mode)+'<div class="stack live-workflow"><div class="actions">'+link('Multi-strategy','trading?view=multi-strategy')+'</div>'+tvPanel+'<div id="bot-launch">'+panel('Launch a bot','Choose the saved trading rules, the instrument to trade, and the maximum USD budget.',
+ return tradingOverview(bots,mode)+'<div class="stack live-workflow"><div class="actions">'+link('Multi-strategy','trading?view=multi-strategy')+btn('Emergency Kill Switch','open-kill-switch','',false,`style="background:#39212e;color:#ff8191;border-color:#592e42" ${disabled}`)+'</div>'+tvPanel+'<div id="bot-launch">'+panel('Launch a bot','Choose the saved trading rules, the instrument to trade, and the maximum USD budget.',
      options.length?form('launch-bot',select('Strategy version','version',[['','Choose a strategy version'],...options],chosen,true)+
        assetPicker('Ticker or crypto pair','instrument',instrument??'')+numeric('Bot budget (USD)','budget',launchBudget,1,1e9),
        unavailable+submit('Launch bot',!online)):
@@ -704,7 +715,8 @@ function strategies(){
  const aiSection=check('Require AI confirmation for non-protective signals','ai',editor.ai)+
  field('Custom AI confirmation rule (optional)','aiPrompt',editor.aiPrompt??'','maxlength="300" placeholder="e.g. Veto buys if news is bearish or candle jumped >2%"')+
  '<small>'+(state.aiConfigured?esc(state.aiProvider ?? 'AI provider')+' configured (with live Alpaca News headlines). Historical replay uses deterministic rules.':'Configure a Gemini or OpenAI key in the server environment to enable AI confirmation.')+'</small>';
- return workspace(group('Strategy setup',baseInputs)+group('Signal rules',templatesBar+'<div class="fields">'+indicators+'</div>'+ruleBuilder,'editor-flow')+
+ const htfField=select('Higher-timeframe trend filter','htfEma',[['0','Off'],['20','1H Close > 1H EMA(20)'],['50','1H Close > 1H EMA(50)'],['100','1H Close > 1H EMA(100)']],String(editor.htfEma??0));
+ return workspace(group('Strategy setup',baseInputs+htfField)+group('Signal rules',templatesBar+'<div class="fields">'+indicators+'</div>'+ruleBuilder,'editor-flow')+
    group('AI confirmation',aiSection,'editor-flow')+group('Position sizing and risk',sizingMode+riskInputs),renderLiveDebugger());
 }
 function backtesting(){
@@ -743,13 +755,15 @@ function backtesting(){
    ${metric('Win rate',Number.isFinite(m?.winRate)?m.winRate.toFixed(1)+'%':'—',m?m.wins+' wins · '+m.losses+' losses':'Closed trades','history')}
  </div>`;
  const runStats=run=>{
-   const metrics=run.metrics;
+   const metrics=run.metrics, wf=metrics?.walkForward;
    const profitFactor=Number.isFinite(metrics?.profitFactor)?num(metrics.profitFactor):metrics?.wins>0&&metrics.losses===0?'∞':'—';
+   const wfFmt=seg=>seg?`${pct(seg.returnPct)} (DD ${pct(seg.maxDrawdown)} · ${seg.closedTrades}T)`:'—';
    return [
      ['Starting capital',usd(run.capital)],['Final equity',usd(run.final)],
      ['Return',pct(run.capital>0?100*(run.final/run.capital-1):null)],['Max drawdown',pct(run.drawdown)],
      ['Win rate',Number.isFinite(metrics?.winRate)?metrics.winRate.toFixed(1)+'%':'—'],
      ['Profit factor',profitFactor],['Sharpe ratio',num(metrics?.sharpe)],['Buy & hold',pct(metrics?.buyAndHold)],
+     ['In-sample (70%)',wfFmt(wf?.inSample)],['Out-of-sample (30%)',wfFmt(wf?.outOfSample)],
      ['Closed trades',num(metrics?.closedTrades)],['Fills',num(run.tradeCount??run.trades?.length)],
      ['Total fees',usd(metrics?.totalFees)],['Fee / slippage',num(run.fees)+' / '+num(run.slippage)+' bps'],
      ['Bot budget cap',run.budget?usd(run.budget):'—'],
@@ -760,8 +774,8 @@ function backtesting(){
  const comparisonRows=a?runStats(a).map(([label,value],i)=>[esc(label),value,...(b?[runStatsB[i][1]]:[])]):[];
  const metadata=run=>esc(run.name)+' v'+esc(run.version)+' · '+esc(run.symbol)+' · '+esc(run.timeframe??'1Min')+
    ' · '+esc(run.start)+' to '+esc(run.end)+(run.source?' · '+esc(run.source):'');
- const equityChart=panel('Equity Curve',a?metadata(a):'',
-   a?plot(a.curve,'price','#20aaff'):empty('Run a saved strategy to see its equity curve.'),
+ const equityChart=panel('Equity Curve',a?metadata(a)+' · Green = Buy, Red = Sell':'',
+   a?plot(a.curve,'price','#20aaff',a.trades):empty('Run a saved strategy to see its equity curve.'),
    a?`<strong class="mono backtest-equity-value">${usd(a.final)}</strong>`:'','dashboard-chart backtest-equity');
  const open=a?.metrics?.openPosition;
  const openNote=open?`<div class="backtest-open-note">Open at end · ${qtyText(open.qty)} units at ${usd(open.entry)} · Mark ${usd(open.mark)} · Unrealized ${usd(open.unrealized)}</div>`:'';
@@ -776,7 +790,7 @@ function backtesting(){
    ${panel('Trade Log','Latest 250 simulated fills from the primary run',openNote+
      table(['Time','Side','Quantity','Fill price','Fees','Realized P&L','Reason'],a.trades.slice(-250).toReversed().map(trade=>[
        stamp(trade.t),badge(trade.side),qtyText(trade.qty),usd(trade.price),usd(trade.fee),usd(trade.pnl),esc(trade.reason??'—')
-     ]),'No executions in this run.'))}`:'';
+     ]),'No executions in this run.'),btn('Export CSV','export-backtest'))}`:'';
  const picker=a?`<div id="run-select" class="backtest-run-select">${select('Primary run','runA',options,runA)}
    ${select('Compare with','runB',[['','No comparison'],...options.filter(([id])=>id!==runA)],b?.id??'')}</div>`:'';
  return `<div class="dashboard backtest-overview">
@@ -910,8 +924,9 @@ function settings(){
  const notifications=panel('Notifications','Select the events you want to receive.',
    `<form id="settings" class="form"><div class="settings-checks">${Object.entries({signals:'Trade signals',fills:'Order fills',risk:'Risk limits',connections:'Connection failures'}).map(([k,label])=>check(label,k,state.alerts[k])).join('')}</div>
     <div class="settings-delivery"><div class="inline"><h3>Telegram delivery</h3>${badge(state.telegramConfigured?'Configured':'Unconfigured',state.telegramConfigured?'good':'')}</div>
-    ${check('Push alerts to Telegram','telegram',state.alerts.telegram!==false)}${state.telegramConfigured?'':'<small>Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID on the worker to connect Telegram.</small>'}</div>
-    <div class="actions">${submit('Save preferences',!online)}${state.telegramConfigured?btn('Send test alert','test-telegram','',false,disabled):''}</div></form>`,'','settings-notifications');
+    ${check('Push alerts to Telegram','telegram',state.alerts.telegram!==false)}
+    ${check('Daily end-of-day portfolio digest (21:00 UTC)','digest',state.alerts.digest!==false)}${state.telegramConfigured?'':'<small>Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID on the worker to connect Telegram.</small>'}</div>
+    <div class="actions">${submit('Save preferences',!online)}${state.telegramConfigured?btn('Send test alert','test-telegram','',false,disabled)+btn('Send digest now','send-digest','',false,disabled):''}</div></form>`,'','settings-notifications');
  const simulator=state.mode==='demo'?panel('Connection simulator','Test how paper bots respond to a feed or broker outage.',
    `<div class="settings-buttons actions">${btn('Disconnect feed','outage','feed',false,disabled)}${btn('Disconnect broker','outage','broker',false,disabled)}${btn('Reconnect both','outage','clear',false,disabled)}</div>`,'','settings-simulator'):'';
  return `<div class="settings-page">${page('Workspace preferences','Settings','Manage trading connections, AI credentials, and alerts.',badge(state.mode==='demo'?'Demo workspace':'Alpaca Paper'))}
@@ -971,9 +986,15 @@ function profile(){
  const metrics=metric('Account equity',usd(state.account?.equity),'Paper portfolio','equity',true)+metric('Buying power',usd(state.account?.buyingPower),'Available for orders','wallet')+
    metric('Win rate',winRate!==null?winRate.toFixed(1)+'%':'—',decided?`${wins}W / ${losses}L · ratio ${winRatio}`:'Awaiting closed trades','equity')+
    metric('Filled orders',filledOrders.length,activeBots+' enabled bots','portfolio');
+ const securityPanel=authInfo?.required?panel('Security & sessions',`${state.activeSessions??1} active session(s)`,
+   `<form id="change-password" class="form"><div class="fields">`+
+   field('Current password','currentPassword','','type="password" required autocomplete="current-password"')+
+   field('New password (min 12 chars)','newPassword','','type="password" required minlength="12" maxlength="256" autocomplete="new-password"')+
+   field('Confirm new password','confirmPassword','','type="password" required minlength="12" maxlength="256" autocomplete="new-password"')+
+   `</div><div class="actions">${submit('Update password',!online)}${btn('Sign out other devices','revoke-sessions','',false,!online?'disabled':'')}</div></form>`):'';
  return `<div class="profile-page">${page('Workspace preferences','Profile','Manage your trader identity and paper account preferences.',badge(online?'Connected':'Offline',online?'good':'bad'))}
    ${!online?'<div class="notice">Cached profile · '+syncLabel()+'</div>':''}
-   ${hero}<div class="profile-layout">${details}<div class="profile-summary">${account}<div class="metrics">${metrics}</div>${equityCurve}</div></div></div>`;
+   ${hero}<div class="profile-layout">${details}<div class="profile-summary">${account}${securityPanel}<div class="metrics">${metrics}</div>${equityCurve}</div></div></div>`;
 
 }
 function historyOrders(){
@@ -1170,6 +1191,24 @@ function renderDeleteModal(){
    </section>
  </div>`;
 }
+function renderKillSwitchModal(){
+ if(!killSwitchModal||!state)return '';
+ const running=Object.values(state.bots??{}).filter(b=>b.desired==='running').length;
+ const openPos=(state.positions??[]).filter(p=>p.qty>0).length;
+ return `<div style="position:fixed;inset:0;z-index:205;background:rgba(4,9,18,.8);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;padding:16px">
+   <section class="panel" role="dialog" aria-modal="true" style="max-width:460px;width:100%;border-color:#a1304b;box-shadow:0 24px 60px rgba(0,0,0,.65)">
+     <div class="panel-head"><div><h2 style="color:#ff8191">Emergency Kill Switch</h2><small>${running} running bot(s) · ${openPos} open position(s)</small></div></div>
+     <div class="form">
+       <div class="notice" style="background:#39212e;border-color:#592e42;color:#ffd0d7">Choose whether to <b>pause all running bots only</b>, or <b>pause all bots AND liquidate every open position at market price</b> immediately.</div>
+       <div class="actions" style="flex-wrap:wrap;gap:8px;margin-top:6px">
+         ${btn('Pause all bots only','confirm-kill-switch','pause',false,'style="background:#2a2418;color:#ffd68a;border-color:#6e5726"')}
+         ${btn('Pause all &amp; Liquidate all','confirm-kill-switch','liquidate',false,'style="background:#6e1f32;color:#fff;border-color:#a1304b"')}
+         ${btn('Cancel','cancel-kill-switch')}
+       </div>
+     </div>
+   </section>
+ </div>`;
+}
 function render(force=false){
  const signedOut=authInfo?.required&&!authInfo.authenticated;
  const hostedUnreachable=!localWorkspace&&!authInfo&&!state;
@@ -1194,7 +1233,7 @@ function render(force=false){
  if(!state){main.innerHTML=empty('Connect to FastTrader to load the workspace.');main.dataset.html='';return}
  if(!force&&!changed&&(pending||document.activeElement?.closest('form, .plot, #run-select')||main.querySelector('.plot:hover')))return;
  if(!force&&!changed&&(['backtesting','profile'].includes(active)||(active==='logs'&&!logsLive)))return;
- const markup=renderers[active]()+renderDeleteModal();
+ const markup=renderers[active]()+renderDeleteModal()+renderKillSwitchModal();
  if(markup!==main.dataset.html){main.innerHTML=markup;main.dataset.html=markup}
 }
 async function api(path,data,opts={}){
@@ -1226,6 +1265,7 @@ function capture(form){
  if(data.symbol!==undefined)data.symbol=data.symbol.trim().toUpperCase();
  for(const [,k]of fields)if(data[k]!==undefined)data[k]=+data[k];
  if(data.aiDailyCap!==undefined)data.aiDailyCap=+data.aiDailyCap;
+ if(data.htfEma!==undefined)data.htfEma=+data.htfEma;
  const changed=Object.entries({...data,ai:form.elements.ai.checked}).some(([k,v])=>editor[k]!==v);
  editor={...editor,...data,ai:form.elements.ai.checked,dirty:true,mutation:changed||!editor.dirty?crypto.randomUUID():editor.mutation};
  if(!authInfo?.required)write('ft-draft',editor);
@@ -1274,10 +1314,14 @@ async function refresh(force=false){
        editor??=read('ft-draft');
      }
    }
-   const res=await fetch('/api/state',{cache:'no-store',credentials:'same-origin',signal:timeoutSignal(10000)});
+   const stateHeaders=stateEtag&&state?{'If-None-Match':stateEtag}:{};
+   const res=await fetch('/api/state',{cache:'no-store',credentials:'same-origin',headers:stateHeaders,signal:timeoutSignal(10000)});
    if(revision!==authRevision)return;
    if(res.status===401){signInRequired();return}
+   if(res.status===304){online=true;return}
    if(!res.ok)throw Error('Unavailable');
+   const etag=res.headers.get('etag');
+   if(etag)stateEtag=etag;
    const snapshot=await res.json();
    if(revision!==authRevision)return;
    state=snapshot;
@@ -1326,6 +1370,45 @@ document.addEventListener('click',async event=>{
  if(action==='close-notifs'){notifOpen=false;chrome();return}
  if(action==='notif-filter'){notifFilter=value;renderNotifDrawer();return}
  if(action==='mark-notifs-read'){if(state.events?.[0])lastSeenNotif=state.events[0].t;chrome();toast('Notifications marked read.');return}
+ if(action==='open-kill-switch'){if(!online||pending){toast('The workspace is reconnecting.');return}killSwitchModal=true;render(true);return}
+ if(action==='cancel-kill-switch'){killSwitchModal=false;render(true);return}
+ if(action==='confirm-kill-switch'){
+   if(!online||pending){toast('The workspace is reconnecting.');return}
+   const liquidateAll=value==='liquidate';
+   pending=true;el.disabled=true;
+   try{
+     const res=await api('bot',{killSwitch:true,liquidateAll});
+     killSwitchModal=false;
+     toast(`Kill Switch: paused ${res.pausedCount} bot(s)${liquidateAll?` & liquidated ${res.liquidatedCount} position(s)`:''}.`);
+     await refresh(true);
+   }catch(error){toast(error.message)}
+   finally{pending=false;el.disabled=false}
+   return;
+ }
+ if(action==='send-digest'){
+   if(!online||pending){toast('The workspace is reconnecting.');return}
+   pending=true;el.disabled=true;
+   try{await api('settings',{sendDigest:true});toast('Daily Telegram digest sent!')}
+   catch(error){toast(error.message)}
+   finally{pending=false;el.disabled=false}
+   return;
+ }
+ if(action==='revoke-sessions'){
+   if(!online||pending){toast('The workspace is reconnecting.');return}
+   pending=true;el.disabled=true;
+   try{const res=await api('auth',{action:'revoke_others'});toast(`Signed out ${res.revoked} other session(s).`);await refresh(true)}
+   catch(error){toast(error.message)}
+   finally{pending=false;el.disabled=false}
+   return;
+ }
+ if(action==='export-backtest'){
+   const run=state.runs.find(r=>r.id===runA);
+   if(!run?.trades?.length){toast('No backtest trades to export.');return}
+   const rows=[['Time','Side','Quantity','Fill Price','Fees','Realized P&L','Reason'],...run.trades.map(t=>[t.t??'',t.side??'',t.qty??'',t.price??'',t.fee??'',t.pnl??'',t.reason??''])];
+   const csv=rows.map(r=>r.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(',')).join('\n');
+   const a=document.createElement('a');a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(csv);a.download=`fasttrader-backtest-${(run.symbol||'run').replace('/','-')}.csv`;a.click();
+   toast('Exported backtest trade log CSV.');return;
+ }
  if(action==='open-delete-bot'){
    if(!online||pending){toast('The workspace is reconnecting.');return}
    deleteBotId=value;
@@ -1821,6 +1904,12 @@ document.addEventListener('submit',async event=>{
      toast('Dedicated AI Bot Trading Key saved securely.');
    }
    if(form.id==='settings'){await api('settings',Object.fromEntries(Object.keys(data).map(k=>[k,true])));toast('Notifications saved.')}
+   if(form.id==='change-password'){
+     if(data.newPassword!==data.confirmPassword)throw Error('New password and confirmation do not match.');
+     await api('auth',{action:'change_password',currentPassword:data.currentPassword,newPassword:data.newPassword});
+     form.reset();
+     toast('Password updated & other sessions signed out.');
+   }
    if(form.id==='profile'){
      const avatar=avatarDraft!==null?avatarDraft:(state.profile?.avatar??'');
      await api('profile',{...data,avatar,offlineSync:Boolean(form.elements.offlineSync?.checked)});

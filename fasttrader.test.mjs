@@ -124,6 +124,21 @@ test('replay avoids same-bar trailing-stop look-ahead bias, computes quant metri
   assert.equal(sampled[0].t, '0');
   assert.equal(sampled.at(-1).t, '1999');
   assert.ok(sampled.some(p => p.t === '777' && p.drawdown === -25));
+  // Higher-timeframe 1H EMA filter blocks entries in downtrend & replay produces 70/30 walk-forward split
+  const htfStrat = strategy({ ...defaults, period: 2, entry: 0, htfEma: 3 });
+  const htfDown = [
+    { t: '2026-10-01T10:00:00Z', o: 120, h: 121, l: 119, c: 120 },
+    { t: '2026-10-01T11:00:00Z', o: 115, h: 116, l: 114, c: 115 },
+    { t: '2026-10-01T12:00:00Z', o: 110, h: 111, l: 109, c: 105 }
+  ];
+  assert.equal(decision(htfStrat, [100, 105], { equity: 10000, cash: 10000, dayStart: 10000, exposure: 0 }, null, 105, null, { warmedUp: true, htfBars: htfDown }), null);
+  const wfBars = Array.from({ length: 30 }, (_, i) => ({
+    t: new Date(Date.parse('2026-10-01T12:00:00Z') + i * 60000).toISOString(),
+    o: 100 + i * 0.5, h: 101 + i * 0.5, l: 99.5 + i * 0.5, c: 100.5 + i * 0.5, v: 500
+  }));
+  const wfRes = replay({ ...defaults, period: 2, entry: 0 }, wfBars, { capital: 10000, fees: 0, slippage: 0 });
+  assert.ok(wfRes.metrics.walkForward?.inSample);
+  assert.ok(wfRes.metrics.walkForward?.outOfSample);
 });
 
 test('contiguous candle warmup blocks gapped entries while allowing protective exits and stop-loss cooldown', () => {
@@ -690,11 +705,25 @@ test('the hosted bridge and worker enforce owner sign-up, authentication and sig
     const snapshot = await send('state', null, cookie);
     assert.equal(snapshot.headers.get('cache-control'), 'no-store');
     assert.equal(snapshot.headers.get('x-frame-options'), 'DENY');
+    const etag = snapshot.headers.get('etag');
+    assert.ok(etag);
     assert.equal((await snapshot.json()).bots.default.budget, 900);
-    assert.equal((await send('auth', { action:'logout' }, cookie)).status, 200);
-    assert.equal((await send('state', null, cookie)).status, 401);
-    assert.equal((await send('auth', { ...owner, action:'login', password:'wrong' })).status, 401);
-    assert.equal((await send('auth', { ...owner, action:'login' })).status, 200);
+    // ETag 304 Not Modified skips payload when unchanged
+    const notMod = await send('state', null, cookie, origin, { 'If-None-Match': etag });
+    assert.equal(notMod.status, 304);
+    // Emergency Kill Switch pauses running bots
+    const ks = await send('bot', { killSwitch: true, liquidateAll: false }, cookie);
+    assert.equal(ks.status, 200);
+    assert.equal((await ks.json()).pausedCount, 1);
+    // Change password rotates session cookie and invalidates old password
+    const newPass = 'new-strong-password-for-fasttrader';
+    const rotated = await send('auth', { action: 'change_password', currentPassword: owner.password, newPassword: newPass }, cookie);
+    assert.equal(rotated.status, 200);
+    const nextCookie = rotated.headers.get('set-cookie').split(';')[0];
+    assert.equal((await send('auth', { action:'logout' }, nextCookie)).status, 200);
+    assert.equal((await send('state', null, nextCookie)).status, 401);
+    assert.equal((await send('auth', { ...owner, action:'login', password: owner.password })).status, 401);
+    assert.equal((await send('auth', { ...owner, action:'login', password: newPass })).status, 200);
   }, null, { FASTTRADER_SIGNUP_CODE: setup, WORKER_SHARED_SECRET: shared });
 });
 

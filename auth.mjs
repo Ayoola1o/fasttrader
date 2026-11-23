@@ -25,6 +25,7 @@ export async function createAuth({ file, required, secure, signupCode, ownerEmai
     return token && digest(token).toString('hex');
   };
   const authenticated = cookie => !required || (store.sessions[keyFor(cookie)] ?? 0) > Date.now();
+  const sessionCount = () => Object.values(store.sessions).filter(exp => exp > Date.now()).length;
   const status = cookie => ({
     required, authenticated: authenticated(cookie), canSignup: required && !store.owner && Boolean(signupCode)
   });
@@ -38,8 +39,8 @@ export async function createAuth({ file, required, secure, signupCode, ownerEmai
   const fail = (message, code = 400) => { throw Object.assign(Error(message), { status: code }); };
   const change = async (input, cookie, clientIp = 'local') => {
     if (!required) fail('Sign-in is disabled on this local workspace.');
-    if (!['signup','login','logout'].includes(input?.action)) fail('Invalid sign-in request.');
-    if (input.action !== 'logout') {
+    if (!['signup','login','logout','change_password','revoke_others'].includes(input?.action)) fail('Invalid sign-in request.');
+    if (['signup', 'login', 'change_password'].includes(input.action)) {
       const now = Date.now();
       const bucketKey = String(clientIp || 'local').slice(0, 64);
       const list = (attemptsByIp.get(bucketKey) ?? []).filter(ts => ts > now - 60000);
@@ -51,7 +52,7 @@ export async function createAuth({ file, required, secure, signupCode, ownerEmai
           if (!v.some(ts => ts > now - 60000)) attemptsByIp.delete(k);
         }
       }
-    } else if (!authenticated(cookie)) {
+    } else if (input.action === 'logout' && !authenticated(cookie)) {
       return { data: status(), cookie: sessionCookie('', 0) };
     }
     const job = queue.then(async () => {
@@ -63,6 +64,36 @@ export async function createAuth({ file, required, secure, signupCode, ownerEmai
           await save({ ...store, sessions });
         }
         return { data: status(), cookie: sessionCookie('', 0) };
+      }
+      if (input?.action === 'revoke_others') {
+        if (!authenticated(cookie)) fail('Sign in to FastTrader.', 401);
+        const key = keyFor(cookie);
+        const now = Date.now();
+        const prevCount = Object.values(store.sessions).filter(exp => exp > now).length;
+        const sessions = key && store.sessions[key] > now ? { [key]: store.sessions[key] } : {};
+        await save({ ...store, sessions });
+        return { data: { revoked: Math.max(0, prevCount - Object.keys(sessions).length), activeSessions: Object.keys(sessions).length } };
+      }
+      if (input?.action === 'change_password') {
+        if (!authenticated(cookie)) fail('Sign in to FastTrader.', 401);
+        const currentPassword = typeof input.currentPassword === 'string' ? input.currentPassword : '';
+        const newPassword = typeof input.newPassword === 'string' ? input.newPassword : '';
+        if (!currentPassword || !newPassword || newPassword.length < 12 || Buffer.byteLength(newPassword) > 256) {
+          fail('Enter your current password and a new password of at least 12 characters.');
+        }
+        const envOwner = ownerEmail && ownerPassword ? { email: ownerEmail.trim().toLowerCase(), password: ownerPassword } : null;
+        const active = store.owner ?? envOwner;
+        if (!active) fail('No owner account configured.', 401);
+        const ok = active.password
+          ? sameSecret(currentPassword, active.password)
+          : sameSecret((await derive(currentPassword, active.salt, 64)).toString('hex'), active.hash);
+        if (!ok) fail('Current password is incorrect.', 401);
+        const salt = randomBytes(16).toString('hex');
+        const nextOwner = { email: active.email, salt, hash: (await derive(newPassword, salt, 64)).toString('hex') };
+        const token = randomBytes(32).toString('base64url');
+        const sessions = { [digest(token).toString('hex')]: Date.now() + duration };
+        await save({ owner: nextOwner, sessions });
+        return { data: { changed: true, activeSessions: 1 }, cookie: sessionCookie(token, duration / 1000) };
       }
       const now = Date.now();
       const email = typeof input.email === 'string' ? input.email.trim().toLowerCase() : '';
@@ -95,5 +126,5 @@ export async function createAuth({ file, required, secure, signupCode, ownerEmai
     queue = job.catch(() => {});
     return job;
   };
-  return { status, authenticated, change };
+  return { status, authenticated, sessionCount, change };
 }

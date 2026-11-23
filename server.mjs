@@ -380,6 +380,11 @@ function updateOrder(order) {
   }
   if (prior) Object.assign(prior, order);
   else state.orders.unshift(order);
+  if (state.orders.length > 1000) {
+    const active = state.orders.filter(item => !terminal.has(item.status));
+    const settled = state.orders.filter(item => terminal.has(item.status)).slice(0, Math.max(0, 1000 - active.length));
+    state.orders = [...active, ...settled];
+  }
 }
 function catalogEntry(row, assetClass) {
   const symbol = canonicalSymbol(row.symbol, assetClass);
@@ -627,10 +632,11 @@ function orderContext(bot, s, bars, series = strategyBars(s, bars)) {
     bot.highWater = null;
     bot.holdBars = 0;
   }
+  const htfBars = s.htfEma > 0 ? aggregateBars(bars, '1Hour') : undefined;
   return {
     position, price, ledger, cash, rules, warmedUp, warmupCount: window.length, warmupNeeded, cooldown, volume, atr, timeframe: tf,
     proposal: decision(s, window.map(b => b.c), account, position, price, rules, {
-      warmedUp, cooldown, volume, atr, bars: window, highWater: bot.highWater, holdBars: bot.holdBars ?? 0
+      warmedUp, cooldown, volume, atr, bars: window, htfBars, highWater: bot.highWater, holdBars: bot.holdBars ?? 0
     })
   };
 }
@@ -1088,6 +1094,13 @@ async function cycle() {
         state.equity.push({ t: state.synced, value: state.account.equity });
         if (state.equity.length > 4500) state.equity.shift();
       }
+      const nowUtc = new Date();
+      const utcDay = nowUtc.toISOString().slice(0, 10);
+      if (telegram.configured && state.alerts.telegram !== false && state.alerts.digest !== false &&
+        nowUtc.getUTCHours() >= 21 && state.lastDigestDay !== utcDay) {
+        state.lastDigestDay = utcDay;
+        void telegram.post(buildDailyDigest()).catch(() => {});
+      }
       await persist(false);
     });
   } catch (error) { console.error('Engine cycle:', error.message); }
@@ -1097,10 +1110,36 @@ await cycle();
 setInterval(cycle, 5000);
 
 let pendingTelegramClose = null;
+let pendingTelegramKill = null;
 const tgEsc = v => String(v ?? '').replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
 const tgUsd = v => Number.isFinite(v) ? (v < 0 ? '-$' : '$') + Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—';
 const tgPct = v => Number.isFinite(v) ? (v > 0 ? '+' : '') + v.toFixed(2) + '%' : '—';
 const tgQty = v => Number.isFinite(v) ? v.toLocaleString('en-US', { maximumFractionDigits: 8 }) : '—';
+
+function buildDailyDigest() {
+  const a = state.account;
+  const dayPnl = Number.isFinite(a.equity) && Number.isFinite(a.dayStart) ? a.equity - a.dayStart : null;
+  const dayPct = a.dayStart > 0 && dayPnl !== null ? 100 * (dayPnl / a.dayStart) : null;
+  const unreal = state.positions.reduce((sum, p) => sum + p.qty * (p.price - p.entry), 0);
+  const bots = Object.values(state.bots);
+  let realized = 0, wins = 0, losses = 0, trades = 0;
+  for (const bot of bots) {
+    const l = botLedger(botOrders(bot.id), bot.symbol, bot.budget);
+    const wl = botWinLoss(bot.id);
+    realized += l.realized; wins += wl.wins; losses += wl.losses; trades += l.buyFills + l.sellFills;
+  }
+  const wr = wins + losses ? `${((100 * wins) / (wins + losses)).toFixed(1)}%` : '—';
+  const active = bots.filter(b => b.desired === 'running').length;
+  const aiErrs = bots.filter(b => b.lastAiError).length;
+  return [
+    `📅 <b>FastTrader Daily Digest</b> (${new Date().toISOString().slice(0, 10)})`,
+    `• Equity: <b>${tgUsd(a.equity)}</b> (${tgUsd(dayPnl)} / ${tgPct(dayPct)} today)`,
+    `• Cash: ${tgUsd(a.cash)} | Exposure: ${tgUsd(a.exposure)}`,
+    `• Unrealized P&amp;L: <b>${tgUsd(unreal)}</b> | Bot Realized: <b>${tgUsd(realized)}</b>`,
+    `• Bot Fills: <b>${trades}</b> | W/L: <b>${wins}W / ${losses}L</b> (${wr})`,
+    `• Bots: <b>${active} active</b> / ${bots.length} total · Open positions: <b>${state.positions.length}</b>${aiErrs ? ` · ⚠️ ${aiErrs} AI error(s)` : ' · ✅ AI healthy'}`
+  ].join('\n');
+}
 
 function botWinLoss(botId) {
   const filled = botOrders(botId).filter(o => o.filled > 0 && Number.isFinite(o.price)).sort((a, b) => (a.filledAt ?? a.t ?? '').localeCompare(b.filledAt ?? b.t ?? ''));
@@ -1191,8 +1230,30 @@ async function handleTelegramCommand(cmd, arg) {
       '/pause &lt;bot&gt; — Pause a bot',
       '/resume &lt;bot&gt; — Resume a paused bot',
       '/pauseall — Pause all running bots immediately',
+      '/killswitch — Pause all bots &amp; liquidate all positions (requires /confirmkill)',
+      '/digest — Send daily portfolio digest now',
       '/close &lt;symbol&gt; — Liquidate an open position (requires /confirm)'
     ].join('\n');
+  }
+  if (cmd === 'digest') return buildDailyDigest();
+  if (cmd === 'killswitch') {
+    const running = Object.values(state.bots).filter(b => b.desired === 'running').length;
+    const openPos = state.positions.filter(p => p.qty > 0).length;
+    pendingTelegramKill = { expires: Date.now() + 60000 };
+    return `🚨 <b>Confirm Emergency Kill Switch</b>\nThis will pause <b>${running}</b> running bot(s) and submit market sells for <b>${openPos}</b> open position(s).\n\nReply <code>/confirmkill</code> within 60 seconds to execute.`;
+  }
+  if (cmd === 'confirmkill') {
+    if (!pendingTelegramKill || Date.now() > pendingTelegramKill.expires) {
+      pendingTelegramKill = null;
+      return 'No pending Kill Switch to confirm (expired or none requested).';
+    }
+    pendingTelegramKill = null;
+    let res;
+    await serial(async () => {
+      res = await change('/api/bot', { killSwitch: true, liquidateAll: true });
+      await persist();
+    });
+    return `🚨 <b>Emergency Kill Switch Executed</b>\n• Paused bots: <b>${res.pausedCount}</b>\n• Positions liquidated: <b>${res.liquidatedCount}</b>${res.errors.length ? `\n• Notes: ${tgEsc(res.errors.join('; '))}` : ''}`;
   }
   if (cmd === 'status') {
     const a = state.account;
@@ -1353,6 +1414,8 @@ if (telegram.configured) {
     { command: 'pause', description: 'Pause a bot by name' },
     { command: 'resume', description: 'Resume a paused bot by name' },
     { command: 'pauseall', description: 'Emergency pause all running bots' },
+    { command: 'killswitch', description: 'Pause all bots & liquidate all positions' },
+    { command: 'digest', description: 'Send daily portfolio digest summary' },
     { command: 'close', description: 'Close an open position (with /confirm)' },
     { command: 'help', description: 'List all FastTrader commands' }
   ]);
@@ -1407,6 +1470,7 @@ function snapshot() {
     botAiConfigured: Boolean(botAiProvider),
     botAiInfo: botAiProvider ? { provider: botAiProvider.name, model: botAiProvider.model, masked: maskKey(botAiProvider.key) } : null,
     botAiKeys: Object.fromEntries([...perBotAiProviders].map(([id, p]) => [id, { provider: p.name, model: p.model, masked: maskKey(p.key) }])),
+    activeSessions: auth.sessionCount(),
     feedName: demo ? 'Synthetic market' : 'Alpaca ' + feed.toUpperCase()
   };
 }
@@ -1625,6 +1689,62 @@ async function change(path, input) {
       bot.lastEvaluation = { t: time(), price: latest, direction: 'sell', rationale: reason };
       return { order, qty, symbol };
     }
+    if (input.killSwitch === true) {
+      const liquidateAll = input.liquidateAll === true;
+      let pausedCount = 0, liquidatedCount = 0;
+      const errors = [];
+      for (const bot of Object.values(state.bots)) {
+        if (bot.desired === 'running') {
+          bot.desired = 'paused';
+          bot.status = 'Paused (Kill Switch)';
+          pausedCount++;
+        }
+      }
+      if (liquidateAll) {
+        const openPositions = state.positions.filter(p => p.qty > 0).slice();
+        for (const pos of openPositions) {
+          try {
+            const ownerBot = Object.values(state.bots).find(b => b.symbol === pos.symbol);
+            if (ownerBot) {
+              await liquidateBotPosition(ownerBot, { pause: true, reason: 'Emergency Kill Switch liquidation' });
+              liquidatedCount++;
+            } else {
+              const rules = isCrypto(pos.symbol) ? cryptoRules.get(pos.symbol) : null;
+              const qty = rules ? roundDown(pos.qty, rules.increment) : pos.qty;
+              if (qty <= 0) continue;
+              const latest = quotePrice(pos.symbol, state.bars[pos.symbol]?.at(-1) ?? { c: pos.price ?? pos.entry });
+              const client = 'ft-kill-' + randomUUID().slice(0, 14);
+              const order = { client, owned: true, strategyId: null, strategy: 'Kill Switch', version: 1, symbol: pos.symbol, side: 'sell', qty, filled: 0, status: 'unknown', t: time(), price: null, limitPrice: null };
+              if (demo) {
+                order.status = 'filled'; order.filled = qty; order.price = latest; order.filledAt = time();
+                order.pnl = qty * (latest - pos.entry);
+                state.cash += qty * latest;
+                state.positions = state.positions.filter(p => p !== pos);
+                updateOrder(order);
+                await reconcile();
+              } else {
+                state.orders.unshift(order);
+                const decimal = value => value.toFixed(9).replace(/\.?0+$/, '');
+                const submitted = await broker('/orders', {
+                  method: 'POST',
+                  body: JSON.stringify({ symbol: pos.symbol, qty: rules ? decimal(qty) : String(qty), side: 'sell', type: 'market', time_in_force: rules ? 'gtc' : 'day', client_order_id: client })
+                });
+                updateOrder(normalize(submitted));
+              }
+              liquidatedCount++;
+            }
+          } catch (err) {
+            errors.push(`${pos.symbol}: ${err.message}`);
+          }
+        }
+      }
+      event('risk', 'Emergency Kill Switch activated', [
+        `Paused ${pausedCount} running bot(s)`,
+        liquidateAll ? `Liquidated ${liquidatedCount} open position(s)` : 'Open positions left untouched',
+        ...errors
+      ]);
+      return { pausedCount, liquidatedCount, errors };
+    }
     if (input.delete === true) {
       const bot = state.bots[input.id];
       if (!bot) throw Error('Bot not found.');
@@ -1744,6 +1864,10 @@ async function change(path, input) {
       return { cleared: true };
     }
     if (input.testTelegram === true) return telegram.sendTest(mode);
+    if (input.sendDigest === true) {
+      await telegram.post(buildDailyDigest());
+      return { sent: true };
+    }
     if (input.removeBotAiKey === true) {
       if (typeof input.botId === 'string' && input.botId) {
         perBotAiProviders.delete(input.botId);
@@ -1767,7 +1891,7 @@ async function change(path, input) {
       await saveBotAiProvider({ name, key, model });
       return { configured: true, provider: name, model, masked: maskKey(key) };
     }
-    state.alerts = Object.fromEntries(['signals', 'fills', 'risk', 'connections', 'telegram'].map(key => [key, input[key] === true]));
+    state.alerts = Object.fromEntries(['signals', 'fills', 'risk', 'connections', 'telegram', 'digest'].map(key => [key, input[key] === true]));
     return state.alerts;
   }
   if (path === '/api/profile') {
@@ -1921,10 +2045,21 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/auth') {
       const clientIp = (bridgeSecret ? req.headers['x-fasttrader-client-ip'] : null) || req.socket?.remoteAddress || 'local';
       const result = await auth.change(await body(req), req.headers.cookie, clientIp);
-      return respond(200, result.data, { 'Set-Cookie': result.cookie });
+      return respond(200, result.data, result.cookie ? { 'Set-Cookie': result.cookie } : {});
     }
     if (url.pathname.startsWith('/api/') && !auth.authenticated(req.headers.cookie)) return respond(401, { error: 'Sign in to FastTrader.' });
-    if (req.method === 'GET' && url.pathname === '/api/state') return respond(200, snapshot());
+    if (req.method === 'GET' && url.pathname === '/api/state') {
+      const payload = JSON.stringify(snapshot());
+      const etag = 'W/"' + createHash('sha1').update(payload).digest('base64url').slice(0, 20) + '"';
+      if (req.headers['if-none-match'] === etag) {
+        res.writeHead(304, { 'Cache-Control': 'no-store', ETag: etag, ...secHeaders });
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ETag: etag, ...secHeaders });
+      res.end(payload);
+      return;
+    }
     if (req.method === 'POST' && url.pathname === '/api/assets') return respond(200, searchAssets(await body(req, 2000)));
     if (req.method === 'POST' && url.pathname.startsWith('/api/')) {
       const input = await body(req, ['/api/profile', '/api/knowledge'].includes(url.pathname) ? 220000 : 20000);

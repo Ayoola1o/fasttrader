@@ -26,6 +26,8 @@ export async function handleBridge(request, env = process.env, upstreamFetch = f
   if (idem && /^[a-zA-Z0-9_-]{8,80}$/.test(idem)) headers.set('Idempotency-Key', idem);
   const clientIp = (request.headers.get('x-forwarded-for')?.split(',')[0] || request.headers.get('x-real-ip') || '').trim().slice(0, 64);
   if (clientIp) headers.set('x-fasttrader-client-ip', clientIp);
+  const ifNoneMatch = !post && route === 'state' ? request.headers.get('if-none-match')?.trim() : null;
+  if (ifNoneMatch && ifNoneMatch.length <= 80) headers.set('If-None-Match', ifNoneMatch);
   let body;
   if (post) {
     headers.set('Content-Type', 'application/json');
@@ -54,6 +56,12 @@ export async function handleBridge(request, env = process.env, upstreamFetch = f
       method: request.method, headers, body, redirect: 'error', cache: 'no-store',
       signal: AbortSignal.timeout(timeoutMs)
     });
+    if (response.status === 304) {
+      const output = new Headers({ 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer' });
+      const etag = response.headers.get('etag');
+      if (etag) output.set('ETag', etag);
+      return new Response(null, { status: 304, headers: output });
+    }
     if (!response.headers.get('content-type')?.startsWith('application/json')) return json(502, 'The FastTrader worker returned an unexpected response.');
     const output = new Headers({
       'Content-Type': 'application/json',
@@ -62,6 +70,8 @@ export async function handleBridge(request, env = process.env, upstreamFetch = f
       'X-Frame-Options': 'DENY',
       'Referrer-Policy': 'no-referrer'
     });
+    const etag = response.headers.get('etag');
+    if (etag) output.set('ETag', etag);
     const setCookie = route === 'auth' && response.headers.get('set-cookie');
     if (setCookie) output.set('Set-Cookie', setCookie);
     return new Response(response.body, { status: response.status, headers: output });

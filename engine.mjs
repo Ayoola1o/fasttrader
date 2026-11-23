@@ -37,7 +37,7 @@ export const ruleOperators = ['gt', 'lt', 'gte', 'lte', 'crosses_above', 'crosse
 export const defaults = {
   name: 'Momentum Alpha', symbol: 'SPY', mode: 'momentum', timeframe: '1Min', period: 12, entry: 0.1, exit: -0.1,
   sizeMode: 'percent', size: 10, sizeUsd: 500, exposure: 20, dailyLoss: 3, stop: 2, take: 4, trailingStop: 0,
-  atrStop: 0, cooldown: 5, maxHoldBars: 0, ai: false, aiPrompt: '', aiNotes: '',
+  atrStop: 0, cooldown: 5, maxHoldBars: 0, htfEma: 0, ai: false, aiPrompt: '', aiNotes: '',
   aiWakeMode: 'smart', aiRiskProfile: 'balanced', aiSizing: 'dynamic', aiDailyCap: 100, rules: null
 };
 
@@ -339,6 +339,9 @@ export function strategy(input, supportsSymbol = symbol => Object.hasOwn(instrum
   const maxHoldBars = input.maxHoldBars === undefined ? 0 : input.maxHoldBars;
   if (!Number.isInteger(maxHoldBars) || maxHoldBars < 0 || maxHoldBars > 1440) throw Error('Invalid value for maxHoldBars');
   result.maxHoldBars = maxHoldBars;
+  const htfEma = input.htfEma === undefined ? 0 : input.htfEma;
+  if (!Number.isInteger(htfEma) || htfEma < 0 || htfEma > 200) throw Error('Invalid value for htfEma');
+  result.htfEma = htfEma;
   const sizeMode = input.sizeMode === 'usd' ? 'usd' : 'percent';
   result.sizeMode = sizeMode;
   const sizeUsd = input.sizeUsd === undefined ? 500 : input.sizeUsd;
@@ -453,6 +456,11 @@ export function decision(s, closes, account, position, price, rules = isCrypto(s
     return null;
   }
   if (!warmedUp || limit || options.cooldown > 0 || (!rules && options.volume === 0)) return null;
+  if (s.htfEma > 0 && Array.isArray(options.htfBars) && options.htfBars.length >= s.htfEma) {
+    const htfEmaVal = indicatorValue(options.htfBars, { indicator: 'ema', period: s.htfEma });
+    const htfClose = options.htfBars.at(-1)?.c;
+    if (Number.isFinite(htfEmaVal) && Number.isFinite(htfClose) && htfClose < htfEmaVal) return null;
+  }
   if (mode === 'ai_notepad' || mode === 'ai_autonomous') {
     const sizeCap = s.sizeMode === 'usd' && Number.isFinite(s.sizeUsd) ? s.sizeUsd : account.equity * s.size / 100;
     const budget = mode === 'ai_autonomous'
@@ -593,12 +601,14 @@ export function replay(s, bars, options) {
     curve.push({ t: bar.t, value: equity, drawdown: 100 * (equity / peak - 1) });
     historyBars.push(bar);
     const window = strategyWindow(s, historyBars, warmupNeeded, options.maxGapMs);
+    const htfBars = s.htfEma > 0 ? aggregateBars(historyBars, '1Hour') : undefined;
     const atr = s.atrStop > 0 ? computeATR(window, Math.min(14, s.period)) : null;
     pending = decision(s, window.map(b => b.c), { equity, cash: Math.min(cash, remainingBudget(budgetCap, realized)), dayStart, exposure }, position, bar.c, rules, {
       warmedUp: window.length >= warmupNeeded,
       cooldown,
       atr,
       bars: window,
+      htfBars,
       highWater: position?.highWater,
       holdBars: position?.holdBars ?? 0,
       volume: Number.isFinite(bar.v) ? bar.v : undefined
@@ -633,6 +643,33 @@ export function replay(s, bars, options) {
   const openPosition = position && series.length
     ? { qty: position.qty, entry: position.entry, mark: series.at(-1).c, unrealized: position.qty * (series.at(-1).c - position.entry) - position.fee }
     : null;
+  let walkForward = null;
+  if (curve.length >= 20) {
+    const splitIdx = Math.floor(curve.length * 0.7);
+    const splitTime = curve[splitIdx].t;
+    const segmentStats = (pts, segTrades) => {
+      const startEq = pts[0]?.value ?? options.capital;
+      const endEq = pts.at(-1)?.value ?? startEq;
+      let segPeak = startEq, segDd = 0;
+      for (const p of pts) {
+        segPeak = Math.max(segPeak, p.value);
+        if (segPeak > 0) segDd = Math.min(segDd, 100 * (p.value / segPeak - 1));
+      }
+      const segSells = segTrades.filter(t => t.side === 'sell' && Number.isFinite(t.pnl));
+      const segWins = segSells.filter(t => t.pnl > 0).length;
+      return {
+        returnPct: startEq > 0 ? 100 * (endEq / startEq - 1) : 0,
+        maxDrawdown: segDd,
+        closedTrades: segSells.length,
+        winRate: segSells.length ? 100 * segWins / segSells.length : null
+      };
+    };
+    walkForward = {
+      splitAt: splitTime,
+      inSample: segmentStats(curve.slice(0, splitIdx + 1), trades.filter(t => t.t <= splitTime)),
+      outOfSample: segmentStats(curve.slice(splitIdx), trades.filter(t => t.t > splitTime))
+    };
+  }
   const metrics = {
     closedTrades: sells.length,
     wins: wins.length,
@@ -648,6 +685,7 @@ export function replay(s, bars, options) {
     sharpe,
     buyAndHold,
     openPosition,
+    walkForward,
     bars: series.length,
     timeframe: s.timeframe ?? '1Min'
   };
