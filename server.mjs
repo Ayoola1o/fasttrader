@@ -381,9 +381,9 @@ function updateOrder(order) {
   if (prior) Object.assign(prior, order);
   else state.orders.unshift(order);
   if (state.orders.length > 1000) {
-    const active = state.orders.filter(item => !terminal.has(item.status));
-    const settled = state.orders.filter(item => terminal.has(item.status)).slice(0, Math.max(0, 1000 - active.length));
-    state.orders = [...active, ...settled];
+    const keep = state.orders.filter(item => !terminal.has(item.status) || (item.strategyId && Object.hasOwn(state.bots, item.strategyId)));
+    const other = state.orders.filter(item => terminal.has(item.status) && !(item.strategyId && Object.hasOwn(state.bots, item.strategyId)));
+    state.orders = [...keep, ...other.slice(0, Math.max(0, 1000 - keep.length))];
   }
 }
 function catalogEntry(row, assetClass) {
@@ -632,7 +632,7 @@ function orderContext(bot, s, bars, series = strategyBars(s, bars)) {
     bot.highWater = null;
     bot.holdBars = 0;
   }
-  const htfBars = s.htfEma > 0 ? aggregateBars(bars, '1Hour') : undefined;
+  const htfBars = s.htfEma > 0 ? strategyBars({ symbol: s.symbol, timeframe: '1Hour' }, bars) : undefined;
   return {
     position, price, ledger, cash, rules, warmedUp, warmupCount: window.length, warmupNeeded, cooldown, volume, atr, timeframe: tf,
     proposal: decision(s, window.map(b => b.c), account, position, price, rules, {
@@ -709,6 +709,7 @@ async function completeAI(job) {
       if (!currentCandidate(job)) return;
       if (error) {
         bot.status = error.message;
+        bot.aiCallsToday = Math.max(0, (bot.aiCallsToday ?? 1) - 1);
         const keySource = keySourceFor(s, bot.id);
         const detail = describeAiError(error, provider, keySource);
         if (error.status === 429 || error.message.includes('(429)')) bot.aiBackoffUntil = Date.now() + 5 * 60000;
@@ -718,6 +719,7 @@ async function completeAI(job) {
         bot.status = 'Running';
         bot.aiBackoffUntil = 0;
         bot.lastAiError = null;
+        if (s.mode === 'ai_autonomous') bot.lastAiWakeAt = Date.now();
         logEntry('ai', model.side === 'hold' ? 'info' : 'good', `${bot.name} AI → ${model.side.toUpperCase()}${proposal.aiFreeRoam && model.side !== 'hold' ? ` (${model.allocationPct ?? 100}%)` : ''}`, { botId: bot.id, bot: bot.name, symbol: s.symbol, detail: `${model.rationale} [${keySourceFor(s, bot.id)}]` });
         const shouldAct = proposal.aiFreeRoam ? model.side !== 'hold' : model.side === proposal.side;
         if (shouldAct && !unresolvedFor(s.symbol)) {
@@ -781,7 +783,7 @@ async function evaluate(bot) {
   }
   if (unresolvedFor(s.symbol)) { bot.status = 'Waiting for order reconciliation'; return; }
   if (context.proposal?.protective) {
-    const mark = freshQuote(s.symbol) ?? bars.at(-1);
+    const mark = freshQuote(s.symbol) ?? bars.at(-1) ?? { t: time() };
     await applySignal({ bot, s, bar: mark, proposal: context.proposal, epoch, expires: Date.now() + aiLifetime });
     return;
   }
@@ -811,7 +813,8 @@ async function evaluate(bot) {
     bot.lastEvaluation = { t: bar.t, price: context.price, direction: 'hold', rationale };
     return;
   }
-  const candidate = { bot, s, bar, proposal, price: context.price, position: context.position, epoch, expires: Date.now() + aiLifetime };
+  const aiTtl = (s.timeframe ?? '1Min') === '1Min' ? 25000 : 45000;
+  const candidate = { bot, s, bar, proposal, price: context.price, position: context.position, epoch, expires: Date.now() + aiTtl };
   if (s.ai && !proposal.protective) {
     if (!providerFor(s)) {
       bot.status = 'Configure an AI API key in Settings or .env';
@@ -839,9 +842,8 @@ async function evaluate(bot) {
         bot.lastEvaluation = { t: bar.t, price: context.price, direction: 'hold', rationale: wake.trigger };
         return;
       }
-      bot.lastAiWakeAt = Date.now();
     }
-    if (pendingAI.has(bot.id) || pendingAI.size >= symbols.length) {
+    if (pendingAI.has(bot.id) || pendingAI.size >= Math.max(20, Object.keys(state.bots).length)) {
       bot.status = 'Waiting for AI capacity';
       return;
     }
@@ -906,8 +908,15 @@ async function applySignal(candidate, model = null) {
     bot.status = 'Order below crypto minimum';
     return;
   }
-  const client = 'ft-' + createHash('sha256').update([s.id, s.version, bar.t, execSide].join('/')).digest('hex').slice(0, 40);
-  if (state.orders.some(order => order.client === client)) return;
+  const baseClient = 'ft-' + createHash('sha256').update([s.id, s.version, bar.t, execSide].join('/')).digest('hex').slice(0, 40);
+  const existing = state.orders.find(order => order.client === baseClient);
+  let client = baseClient;
+  if (existing) {
+    if (!proposal.protective || !['rejected', 'canceled', 'expired'].includes(existing.status)) return;
+    const retries = state.orders.filter(order => order.client?.startsWith(baseClient + '-r')).length;
+    if (retries >= 3) return;
+    client = baseClient + '-r' + (retries + 1);
+  }
   const order = {
     client, owned: true, strategyId: s.id, strategy: s.name, version: s.version, symbol: s.symbol, side: execSide,
     qty, filled: 0, status: 'unknown', t: time(), price: null,
@@ -1074,7 +1083,10 @@ async function cycle() {
       seedBotHistory(state.paperPortfolio?.running ? [...bots, state.paperPortfolio] : bots);
       for (const bot of bots) {
         const s = state.strategies.find(item => item.id === bot.id && item.version === bot.version);
-        if (s && eligible.has(s.symbol)) void loadTimeframe(s);
+        if (s && eligible.has(s.symbol)) {
+          void loadTimeframe(s);
+          if (s.htfEma > 0) void loadTimeframe({ symbol: s.symbol, timeframe: '1Hour' });
+        }
       }
       const offset = bots.findIndex(bot => bot.id === lastSubmittingBot) + 1;
       for (const bot of [...bots.slice(offset), ...bots.slice(0, offset)]) {
