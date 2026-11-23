@@ -1,5 +1,5 @@
 const getRoutes = new Set(['auth', 'state']);
-const postRoutes = new Set(['auth', 'strategy', 'bot', 'settings', 'profile', 'demo', 'backtest']);
+const postRoutes = new Set(['auth', 'assets', 'strategy', 'strategy-preview', 'bot', 'settings', 'profile', 'demo', 'backtest']);
 const json = (status, error) => Response.json({ error }, { status, headers: { 'Cache-Control': 'no-store' } });
 const maxBodyBytes = 220000;
 
@@ -46,7 +46,7 @@ export async function handleBridge(request, env = process.env, upstreamFetch = f
   try {
     const response = await upstreamFetch(new URL('/api/' + route, worker), {
       method: request.method, headers, body, redirect: 'error', cache: 'no-store',
-      signal: AbortSignal.timeout(route === 'backtest' ? 65000 : 10000)
+      signal: AbortSignal.timeout(['backtest', 'strategy-preview'].includes(route) ? 65000 : 10000)
     });
     if (!response.headers.get('content-type')?.startsWith('application/json')) return json(502, 'The FastTrader worker returned an unexpected response.');
     const output = new Headers({ 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });

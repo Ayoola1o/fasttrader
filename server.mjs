@@ -1,7 +1,7 @@
 import { createServer } from 'node:http';
 import { readFile, mkdir, writeFile, rename } from 'node:fs/promises';
 import { randomUUID, createHash, createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
-import { instruments, defaults, strategy, decision, replay, downsampleCurve, synthetic, botLedger, isCrypto, cryptoReplayRules, roundDown, contiguousBars, aggregateBars, computeATR, computeRSI, indicatorValue, timeframes, ruleWarmupBars, shouldWakeAutonomousAI } from './engine.mjs';
+import { instruments, defaults, strategy, decision, replay, downsampleCurve, synthetic, botLedger, isCrypto, cryptoReplayRules, roundDown, strategyWindow, entrySignal, evaluateRuleSet, aggregateBars, closedStrategyBars, computeATR, computeRSI, indicatorValue, timeframes, ruleWarmupBars, shouldWakeAutonomousAI } from './engine.mjs';
 import { assessSignal, signalProvider, testProviderKey, defaultGeminiModel } from './signal-ai.mjs';
 import { createAuth, sameSecret } from './auth.mjs';
 import { createStore } from './store.mjs';
@@ -88,7 +88,7 @@ async function saveBotAiProvider(provider) {
 const providerFor = (s, botId = s?.id) => (botId && perBotAiProviders.get(botId)) || (s?.mode === 'ai_autonomous' && botAiProvider) || aiProvider;
 const keySourceFor = (s, botId = s?.id) =>
   (botId && perBotAiProviders.has(botId)) ? 'Personal Bot Key' :
-  (s?.mode === 'ai_autonomous' && botAiProvider) ? 'Dedicated Bot Key' : 'Main .env Key';
+    (s?.mode === 'ai_autonomous' && botAiProvider) ? 'Dedicated Bot Key' : 'Main .env Key';
 function describeAiError(error, provider, keySource) {
   const status = error?.status;
   const prov = provider ? `${provider.name} · ${provider.model}` : 'AI provider';
@@ -464,7 +464,12 @@ async function reconcile() {
         updateOrder(normalize(await broker('/orders:by_client_order_id?client_order_id=' + encodeURIComponent(item.client))));
       } catch (error) {
         if (error.status !== 404 || item.status !== 'unknown') throw error;
-        // Ambiguous submissions remain blocked pending broker confirmation.
+        // Require repeated broker confirmations before releasing the symbol.
+        item.firstMissingAt ??= Date.now();
+        if (Date.now() - item.firstMissingAt >= staleOrderMs) {
+          item.status = 'rejected';
+          event('fills', 'Order absent from broker after reconciliation', [item.symbol, item.client]);
+        }
       }
       if (item.side === 'buy' && item.id && !terminal.has(item.status) && item.status !== 'unknown' &&
         Date.now() - Date.parse(item.t) > staleOrderMs) {
@@ -476,7 +481,7 @@ async function reconcile() {
         }
       }
     }
-    state.positions = positions.map(p => ({ symbol: canonicalSymbol(p.symbol, p.asset_class), qty: +p.qty, entry: +p.avg_entry_price, price: +p.current_price }));
+    state.positions = positions.map(p => ({ symbol: canonicalSymbol(p.symbol, p.asset_class), assetClass: p.asset_class, qty: +p.qty, entry: +p.avg_entry_price, price: +p.current_price }));
     state.account = {
       equity: +account.equity, cash: +account.cash, buyingPower: +account.buying_power, dayStart: +account.last_equity,
       cryptoBuyingPower: account.non_marginable_buying_power == null ? +account.cash : +account.non_marginable_buying_power,
@@ -490,18 +495,55 @@ async function reconcile() {
   state.broker = demo ? 'simulated' : 'connected';
   brokerAt = Date.now();
 }
-function ready(symbol) {
+
+async function removeBot(bot) {
+  delete state.bots[bot.id];
+  if (perBotAiProviders.delete(bot.id)) await saveAiSecrets();
+}
+
+async function reconcileClosingBots() {
+  let positions;
+  for (const bot of Object.values(state.bots)) {
+    if (!bot.closingOrder) continue;
+    const order = state.orders.find(item => item.client === bot.closingOrder);
+    if (!order || !terminal.has(order.status) || unresolvedFor(bot.symbol)) continue;
+    if (!positions) {
+      try {
+        positions = demo ? state.positions : (await broker('/positions')).map(position => ({
+          symbol: canonicalSymbol(position.symbol, position.asset_class), qty: +position.qty
+        }));
+      } catch {
+        return; // Keep the deletion pending and retry position confirmation on the next cycle.
+      }
+    }
+    if (positions.some(position => position.symbol === bot.symbol && position.qty !== 0)) {
+      bot.closingOrder = null;
+      bot.status = 'Liquidation incomplete. Position remains open.';
+      event('risk', bot.status, [bot.name, bot.symbol]);
+      continue;
+    }
+    await removeBot(bot);
+    event('risk', `Deleted bot · ${bot.name}`, [`${bot.symbol} position confirmed closed`]);
+  }
+}
+function ready(symbol, protective = false) {
   const bar = state.bars[symbol]?.at(-1);
   const key = feedKey(symbol);
   const open = demo || (isCrypto(symbol) ? state.cryptoSessionOpen : state.sessionOpen);
   return eligible.has(symbol) && (state[key] === 'live' || state[key] === 'simulated' || state[key] === 'polling') && Date.now() - brokerAt < 20000 &&
-    brokerAt >= feedEpoch[key] && open && bar && Date.now() - Date.parse(bar.t) < maxAge;
+    brokerAt >= feedEpoch[key] && open && (
+      (protective && freshQuote(symbol)) || (bar && Date.now() - Date.parse(bar.t) < maxAge)
+    );
 }
-const unresolvedFor = symbol => state.orders.some(order => !terminal.has(order.status) && (order.status === 'unknown' || order.symbol === symbol));
+const unresolvedFor = symbol => state.orders.some(order => order.symbol === symbol && !terminal.has(order.status));
+
+function freshQuote(symbol) {
+  const quote = state.quotes[symbol];
+  return quote && Date.now() - Date.parse(quote.t) < maxAge ? quote : null;
+}
 
 function quotePrice(symbol, bar) {
-  const quote = state.quotes[symbol];
-  return quote && Date.now() - Date.parse(quote.t) < maxAge ? quote.price : bar.c;
+  return freshQuote(symbol)?.price ?? bar?.c;
 }
 
 const botOrders = id => state.orders.filter(order => order.owned && order.strategyId === id);
@@ -542,16 +584,14 @@ async function recentNews(symbol) {
   }
 }
 
-function orderContext(bot, s, bars) {
+function orderContext(bot, s, bars, series = strategyBars(s, bars)) {
   const position = state.positions.find(p => p.symbol === s.symbol);
   const ledger = botLedger(botOrders(bot.id), s.symbol, hasBudget(bot.budget) ? bot.budget : null);
   const rules = isCrypto(s.symbol) ? cryptoRules.get(s.symbol) : null;
   if (!positionMatchesLedger(position, ledger, rules)) return null;
   const tf = s.timeframe ?? '1Min';
-  const tfMs = timeframes[tf] ?? 60000;
-  const series = aggregateBars(bars, tf);
   const bar = series.at(-1) ?? bars.at(-1);
-  const price = quotePrice(s.symbol, bar);
+  const price = quotePrice(s.symbol, bars.at(-1));
   const accountReserved = reservedBuys(state.orders);
   const freeCash = accountReserved === null ? 0 : Math.max(0, state.account.cash - accountReserved);
   const freeBuyingPower = accountReserved === null ? 0 : Math.max(0, state.account.buyingPower - accountReserved);
@@ -561,7 +601,7 @@ function orderContext(bot, s, bars) {
   const botExposure = (position ? position.qty * price : 0) + botReserved;
   const account = { ...state.account, cash, exposure: botExposure };
   const warmupNeeded = ruleWarmupBars(s);
-  const window = contiguousBars(series, warmupNeeded, Math.max(180000, tfMs * 3));
+  const window = strategyWindow(s, series, warmupNeeded);
   const warmedUp = window.length >= warmupNeeded;
   const cooldown = bot.cooldownBars ?? 0;
   const volume = Number.isFinite(bar?.v) ? bar.v : undefined;
@@ -581,9 +621,10 @@ function orderContext(bot, s, bars) {
 }
 
 function currentCandidate(candidate) {
-  const { bot, s, bar, epoch, expires } = candidate;
+  const { bot, s, bar, epoch, expires, proposal } = candidate;
   return state.bots[bot.id] === bot && bot.desired === 'running' && feedEpoch[feedKey(s.symbol)] === epoch &&
-    Date.now() < expires && ready(s.symbol) && state.bars[s.symbol]?.at(-1)?.t === bar.t;
+    Date.now() < expires && ready(s.symbol, proposal.protective) &&
+    (proposal.protective || strategyBars(s).at(-1)?.t === bar.t);
 }
 
 function drainAI() {
@@ -687,25 +728,45 @@ async function completeAI(job) {
 async function evaluate(bot) {
   const s = state.strategies.find(item => item.id === bot.id && item.version === bot.version);
   const bars = state.bars[s.symbol] ?? [];
-  const bar = bars.at(-1);
-  if (!ready(s.symbol)) {
+  if (!ready(s.symbol, true)) {
     bot.status = !demo && !isCrypto(s.symbol) && state.broker === 'connected' && !state.sessionOpen
       ? 'Stock session closed or trading unavailable' : 'Waiting for fresh feed and broker';
     return;
   }
-  if (unresolvedFor(s.symbol)) { bot.status = 'Waiting for order reconciliation'; return; }
   const epoch = feedEpoch[feedKey(s.symbol)];
-  if (Date.parse(bar.t) + (demo ? 0 : 60000) < Math.max(bot.started, epoch)) {
+  const series = strategyBars(s, bars);
+  const bar = series.at(-1);
+  const position = state.positions.find(p => p.symbol === s.symbol);
+  if (position?.qty > 0 && bar && bar.t !== bot.lastHoldBar) {
+    const duration = timeframes[s.timeframe ?? '1Min'];
+    const entry = !bot.holdBars && botOrders(bot.id).find(order => order.side === 'buy' && order.filled > 0);
+    const enteredAt = entry ? Date.parse(entry.filledAt ?? entry.t) : -Infinity;
+    const elapsed = (bot.lastHoldBar ? series.filter(candle => candle.t > bot.lastHoldBar) : [bar]).filter(candle => {
+      const timestamp = Date.parse(candle.t);
+      const closesAt = demo && duration === 60000 ? timestamp : (Math.floor(timestamp / duration) + 1) * duration;
+      return closesAt >= enteredAt;
+    });
+    bot.holdBars = (bot.holdBars ?? 0) + elapsed.length;
+    bot.lastHoldBar = bar.t;
+  }
+  const context = orderContext(bot, s, bars, series);
+  if (!context) {
+    bot.status = 'Position differs from strategy fills';
+    bot.lastEvaluation = { t: bar?.t ?? time(), direction: 'hold', rationale: bot.status };
+    return;
+  }
+  if (unresolvedFor(s.symbol)) { bot.status = 'Waiting for order reconciliation'; return; }
+  if (context.proposal?.protective) {
+    const mark = freshQuote(s.symbol) ?? bars.at(-1);
+    await applySignal({ bot, s, bar: mark, proposal: context.proposal, epoch, expires: Date.now() + aiLifetime });
+    return;
+  }
+  if (!ready(s.symbol)) return;
+  if (!bar || Date.parse(bar.t) + (demo && s.timeframe === '1Min' ? 0 : timeframes[s.timeframe ?? '1Min']) < Math.max(bot.started, epoch)) {
     bot.status = 'Waiting for a new bar';
     return;
   }
   if (bar.t === bot.lastBar) return;
-  const context = orderContext(bot, s, bars);
-  if (!context) {
-    bot.status = 'Position differs from strategy fills';
-    bot.lastEvaluation = { t: bar.t, direction: 'hold', rationale: bot.status };
-    return;
-  }
   const minimum = context.rules ? Math.max(context.rules.minValue, context.price * context.rules.minimum) : context.price;
   bot.status = !hasBudget(bot.budget) ? 'Budget required for new buys' :
     !context.ledger.complete ? 'Awaiting complete fill history' :
@@ -715,15 +776,14 @@ async function evaluate(bot) {
   const { proposal } = context;
   if (!proposal) {
     bot.lastBar = bar.t;
-    if (context.position?.qty > 0) bot.holdBars = (bot.holdBars ?? 0) + 1;
     if ((bot.cooldownBars ?? 0) > 0) bot.cooldownBars--;
     const rationale = !context.warmedUp && !context.position ? `Warming up: ${context.warmupCount}/${context.warmupNeeded} contiguous ${context.timeframe} candles` :
       context.cooldown > 0 && !context.position ? `Post-stop-loss cooldown (${context.cooldown} bars remaining)` :
-      !context.rules && context.volume === 0 && !context.position ? 'Skipped zero-volume bar' :
-      bot.status !== 'Running' ? bot.status :
-      state.account.equity <= state.account.dayStart * (1 - s.dailyLoss / 100) ? 'Daily loss limit reached' :
-      context.cash < minimum && !context.position ? 'Available buying power is below the minimum order' :
-      context.position ? 'Holding the current position. No exit rule matched.' : 'No entry passed the strategy and risk rules.';
+        !context.rules && context.volume === 0 && !context.position ? 'Skipped zero-volume bar' :
+          bot.status !== 'Running' ? bot.status :
+            state.account.equity <= state.account.dayStart * (1 - s.dailyLoss / 100) ? 'Daily loss limit reached' :
+              context.cash < minimum && !context.position ? 'Available buying power is below the minimum order' :
+                context.position ? 'Holding the current position. No exit rule matched.' : 'No entry passed the strategy and risk rules.';
     bot.lastEvaluation = { t: bar.t, price: context.price, direction: 'hold', rationale };
     return;
   }
@@ -746,7 +806,7 @@ async function evaluate(bot) {
       logEntry('bot', 'warn', `${bot.name} paused AI calls (daily cap ${bot.aiCallsToday}/${s.aiDailyCap})`, { botId: bot.id, bot: bot.name, symbol: s.symbol });
       return;
     }
-    const richBars = (s.mode === 'ai_notepad' || s.mode === 'ai_autonomous') ? aggregateBars(bars, s.timeframe ?? '1Min').slice(-60) : bars.slice(-20);
+    const richBars = series.slice(s.mode === 'ai_notepad' || s.mode === 'ai_autonomous' ? -60 : -20);
     if (s.mode === 'ai_autonomous' && s.aiWakeMode === 'smart') {
       const wake = shouldWakeAutonomousAI(richBars, bot.lastAiWakeAt ?? 0);
       if (!wake.wake) {
@@ -795,6 +855,7 @@ async function applySignal(candidate, model = null) {
   if (!context) return;
   const { position, price: latest, proposal: validated, rules, cash } = context;
   if (!validated) return;
+  if (validated.protective !== proposal.protective) return;
   if (!proposal.aiFreeRoam && validated.side !== execSide) return;
   if (execSide === 'sell' && !(position?.qty > 0)) return;
   if (execSide === 'buy' && position?.qty > 0 && !(proposal.aiFreeRoam && s.aiSizing === 'dynamic')) return;
@@ -882,6 +943,52 @@ async function seedHistory(symbol) {
     state.bars[symbol] = [...merged.values()].sort((a, b) => a.t.localeCompare(b.t)).slice(-1500);
   });
 }
+const timeframeHistory = new Map();
+const timeframeLoads = new Map();
+const timeframeRefreshAt = new Map();
+const historyKey = s => s.symbol + ':' + s.timeframe;
+const maxStrategyBars = 240;
+
+function strategyBars(s, raw = state.bars[s.symbol] ?? []) {
+  const recent = closedStrategyBars(raw, s.timeframe, Date.now(), demo);
+  if (!s.timeframe || s.timeframe === '1Min') return recent;
+  const key = historyKey(s);
+  const historical = timeframeHistory.get(key);
+  if (!historical) return recent;
+  const merged = new Map(historical.map(bar => [bar.t, bar]));
+  for (const bar of recent) {
+    if (!merged.has(bar.t)) merged.set(bar.t, bar);
+  }
+  const result = [...merged.values()].sort((a, b) => a.t.localeCompare(b.t)).slice(-maxStrategyBars);
+  timeframeHistory.set(key, result);
+  return result;
+}
+
+function loadTimeframe(s) {
+  if (!s.timeframe || s.timeframe === '1Min') return;
+  const key = historyKey(s);
+  if (timeframeLoads.has(key)) return timeframeLoads.get(key);
+  if (Date.now() < (timeframeRefreshAt.get(key) ?? 0)) return;
+  const duration = timeframes[s.timeframe];
+  const end = Math.floor(Date.now() / duration) * duration;
+  const days = demo || isCrypto(s.symbol) ? 1 + Math.ceil(maxStrategyBars * duration / 86400000) :
+    { '5Min': 10, '15Min': 25, '1Hour': 65 }[s.timeframe];
+  const load = history(s.symbol, end - days * 86400000, end - 1, s.timeframe)
+    .then(bars => {
+      const closed = closedStrategyBars(bars, s.timeframe, end).slice(-maxStrategyBars);
+      if (closed.length) {
+        timeframeHistory.set(key, closed);
+        timeframeRefreshAt.set(key, Date.now() + 6 * 3600000);
+      } else {
+        timeframeRefreshAt.set(key, Date.now() + 60000);
+      }
+    })
+    .catch(() => timeframeRefreshAt.set(key, Date.now() + 60000))
+    .finally(() => timeframeLoads.delete(key));
+  timeframeLoads.set(key, load);
+  return load;
+}
+
 const historySeeded = new Set(symbols);
 const historyRetryAt = new Map();
 let seedingHistory = false;
@@ -936,8 +1043,13 @@ async function cycle() {
         state.broker = 'offline';
         brokerAt = 0;
       }
+      if (brokerAt) await reconcileClosingBots();
       const bots = Object.values(state.bots).filter(bot => bot.desired === 'running');
       seedBotHistory(bots);
+      for (const bot of bots) {
+        const s = state.strategies.find(item => item.id === bot.id && item.version === bot.version);
+        if (s && eligible.has(s.symbol)) void loadTimeframe(s);
+      }
       const offset = bots.findIndex(bot => bot.id === lastSubmittingBot) + 1;
       for (const bot of [...bots.slice(offset), ...bots.slice(0, offset)]) {
         const count = state.orders.length;
@@ -1226,7 +1338,7 @@ if (telegram.configured) {
   ]);
 }
 
-const assets = { '/': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/style.css': ['style.css', 'text/css'], '/sw.js': ['sw.js', 'text/javascript'], '/mark.svg': ['mark.svg', 'image/svg+xml'], '/favicon.ico': ['mark.svg', 'image/svg+xml'] };
+const assets = { '/': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/strategy-playbooks.mjs': ['strategy-playbooks.mjs', 'text/javascript'], '/style.css': ['style.css', 'text/css'], '/sw.js': ['sw.js', 'text/javascript'], '/dashboard-ai.png': ['dashboard-ai.png', 'image/png'], '/mark.svg': ['mark.svg', 'image/svg+xml'], '/favicon.ico': ['mark.svg', 'image/svg+xml'] };
 function snapshot() {
   const visibleSymbols = [...new Set([...trackedSymbols(), ...Object.values(state.bots).map(bot => bot.symbol), ...state.strategies.map(item => item.symbol)])];
   const market = visibleSymbols.map(symbol => {
@@ -1359,7 +1471,7 @@ async function change(path, input) {
       event('fills', s.name + ' adopted open ' + symbol + ' position' + (extra > 0 ? ' + $' + extra.toFixed(2) + ' funds' : ''));
       return state.bots[s.id];
     }
-    async function liquidateBotPosition(bot, { pause = false, reason = 'Manual position liquidation requested' } = {}) {
+    async function liquidateBotPosition(bot, { pause = false, deleteAfterFill = false, reason = 'Manual position liquidation requested' } = {}) {
       const symbol = bot.symbol;
       if (unresolvedFor(symbol)) throw Error('Wait for the existing ' + symbol + ' order to reconcile first.');
       const position = state.positions.find(p => p.symbol === symbol && p.qty > 0);
@@ -1385,6 +1497,11 @@ async function change(path, input) {
         updateOrder(order);
         await reconcile();
       } else {
+        if (deleteAfterFill) {
+          bot.closingOrder = client;
+          bot.desired = 'paused';
+          bot.status = 'Liquidation pending';
+        }
         state.orders.unshift(order);
         await persist();
         try {
@@ -1414,15 +1531,23 @@ async function change(path, input) {
     if (input.delete === true) {
       const bot = state.bots[input.id];
       if (!bot) throw Error('Bot not found.');
+      if (bot.closingOrder) throw Error('Wait for the liquidation order to reconcile.');
+      if (!demo && input.liquidate === true) await reconcile();
       const symbol = bot.symbol;
       const position = state.positions.find(p => p.symbol === symbol && p.qty > 0);
       let order = null;
       if (input.liquidate === true && position) {
-        const closed = await liquidateBotPosition(bot, { pause: false, reason: 'Bot deleted — position liquidated' });
+        const closed = await liquidateBotPosition(bot, { deleteAfterFill: true, reason: 'Liquidation requested before bot deletion' });
         order = closed.order;
+        if (!demo || state.positions.some(item => item.symbol === symbol && item.qty !== 0)) {
+          if (demo) {
+            bot.desired = 'paused';
+            bot.status = 'Liquidation incomplete. Position remains open.';
+          }
+          return { deleted: null, liquidated: false, pending: !demo, leftOpen: demo, order };
+        }
       }
-      delete state.bots[bot.id];
-      if (perBotAiProviders.delete(bot.id)) await saveAiSecrets();
+      await removeBot(bot);
       const details = order
         ? [`Bot: ${bot.name}`, `Liquidated ${order.qty} ${symbol} at market`]
         : position
@@ -1434,6 +1559,7 @@ async function change(path, input) {
     if (input.liquidate === true) {
       const bot = state.bots[input.id];
       if (!bot) throw Error('Bot not found.');
+      if (bot.closingOrder) throw Error('Wait for the liquidation order to reconcile.');
       const { order, qty, symbol } = await liquidateBotPosition(bot, { pause: input.pause === true });
       event('risk', `Manual liquidation · ${symbol}`, [`Bot: ${bot.name}`, `Submitted market sell for ${qty} ${symbol}`]);
       return { bot, order };
@@ -1470,6 +1596,7 @@ async function change(path, input) {
       }
     }
     const previous = state.bots[s.id];
+    if (previous?.closingOrder) throw Error('Wait for the liquidation order to reconcile.');
     if (input.create === true && previous) throw Error('This strategy already has a bot. Use its controls to resume it.');
     if (input.action !== 'running' && previous?.version !== s.version) throw Error('This bot version changed. Refresh and try again.');
     const budget = input.action === 'running' && input.budget !== undefined ? input.budget : previous?.budget;
@@ -1505,6 +1632,10 @@ async function change(path, input) {
       id: s.id, version: s.version, name: s.name, symbol: s.symbol, desired: input.action, status: input.action,
       budget, createdAt: previous?.createdAt ?? previous?.started ?? Date.now(), started: Date.now(),
       lastBar: previous?.symbol === s.symbol ? previous.lastBar : undefined,
+      lastHoldBar: previous?.symbol === s.symbol ? previous.lastHoldBar : undefined,
+      holdBars: previous?.symbol === s.symbol ? previous.holdBars : undefined,
+      highWater: previous?.symbol === s.symbol ? previous.highWater : undefined,
+      cooldownBars: previous?.symbol === s.symbol ? previous.cooldownBars : undefined,
       lastEvaluation: previous?.version === s.version && previous?.symbol === s.symbol ? previous.lastEvaluation : undefined
     };
     logEntry('bot', input.action === 'running' ? 'good' : 'info', `${s.name} → ${input.action.toUpperCase()}`, { botId: s.id, bot: s.name, symbol: s.symbol, detail: `Strategy v${s.version}${budget ? ' · Budget $' + budget.toFixed(2) : ''}` });
@@ -1580,6 +1711,25 @@ async function change(path, input) {
   }
   throw Error('Unknown operation');
 }
+async function previewStrategy(input) {
+  const s = validateStrategy(input);
+  if (s.mode === 'ai_notepad' || s.mode === 'ai_autonomous') throw Error('Select a rule-based strategy to preview.');
+  await loadTimeframe(s);
+  const needed = ruleWarmupBars(s);
+  const bars = strategyWindow(s, strategyBars(s), needed);
+  const ready = bars.length >= needed;
+  const groups = {};
+  for (const side of ['entry', 'exit']) {
+    if (s.rules?.[side]?.length) {
+      const group = evaluateRuleSet(bars, s.rules, side);
+      groups[side] = { logic: s.rules[side + 'Logic'], ...group, ready: ready && group.ready, pass: ready && group.pass };
+    }
+  }
+  const latest = bars.at(-1);
+  const zeroVolume = !isCrypto(s.symbol) && latest?.v === 0;
+  return { ready, needed, count: bars.length, latest, groups, zeroVolume, entry: ready && !zeroVolume ? entrySignal(s, bars) : null };
+}
+
 async function backtest(input) {
   const s = state.strategies.find(item => item.id === input.id && item.version === input.version);
   if (!s || s.mode === 'ai_notepad' || s.mode === 'ai_autonomous') throw Error('AI Notepad and Autonomous AI strategies cannot be replayed deterministically. Select a Rule Builder or preset strategy.');
@@ -1601,6 +1751,7 @@ async function backtest(input) {
   return serial(async () => {
     const run = {
       id: randomUUID(), t: time(), name: s.name, version: s.version, symbol: s.symbol, timeframe: tf,
+      ...(s.playbookId ? { playbookId: s.playbookId } : {}),
       capital, ...(hasBudget ? { budget } : {}), fees, slippage, start: input.start, end: input.end,
       source: sourceFor(s.symbol), final: result.final, drawdown: result.drawdown, metrics: result.metrics,
       tradeCount: result.trades.length, curve: storedCurve, trades: storedTrades
@@ -1637,6 +1788,7 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/assets') return respond(200, searchAssets(await body(req, 2000)));
     if (req.method === 'POST' && url.pathname.startsWith('/api/')) {
       const input = await body(req, url.pathname === '/api/profile' ? 220000 : 20000);
+      if (url.pathname === '/api/strategy-preview') return respond(200, await previewStrategy(input));
       const result = url.pathname === '/api/backtest' ? await backtest(input) : await serial(async () => {
         if (!auth.authenticated(req.headers.cookie)) throw Object.assign(Error('Sign in to FastTrader.'), { status: 401 });
         const value = await change(url.pathname, input);
@@ -1648,7 +1800,7 @@ const server = createServer(async (req, res) => {
     const asset = assets[url.pathname];
     if (req.method !== 'GET' || !asset) return respond(404, { error: 'Not found' });
     const contents = await readFile(new URL('./public/' + asset[0], import.meta.url));
-    res.writeHead(200, { 'Content-Type': asset[1] + '; charset=utf-8', 'Cache-Control': 'no-cache', 'X-Content-Type-Options': 'nosniff' });
+    res.writeHead(200, { 'Content-Type': asset[1].startsWith('image/png') ? asset[1] : asset[1] + '; charset=utf-8', 'Cache-Control': 'no-cache', 'X-Content-Type-Options': 'nosniff' });
     res.end(contents);
   } catch (error) { respond(error.status >= 400 && error.status < 600 ? error.status : 400, { error: error instanceof SyntaxError ? 'Invalid JSON' : error.message }); }
 });

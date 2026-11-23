@@ -9,10 +9,26 @@ import { runInNewContext } from 'node:vm';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { defaults, decision, replay, downsampleCurve, botLedger, contiguousBars, aggregateBars, computeATR, strategy, evaluateRuleSet, shouldWakeAutonomousAI } from './engine.mjs';
+import { defaults, decision, replay, downsampleCurve, botLedger, contiguousBars, aggregateBars, closedStrategyBars, computeATR, strategy, strategyWindow, evaluateRuleSet, shouldWakeAutonomousAI } from './engine.mjs';
 import { signalProvider, assessSignal } from './signal-ai.mjs';
 import { createTelegram } from './telegram.mjs';
 import { handleBridge } from './api/bridge.js';
+import { strategyPlaybooks } from './public/strategy-playbooks.mjs';
+
+test('strategy waits for the timeframe to close and treats max hold as a protective exit', () => {
+  const bars = ['12:00', '12:14', '12:15'].map((stamp, index) => ({
+    t: `2026-11-23T${stamp}:00.000Z`, o: 100, h: 103, l: 99, c: 100 + index
+  }));
+  assert.deepEqual(closedStrategyBars(bars, '15Min', Date.parse('2026-11-23T12:14:59Z')), []);
+  const closed = closedStrategyBars(bars, '15Min', Date.parse('2026-11-23T12:15:00Z'));
+  assert.deepEqual(closed.map(bar => [bar.t, bar.c]), [[bars[0].t, 101]]);
+  const proposal = decision(
+    { ...defaults, maxHoldBars: 2, ai: true }, [], { equity: 1000, dayStart: 1000 },
+    { entry: 100, qty: 1 }, 100, null, { holdBars: 2, warmedUp: false }
+  );
+  assert.equal(proposal.side, 'sell');
+  assert.equal(proposal.protective, true);
+});
 
 test('replay decides at the close and fills at the next open with costs and sizing limits', () => {
   const rules = { ...defaults, period: 2, entry: 0, stop: 2, take: 4 };
@@ -141,12 +157,39 @@ test('timeframe aggregation, mean reversion, breakout, and ATR stops work determ
   const mrBuy = decision(mr, [100, 100, 100, 100, 92], account, null, 92);
   assert.equal(mrBuy?.side, 'buy');
   const bo = { ...defaults, mode: 'breakout', period: 4, entry: 0 };
-  const boBuy = decision(bo, [100, 101, 102, 105], account, null, 105);
+  const boBuy = decision(bo, [100, 101, 102, 103, 105], account, null, 105);
   assert.equal(boBuy?.side, 'buy');
+  const wickBars = mins.slice(0, 5).map((bar, index) => ({ ...bar, h: 120, l: 80, c: 100 + index }));
+  assert.equal(decision(bo, wickBars.map(bar => bar.c), account, null, 104, null, { bars: wickBars }), null);
+  wickBars.at(-1).c = 95;
+  assert.equal(decision({ ...bo, stop: 20 }, wickBars.map(bar => bar.c), account, { qty: 1, entry: 100 }, 95, null, { bars: wickBars }), null);
   const atrRule = { ...defaults, stop: 10, atrStop: 1 };
   const atrExit = decision(atrRule, [100, 98], account, { qty: 10, entry: 100 }, 98.5, null, { atr: 1 });
   assert.equal(atrExit?.side, 'sell');
   assert.equal(atrExit?.stopLoss, true);
+});
+
+test('custom crossings can evaluate a 200-period indicator', () => {
+  const s = strategy({ ...defaults, mode: 'custom', rules: { entry: [{
+    left: { indicator: 'rsi', period: 200 }, op: 'crosses_above', right: { indicator: 'number', value: 0 }
+  }] } });
+  const bars = Array.from({ length: 202 }, (_, i) => ({
+    t: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(), c: i < 201 ? 400 - i : 500
+  }));
+  const window = strategyWindow(s, bars);
+  assert.equal(window.length, 202);
+  assert.equal(evaluateRuleSet(window, s.rules, 'entry').pass, true);
+});
+
+test('replay reduces the next entry budget by realized losses', () => {
+  const s = strategy({ ...defaults, mode: 'custom', cooldown: 0, stop: 10, period: 2, rules: { entry: [{
+    left: { indicator: 'close' }, op: 'gt', right: { indicator: 'number', value: 0 }
+  }] } });
+  const bars = Array.from({ length: 5 }, (_, i) => ({
+    t: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(), o: 100, h: 100, l: i === 2 ? 89 : 100, c: 100, v: 10
+  }));
+  const result = replay(s, bars, { capital: 10000, budget: 500, fees: 0, slippage: 0 });
+  assert.deepEqual(result.trades.map(({side, qty}) => [side, qty]), [['buy', 5], ['sell', 5], ['buy', 4]]);
 });
 
 test('custom rule builder supports indicator comparisons, crosses, trailing stop, maxHoldBars, and USD sizing', () => {
@@ -301,6 +344,39 @@ async function withWorker(run, mockAI, env = {}, preloadSource = '') {
     await rm(cwd,{recursive:true,force:true});
   }
 }
+
+test('strategy preview backfills hourly history and evaluates the selected rule engine', async () => {
+  await withWorker(async api => {
+    const draft = { ...defaults, symbol: 'BTC/USD', timeframe: '1Hour', mode: 'custom', rules: { entry: [{
+      left: { indicator: 'sma', period: 200 }, op: 'gt', right: { indicator: 'number', value: 0 }
+    }] } };
+    const result = await api('strategy-preview', draft);
+    assert.equal(result.ready, true);
+    assert.equal(result.count, 202);
+    assert.equal(result.groups.entry.pass, true);
+    assert.match(result.entry, /Custom entry rules matched/);
+    assert.ok(Date.parse(result.latest.t) + 3600000 <= Date.now());
+  });
+});
+
+test('playbook drafts validate and saved replays retain the source playbook', async () => {
+  await withWorker(async (api, _until, url) => {
+    const module = await fetch(url + '/strategy-playbooks.mjs');
+    assert.equal(module.status, 200);
+    assert.match(module.headers.get('content-type'), /javascript/);
+    for (const [playbookId, playbook] of Object.entries(strategyPlaybooks)) {
+      const draft = { ...defaults, ...playbook.draft, playbookId, mode: 'custom', name: playbook.name, symbol: 'BTC/USD' };
+      const saved = await api('strategy', draft);
+      assert.equal(saved.playbookId, playbookId);
+      assert.deepEqual(saved.rules, draft.rules);
+      const start = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+      const end = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+      const result = await api('backtest', { id: saved.id, version: saved.version, start, end, capital: 10000, fees: 25, slippage: 5 });
+      const snapshot = await api('state');
+      assert.equal(snapshot.runs.find(run => run.id === result.id)?.playbookId, playbookId);
+    }
+  });
+});
 
 test('screen, version, replay and execute a demo strategy, then pause safely through feed and broker outages', { timeout: 95000 }, async () => {
   await withWorker(async (api, until) => {
@@ -540,7 +616,7 @@ test('the hosted bridge and worker enforce owner sign-up, authentication and sig
 });
 
 
-test('Alpaca catalog pages include assets beyond the watchlist and only eligible instruments can launch bots', async () => {
+test('Alpaca catalog supports eligible assets and deletion waits for liquidation', async () => {
   await withWorker(async (api, until) => {
     const first = await until(async () => {
       const result = await api('assets', { assetClass: 'us_equity' });
@@ -563,10 +639,30 @@ test('Alpaca catalog pages include assets beyond the watchlist and only eligible
     const snapshot = await api('state');
     assert.ok(snapshot.market.some(asset => asset.symbol === 'DOGE/USD'));
     assert.ok(!snapshot.market.some(asset => asset.symbol === 'TEST01'));
+
+    const bot = await api('bot', { id: saved.id, version: saved.version, adopt: true, symbol: 'GLD' });
+    const firstClose = await api('bot', { id: bot.id, delete: true, liquidate: true });
+    assert.equal(firstClose.pending, true);
+    assert.equal(firstClose.liquidated, false);
+    assert.equal((await api('state')).bots[bot.id].closingOrder, firstClose.order.client);
+    await until(async () => {
+      const state = await api('state');
+      return state.bots[bot.id]?.status === 'Liquidation incomplete. Position remains open.';
+    });
+
+    const retry = await api('bot', { id: bot.id, delete: true, liquidate: true });
+    assert.equal(retry.pending, true);
+    assert.equal(retry.order.qty, 1);
+    await until(async () => {
+      const state = await api('state');
+      return !state.bots[bot.id] && !state.positions.some(position => position.symbol === 'GLD');
+    });
   }, null, { FASTTRADER_MODE: 'alpaca', ALPACA_KEY: 'test-key', ALPACA_SECRET: 'test-secret' }, `
     const originalFetch = globalThis.fetch;
     const asset = (symbol, kind, details = {}) => ({ symbol, class: kind, name: symbol, tradable: true, ...details });
     const cryptoRules = { fractionable: true, min_trade_increment: '0.1', min_order_size: '1', price_increment: '0.000001' };
+    let remaining = 2;
+    const closes = [];
     globalThis.WebSocket = class {
       addEventListener() {}
       close() {}
@@ -590,6 +686,28 @@ test('Alpaca catalog pages include assets beyond the watchlist and only eligible
         }
         case '/v2/account': return Response.json({ status: 'ACTIVE', cash: '10000', equity: '10000', buying_power: '10000' });
         case '/v2/clock': return Response.json({ is_open: false });
+        case '/v2/positions': return Response.json(remaining ? [{
+          symbol: 'GLD', asset_class: 'us_equity', qty: String(remaining), avg_entry_price: '100',
+          current_price: '100', market_value: String(remaining * 100)
+        }] : []);
+        case '/v2/orders': {
+          if (options?.method === 'POST') {
+            const order = JSON.parse(options.body);
+            const accepted = { ...order, id: 'close-' + closes.length, asset_class: 'us_equity',
+              submitted_at: new Date().toISOString(), status: 'accepted', filled_qty: '0' };
+            closes.push(accepted);
+            return Response.json(accepted);
+          }
+          return Response.json(closes.filter(order => url.searchParams.get('status') !== 'open' || order.status === 'accepted'));
+        }
+        case '/v2/orders:by_client_order_id': {
+          const order = closes.find(item => item.client_order_id === url.searchParams.get('client_order_id'));
+          if (!order) return Response.json({}, { status: 404 });
+          remaining--;
+          Object.assign(order, { status: remaining ? 'canceled' : 'filled', filled_qty: '1',
+            filled_avg_price: '100', filled_at: new Date().toISOString() });
+          return Response.json(order);
+        }
         default: return Response.json([]);
       }
     };

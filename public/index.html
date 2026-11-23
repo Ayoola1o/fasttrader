@@ -7,7 +7,7 @@
 <title>FastTrader | Paper Trading Workspace</title>
 <link rel="icon" href="/mark.svg">
 <link rel="stylesheet" href="/style.css">
-<script src="/app.js" defer></script>
+<script src="/app.js" type="module"></script>
 </head>
 <body>
 <aside class="sidebar">
@@ -22,6 +22,10 @@
   <header class="topbar">
     <a class="mobile-brand" href="#dashboard"><img src="/mark.svg" alt=""><span>Fast<span>Trader</span></span></a>
     <div id="crumb">Workspace <span>/</span> <strong>Dashboard</strong></div>
+    <form id="dashboard-search" class="dashboard-search" role="search" aria-label="Search the asset catalog">
+      <label><span aria-hidden="true">⌕</span><input type="search" name="query" aria-label="Search markets" placeholder="Search markets…" maxlength="80" required></label>
+      <kbd>Ctrl / ⌘ K</kbd>
+    </form>
     <div class="top-actions">
       <span class="connection" id="connection"><i class="dot"></i> Connecting</span>
       <button type="button" class="icon-button bell-button" id="bell" data-action="toggle-notifs" aria-label="Notifications" aria-expanded="false"></button>

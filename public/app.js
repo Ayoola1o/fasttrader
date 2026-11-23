@@ -1,3 +1,5 @@
+import { strategyPlaybooks } from './strategy-playbooks.mjs';
+
 const pages={dashboard:'Dashboard',trading:'Live Trading',session:'Bot Session',screener:'Screener',strategies:'Strategy Editor',backtesting:'Backtesting',portfolio:'Portfolio',history:'History',logs:'Logs',settings:'Settings',profile:'Profile'};
 const paths={
 dashboard:'M3 3h7v7H3zm11 0h7v7h-7zM3 14h7v7H3zm11 0h7v7h-7z',screener:'M3 4h18v4l-7 6v5l-4 2v-7L3 8z',
@@ -35,7 +37,12 @@ function read(k){try{return JSON.parse(localStorage.getItem(k))}catch{return nul
 function write(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch{}}
 const localWorkspace=['127.0.0.1','localhost'].includes(location.hostname);
 let authInfo=null,authMode='login',authRevision=0,authError='';
-let state=null,online=false,active='',selected='',chartMode='Price',range='1H',assetClass='Stocks',editor=null,editorRoute='',runA='',runB=null,pending=false,syncing=false,toastTimer;
+let state=null,online=false,active='',selected='',chartMode='Equity',range='1H',assetClass='Stocks',editor=null,editorRoute='',runA='',runB=null,pending=false,syncing=false,toastTimer;
+let playbookLibraryOpen=false;
+let backtestDraft=null, backtestVersionRoute=null;
+let portfolioRange='1W', accountRange='1M', showAllPositions=false;
+const accountPeriods={'1M':'Last 30 days','3M':'Last 90 days','1Y':'Last year','ALL':'All time'};
+const portfolioRanges={'1D':1,'1W':7,'1M':30,'3M':90,'1Y':365,'ALL':Infinity};
 const ranges={'15M':15,'1H':60,'4H':240,'1D':1440};
 const screen={search:'',volume:0,volatility:0};
 const cryptoScreen={search:'',volume:0,volatility:0};
@@ -66,6 +73,7 @@ function chrome(){
    mobileNav.innerHTML=mobileTabs.map(([k,label])=>`<a href="#${k}" class="mobile-tab ${k===active||k==='trading'&&active==='session'?'active':''}" ${k===active?'aria-current="page"':''}>${icon(k)}<span>${label}</span></a>`).join('');
    mobileNav.dataset.page=active;
  }
+ $('.topbar').classList.toggle('dashboard-topbar',active==='dashboard');
  $('#crumb').innerHTML='Workspace <span>/</span> <strong>'+pages[active]+'</strong>';
  const unread=state?.events?state.events.filter(e=>!lastSeenNotif||e.t>lastSeenNotif).length:0;
  const bell=$('#bell');
@@ -106,7 +114,7 @@ function renderNotifDrawer(){
   <div class="notif-foot"><a class="button" href="#settings" data-action="close-notifs">Alert preferences &amp; Integrations →</a></div>`;
 }
 let chartId=0;
-function plot(points,unit='price'){
+function plot(points,unit='price',accent='#4be4b2'){
  if(points.length<2)return empty('Chart history will appear as data arrives.');
  const max=Math.max(...points.map(p=>p.value)),min=Math.min(...points.map(p=>p.value));
  const pad=Math.max((max-min)*.15,Math.abs(max)*.0004,.01),low=min-pad,high=max+pad;
@@ -115,7 +123,7 @@ function plot(points,unit='price'){
  const grids=Array.from({length:5},(_,i)=>{const row=12+i*54.5,v=high-(high-low)*i/4;return `<path d="M10 ${row}H700" stroke="#28364a" stroke-dasharray="3 5"/><text x="711" y="${row+4}">${unit==='percent'?v.toFixed(1)+'%':num(v)}</text>`}).join('');
  const ticks=Array.from({length:6},(_,i)=>{const j=Math.round((points.length-1)*i/5),long=Date.parse(points.at(-1).t)-Date.parse(points[0].t)>86400000;return `<text x="${x(j)}" y="253" text-anchor="${i===0?'start':i===5?'end':'middle'}">${esc(stamp(points[j].t,long?{month:'short',day:'numeric'}:{hour:'2-digit',minute:'2-digit',hour12:false}))}</text>`}).join('');
  const id='shade'+(++chartId);
- return `<div class="plot" tabindex="0" aria-label="Interactive chart. Use arrow keys to inspect values." data-points="${esc(JSON.stringify(points))}" data-unit="${unit}" data-low="${low}" data-high="${high}"><svg viewBox="0 0 790 265" role="img" aria-label="Time series chart"><defs><linearGradient id="${id}" x1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#43e2ae" stop-opacity=".23"/><stop offset="100%" stop-color="#43e2ae" stop-opacity="0"/></linearGradient></defs>${grids}${ticks}<path d="${line} L700 230 H10 Z" fill="url(#${id})"/><path d="${line}" fill="none" stroke="#4be4b2" stroke-width="2" vector-effect="non-scaling-stroke"/><line class="crosshair" y1="12" y2="230" stroke="#7e98b5" stroke-dasharray="4 4" visibility="hidden"/><circle class="point" r="4" fill="#4be4b2" stroke="#0b1018" stroke-width="2" visibility="hidden"/></svg><div class="tooltip" role="status" hidden></div></div>`;
+ return `<div class="plot" tabindex="0" aria-label="Interactive chart. Use arrow keys to inspect values." data-points="${esc(JSON.stringify(points))}" data-unit="${unit}" data-low="${low}" data-high="${high}"><svg viewBox="0 0 790 265" role="img" aria-label="Time series chart"><defs><linearGradient id="${id}" x1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="${accent}" stop-opacity=".23"/><stop offset="100%" stop-color="${accent}" stop-opacity="0"/></linearGradient></defs>${grids}${ticks}<path d="${line} L700 230 H10 Z" fill="url(#${id})"/><path d="${line}" fill="none" stroke="${accent}" stroke-width="2" vector-effect="non-scaling-stroke"/><line class="crosshair" y1="12" y2="230" stroke="#7e98b5" stroke-dasharray="4 4" visibility="hidden"/><circle class="point" r="4" fill="${accent}" stroke="#0b1018" stroke-width="2" visibility="hidden"/></svg><div class="tooltip" role="status" hidden></div></div>`;
 }
 function inspect(node,i){
  const points=node.points??=JSON.parse(node.dataset.points);
@@ -131,29 +139,77 @@ const metric=(label,v,note,k,mint=false)=>`<section class="panel metric"><div cl
 const mark=(s,i=0)=>`<span class="ticker-mark" data-color="${i%5}">${esc(s.slice(0,2))}</span>`;
 const orders=(items,limit=100)=>table(['Asset','Side','Filled / quantity','Fill price','Status','Time'],items.slice(0,limit).map(o=>[esc(o.symbol),badge(o.side),qtyText(o.filled)+' / '+qtyText(o.qty),usd(o.price),badge(o.status),stamp(o.t)]),'Orders will appear after a bot submits a signal.');
 const sessionRoute=b=>'session?id='+encodeURIComponent(b.id);
-const botRows=()=>Object.values(state.bots).map(b=>`<a class="bot-row bot-session-link" href="#${sessionRoute(b)}"><span><b>${esc(b.name)}</b><small>${esc(b.symbol)} · v${b.version}</small></span>${badge(botStatus(b))}</a>`).join('')||empty('No bots started. Launch a saved strategy in Live Trading.');
+const botRows=()=>Object.values(state.bots)
+ .filter(bot=>bot.desired==='running')
+ .toSorted((a,b)=>(b.started??0)-(a.started??0))
+ .slice(0,5)
+ .map(b=>`<a class="bot-row bot-session-link" href="#${sessionRoute(b)}"><span><b>${esc(b.name)}</b><small>${esc(b.symbol)} · v${b.version}</small></span>${badge(botStatus(b))}</a>`).join('')||empty('No running bots. Open Live Trading to launch or resume a bot.');
 function dashboard(){
- const a=state.account,m=state.market.find(i=>i.symbol===selected)??state.market[0],enabled=Object.values(state.bots).filter(b=>b.desired==='running'),running=enabled.filter(b=>b.status==='Running');
- const chartSymbol=m?.symbol??'';
- const change=a.dayStart?100*(a.equity/a.dayStart-1):null, hasAccount=state.mode==='demo'||state.equity.length>0;
- const all=chartMode==='Price'?(state.bars[chartSymbol]??[]).map(b=>({t:b.t,value:b.c})):state.equity;
- if(chartMode==='Price'&&Number.isFinite(m?.price)&&m.t>all.at(-1)?.t)all.push({t:m.t,value:m.price});
- const since=Date.parse(all.at(-1)?.t)-ranges[range]*60000;
- const segmented=(values,action,current)=>`<div class="segmented">${values.map(v=>`<button type="button" class="${v===current?'selected':''}" data-action="${action}" data-value="${v}" aria-pressed="${v===current}">${v}</button>`).join('')}</div>`;
- const title=chartMode==='Equity'?'Account equity':m?`<span class="trade-hero">${mark(chartSymbol)}<span>${esc(chartSymbol)} <span class="mono">${usd(m.price)}</span></span></span>`:'Market price';
- const desc=chartMode==='Price'?esc(m?.source??state.feedName)+' · '+esc(online?m?.freshness:'cached')+' · '+stamp(m?.t):'Paper account · '+esc(online?state.broker:'cached')+' · '+stamp(all.at(-1)?.t);
- const price=panel(title,desc,plot(all.filter(p=>Date.parse(p.t)>=since)),`<div class="actions">${segmented(['Price','Equity'],'chart',chartMode)}${segmented(Object.keys(ranges),'range',range)}</div>`,'chart-panel');
- const watch=panel('Watchlist','Recent stock and crypto movement',`<div class="watch-list">${state.market.map((m,i)=>`<button class="watch-row" data-action="watch" data-value="${m.symbol}">${mark(m.symbol,i)}<span><b>${m.symbol}</b><small>${esc(m.name)}</small></span><span class="watch-right"><b>${usd(m.price)}</b><small class="${color(m.change)}">${pct(m.change)}</small></span></button>`).join('')}</div><a class="watch-footer" href="#screener">Open screener →</a>`);
- const signals=state.signals.length?`<div class="activity">${state.signals.slice(0,4).map(s=>`<div class="activity-item"><div class="inline"><b>${esc(s.symbol)}</b>${badge(s.direction)}</div><p>${esc(s.rationale)}</p><small>${esc(s.strategy)} v${s.version} · ${esc(s.source)} · ${stamp(s.t)}</small></div>`).join('')}</div>`:empty('Signals will appear when a running strategy finds a setup.');
+ const a=state.account, equity=state.equity, hasAccount=state.mode==='demo'||equity.length>0;
+ const current=hasAccount?a.equity:null;
+ const pnl=current!==null&&a.dayStart>0?current-a.dayStart:null;
+ const dayChange=pnl===null?null:100*pnl/a.dayStart;
+ const base=equity[0]?.value;
+ const totalReturn=current!==null&&base>0?100*(current/base-1):null;
+ const exits=state.orders.filter(o=>o.owned&&o.side==='sell'&&o.filled>0&&Number.isFinite(o.pnl)&&o.pnl!==0);
+ const winRate=exits.length?100*exits.filter(o=>o.pnl>0).length/exits.length:null;
+ const name=state.profile?.name?.trim().split(/\s+/)[0];
+ const sessionLabel=!online?'Offline · Cached':state.mode==='demo'?'Demo market':state.broker!=='connected'?'Broker reconnecting':state.sessionOpen?'U.S. market open':'U.S. market closed';
+ const sessionClass=online&&(state.mode==='demo'||state.broker==='connected'&&state.sessionOpen)?'good':'';
+ const metricChange=value=>`<span class="${color(value)}">${pct(value)}</span>`;
+ const metrics=[
+   metric('Portfolio value',usd(current),metricChange(dayChange)+' today','equity'),
+   metric('Today’s P&amp;L',pnl>0?'+'+usd(pnl):usd(pnl),metricChange(dayChange)+' today','trading'),
+   metric('Total return',pct(totalReturn),base>0?'Since '+esc(stamp(equity[0].t,{month:'short',day:'numeric',year:'numeric'})):'Awaiting equity history','portfolio'),
+   metric('Win rate',winRate===null?'—':winRate.toFixed(1)+'%',exits.length?exits.length+' realized sell fills':'Awaiting closed trades','history')
+ ].join('');
+ const m=state.market.find(asset=>asset.symbol===selected);
+ const marketChart=chartMode==='Price'&&m;
+ const all=marketChart?(state.bars[m.symbol]??[]).map(b=>({t:b.t,value:b.c})):equity;
+ const duration=marketChart?ranges[range]*60000:portfolioRanges[portfolioRange]*86400000;
+ const since=Date.parse(all.at(-1)?.t)-duration;
+ const controls=Object.keys(marketChart?ranges:portfolioRanges).map(value=>btn(value,marketChart?'range':'portfolio-range',value,false,
+   `aria-pressed="${value===(marketChart?range:portfolioRange)}"`)).join('');
+ const chart=panel(marketChart?esc(m.symbol)+' performance':'Portfolio performance',marketChart?esc(m.name):'',
+   plot(all.filter(p=>Date.parse(p.t)>=since&&Number.isFinite(p.value)),'price','#20aaff'),
+   `<div class="dashboard-chart-actions">${marketChart?btn('Portfolio','chart','Equity'):''}<div class="segmented" aria-label="Chart range">${controls}</div></div>`,'dashboard-chart');
+ const marketNames={'SPY':'S&P 500 ETF','QQQ':'Nasdaq-100 ETF','BTC/USD':'Bitcoin','ETH/USD':'Ethereum'};
+ const overview=Object.keys(marketNames).map(symbol=>state.market.find(asset=>asset.symbol===symbol)).filter(Boolean);
+ const rows=(assets,marketOverview=false)=>assets.map((asset,i)=>{
+   const bars=(state.bars[asset.symbol]??[]).slice(-20);
+   const closes=bars.map(bar=>bar.c).filter(Number.isFinite);
+   const spread=Math.max(...closes)-Math.min(...closes)||1, low=Math.min(...closes);
+   const spark=closes.length>1?`<svg class="dashboard-spark ${color(asset.change)}" viewBox="0 0 64 22" aria-hidden="true"><polyline fill="none" stroke="currentColor" stroke-width="1.7" points="${closes.map((value,idx)=>`${2+60*idx/(closes.length-1)},${20-18*(value-low)/spread}`).join(' ')}"/></svg>`:'';
+   return `<button type="button" class="watch-row dashboard-market-row" data-action="watch" data-value="${esc(asset.symbol)}">${mark(asset.symbol,i)}
+     <span><b>${esc(marketOverview?marketNames[asset.symbol]:asset.symbol)}</b><small>${esc(marketOverview?asset.symbol:asset.name)}</small></span>
+     ${marketOverview?'':spark}<span class="watch-right"><b>${usd(asset.price)}</b><small class="${color(asset.change)}">${pct(asset.change)}</small></span></button>`;
+ }).join('');
+ const opportunities=state.market.filter(asset=>asset.eligible&&Number.isFinite(asset.change)&&Number.isFinite(asset.price))
+   .toSorted((first,second)=>second.change-first.change).slice(0,3);
+ const marketsLink='<a class="dashboard-panel-link" href="#screener">View markets →</a>';
+ const quickActions=[
+   ['trading','Start live session','trading'],
+   ['backtesting','Run backtest','backtesting'],
+   ['strategies?new','Create strategy','plus']
+ ].map(([route,label,glyph])=>`<a class="button" href="#${route}"><span>${icon(glyph)}</span>${label}</a>`).join('');
+ const signals=state.signals.length?`<div class="activity">${state.signals.slice(0,3).map(s=>`<div class="activity-item"><div class="inline"><b>${esc(s.symbol)}</b>${badge(s.direction)}</div><p>${esc(s.rationale)}</p><small>${esc(s.strategy)} v${s.version} · ${esc(s.source)} · ${stamp(s.t)}</small></div>`).join('')}</div>`:empty('Signals will appear when a running strategy finds a setup.');
  const holdings=table(['Asset','Units','Mark','Unrealized P&L'],state.positions.map(p=>{
    const pnl=p.qty*(p.price-p.entry);
    return [esc(p.symbol),qtyText(p.qty),usd(p.price),`<span class="${color(pnl)}">${usd(pnl)}</span>`];
  }),'Filled entry orders will appear here.');
- return page('Trading overview','Dashboard','Monitor your paper account, market data, and automated strategies.',link(icon('plus')+' New strategy','strategies?new',true))+
- (!online?`<div class="notice">Showing cached workspace data · ${syncLabel()}</div>`:'')+
- `<div class="metrics">${metric('Account equity',usd(hasAccount?a.equity:null),`<span class="${color(change)}">${pct(hasAccount?change:null)}</span> today`,'equity',true)}${metric('Buying power',usd(hasAccount?a.buyingPower:null),'Available for orders','wallet')}${metric('Open positions',state.positions.length,usd(hasAccount?a.exposure:null)+' gross exposure','portfolio')}${metric('Active bots',running.length,enabled.length?enabled.length+' enabled':'No running strategies','bot',true)}</div>
- <div class="grid">${price}${watch}</div><div class="grid equal">${panel('Recent orders','Paper execution activity',orders(state.orders,5),link('Portfolio','portfolio'))}${panel('Trade signals','Latest strategy decisions',signals)}</div>
- <div class="grid equal">${panel('Open holdings','Current paper positions',holdings,link('Portfolio','portfolio'))}${panel('Bot status','Backend execution',botRows(),link('Manage bots','trading'))}</div>`;
+ return `<div class="dashboard">
+ <header class="dashboard-greeting"><div><h1>${name?'Welcome back, '+esc(name)+'!':'Trading dashboard'}</h1><p class="sub">Here’s your trading overview for today.</p></div>
+ <span class="connection dashboard-session ${sessionClass}"><i class="dot"></i>${sessionLabel}</span></header>
+ <div class="metrics dashboard-metrics">${metrics}</div>
+ <div class="dashboard-primary">${chart}${panel('Market overview','',`<div class="watch-list">${rows(overview,true)}</div>`,marketsLink,'dashboard-market')}</div>
+ <div class="dashboard-secondary">
+   ${panel('Top opportunities','Ranked by recent price change',opportunities.length?`<div class="watch-list">${rows(opportunities)}</div>`:empty('Opportunities appear as eligible market data arrives.'),marketsLink,'dashboard-market')}
+   <section class="panel dashboard-ai"><div><h2>Build with AI trading tools</h2><p class="sub">Draft strategy rules or configure an autonomous paper trading bot.</p>${link('Explore AI tools →','strategies?new&mode=ai_notepad')}</div></section>
+   ${panel('Quick actions','',`<div class="dashboard-quick">${quickActions}</div>`)}
+ </div>
+ <div class="grid equal">${panel('Recent orders','Paper execution activity',orders(state.orders,5),link('Portfolio','portfolio'))}${panel('Trade signals','Latest strategy decisions',signals)}</div>
+ <div class="grid equal">${panel('Open holdings','Current paper positions',holdings,link('Portfolio','portfolio'))}${panel('Bot status','Running bots',botRows(),link('Manage bots','trading'))}</div>
+ </div>`;
 }
 function tradingView(symbol, botOrders, position, label='Trading View'){
  const allBars=state.bars[symbol]??[];
@@ -202,10 +258,42 @@ function tradingView(symbol, botOrders, position, label='Trading View'){
  const m=state.market.find(item=>item.symbol===symbol);
  const desc=`${esc(symbol)} · ${usd(m?.price??slice.at(-1).c)} · ${buys} buy / ${sells} sell markers in view`;
  const legend=`<div class="tv-legend"><span><i class="tv-dot buy"></i>Buy (${buys})</span><span><i class="tv-dot sell"></i>Sell (${sells})</span>${position?.qty>0?`<span><i class="tv-dot entry"></i>Avg entry ${usd(position.entry)}</span>`:''}</div>`;
- return panel(label,desc,legend+`<div class="plot" tabindex="0" aria-label="Bot trading view chart" data-points="${esc(JSON.stringify(points))}" data-unit="price" data-low="${low}" data-high="${high}"><svg viewBox="0 0 790 265" role="img" aria-label="Trading view chart"><defs><linearGradient id="${id}" x1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#43e2ae" stop-opacity=".23"/><stop offset="100%" stop-color="#43e2ae" stop-opacity="0"/></linearGradient></defs>${grids}${ticks}${seriesSvg}${entryLine}${markers}<line class="crosshair" y1="12" y2="230" stroke="#7e98b5" stroke-dasharray="4 4" visibility="hidden"/><circle class="point" r="4" fill="#4be4b2" stroke="#0b1018" stroke-width="2" visibility="hidden"/></svg><div class="tooltip" role="status" hidden></div></div>`,controls,'chart-panel');
+ return panel(label,desc,legend+`<div class="plot" tabindex="0" aria-label="Bot trading view chart" data-points="${esc(JSON.stringify(points))}" data-unit="price" data-low="${low}" data-high="${high}"><svg viewBox="0 0 790 265" role="img" aria-label="Trading view chart"><defs><linearGradient id="${id}" x1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#4be4b2" stop-opacity=".23"/><stop offset="100%" stop-color="#4be4b2" stop-opacity="0"/></linearGradient></defs>${grids}${ticks}${seriesSvg}${entryLine}${markers}<line class="crosshair" y1="12" y2="230" stroke="#7e98b5" stroke-dasharray="4 4" visibility="hidden"/><circle class="point" r="4" fill="#4be4b2" stroke="#0b1018" stroke-width="2" visibility="hidden"/></svg><div class="tooltip" role="status" hidden></div></div>`,controls,'chart-panel');
 }
 function unmanagedPositions(){
  return state.positions.filter(p=>p.qty>0&&!Object.values(state.bots).some(b=>b.symbol===p.symbol&&((state.botSessions?.[b.id]?.qty??0)>1e-8||b.desired==='running')));
+}
+function tradingOverview(bots,mode){
+ const enabled=bots.filter(b=>b.desired==='running');
+ const running=enabled.filter(b=>b.status==='Running');
+ const fills=state.orders.filter(o=>o.owned&&o.filled>0);
+ const exits=fills.filter(o=>o.side==='sell'&&Number.isFinite(o.pnl));
+ const wins=exits.filter(o=>o.pnl>0).length;
+ const a=state.account;
+ const ready=(state.mode==='demo'||state.equity.length>0)&&a.dayStart>0;
+ const pnl=ready?a.equity-a.dayStart:null;
+ const ratio=ready&&a.equity>0?100*a.exposure/a.equity:null;
+ const day=state.equity.at(-1)?.t.slice(0,10);
+ const curve=state.equity.filter(p=>ready&&p.t.slice(0,10)===day).map(p=>({t:p.t,value:p.value-a.dayStart}));
+ const cards=enabled.map(b=>{
+   const book=state.botSessions?.[b.id];
+   const net=book?.complete&&Number.isFinite(book.unrealized)?book.realized+book.unrealized:null;
+   return `<a class="live-bot" href="#${sessionRoute(b)}"><span class="live-bot-icon">${icon('bot')}</span><span><b>${esc(b.name)}</b><small>${esc(b.symbol)} · ${esc(botStatus(b))}</small></span><strong class="${color(net)}">${usd(net)}</strong></a>`;
+ }).join('');
+ const bulk=(label,action,available)=>btn(label,'fleet-command',action,false,online&&available?'':'disabled');
+ const stop=bots.some(b=>b.desired!=='stopped');
+ const status=!online?'Cached':running.length?'Live active':enabled.length?'Waiting':'Idle';
+ return `<div class="live-overview">${page(mode,'Live Trading Session','Monitor and manage your paper trading activity.',`<div class="actions">${badge(status,online&&running.length?'good':'')}${bulk('End session','stopped',stop)}</div>`)}
+ ${online?'':'<div class="notice">Cached workspace · '+syncLabel()+'</div>'}
+ <div class="metrics">${metric('Session P&L','<span class="'+color(pnl)+'">'+usd(pnl)+'</span>',ready?pct(100*pnl/a.dayStart)+' since day start':'Awaiting account snapshot','equity',true)}
+ ${metric('Win rate',exits.length?(100*wins/exits.length).toFixed(1)+'%':'—',exits.length?num(exits.length)+' exits with recorded P&L':'Awaiting realized exits','backtesting')}
+ ${metric('Total trades',fills.length,'Recorded bot orders with fills','portfolio')}
+ ${metric('Active bots',running.length,enabled.length-running.length+' waiting · '+bots.filter(b=>b.desired==='paused').length+' paused','bot',true)}</div>
+ <div class="live-middle">${panel('Live performance','Account P&L from day-start equity',plot(curve),'<span class="series-key">Session P&L</span>','live-chart')}
+ ${panel('Active bots','Bot P&L before fees','<div class="live-cards">'+(cards||empty('Launch a funded bot to follow its session here.'))+'</div>',btn('View all ↓','fleet-jump','bot-list'))}</div>
+ <div class="live-controls">${panel('Trading controls','',`<div class="actions">${bulk('Pause all','paused',enabled.length)}${bulk('Stop all','stopped',stop)}${btn('Configure bots','fleet-jump','bot-launch')}</div>`)}
+ ${panel('Market status','',`<b>${!online?'Cached snapshot':state.mode==='demo'?'Simulated market':state.broker!=='connected'?'Broker unavailable':state.sessionOpen?'Stock market open':'Stock market closed'}</b><small>Stocks · ${esc(online?state.feed:'cached')} &nbsp; Crypto · ${esc(online?state.cryptoFeed??state.feed:'cached')}</small>`)}
+ ${panel('Risk monitor','',`<b>${Number.isFinite(ratio)?num(ratio)+'% gross exposure':'Awaiting exposure'}</b><small>Position value / account equity</small><meter min="0" max="100" value="${Number.isFinite(ratio)?ratio:0}" aria-label="Gross exposure percent"></meter>`)}</div></div>`;
 }
 function trading(){
  const bots=Object.values(state.bots);
@@ -221,11 +309,9 @@ function trading(){
  const filters=`<div class="tabs" role="group" aria-label="Filter bots">${groups.map(([k,label])=>btn(label+' '+counts[k],'bot-filter',k,false,`aria-pressed="${botFilter===k}"`)).join('')}</div>`;
  const options=state.strategies.slice().reverse().filter(s=>!s.ai||state.aiConfigured||(s.mode==='ai_autonomous'&&state.botAiConfigured)||Boolean(state.botAiKeys?.[s.id]))
    .map(s=>[key(s),s.name+' · '+s.symbol+' · v'+s.version]);
- const instruments=state.market.filter(m=>m.eligible).map(m=>[m.symbol,m.symbol+' · '+m.name]);
  const requested=launchVersion??params().get('version');
  const chosen=options.some(([id])=>id===requested)?requested:'';
  const instrument=launchInstrument??(chosen?version(chosen)?.symbol:'');
- const target=instruments.some(([id])=>id===instrument)?instrument:'';
  const unavailable=requested&&!chosen?'<small>The requested strategy is unavailable for launch. Select another version or open its existing bot session.</small>':'';
  const disabled=!online?'disabled':'';
  const rows=bots.filter(b=>botFilter==='all'||b.desired===botFilter).map(b=>{
@@ -256,18 +342,13 @@ function trading(){
      select('Strategy to manage position','version',[['','Choose a strategy version'],...options],chosen,true)+
      numeric('Additional funds to add (USD)','addFunds',0,0,1e9),
      submit('Assign position & start bot',!online))):'';
- return page('Automated execution','Live Trading','Launch and manage paper bots from saved strategy versions.',badge(mode,'good'))+
-   (!online?'<div class="notice">Showing cached bot status · '+syncLabel()+'</div>':'')+
-   '<div class="metrics">'+metric('Active bots',counts.running,counts.running?bots.filter(b=>b.status==='Running'&&b.desired==='running').length+' processing signals':'No active bots','bot',true)+
-   metric('Paused bots',counts.paused,'Available to resume','strategies')+metric('Stopped bots',counts.stopped,'Available to restart','portfolio')+
-   metric('Paper broker',esc(online?state.broker:'cached'),esc(state.feedName)+' · '+esc(online?state.feed:'cached'),'equity')+'</div>'+
-   '<div class="stack">'+tvPanel+adoptPanel+panel('Launch a bot','Choose the saved trading rules, the instrument to trade, and the maximum USD budget.',
-     options.length&&instruments.length?form('launch-bot',select('Strategy version','version',[['','Choose a strategy version'],...options],chosen,true)+
-       select('Ticker or crypto pair','instrument',[['','Choose an instrument'],...instruments],target,true)+numeric('Bot budget (USD)','budget',launchBudget,1,1e9),
+ return tradingOverview(bots,mode)+'<div class="stack live-workflow">'+tvPanel+'<div id="bot-launch">'+panel('Launch a bot','Choose the saved trading rules, the instrument to trade, and the maximum USD budget.',
+     options.length?form('launch-bot',select('Strategy version','version',[['','Choose a strategy version'],...options],chosen,true)+
+       assetPicker('Ticker or crypto pair','instrument',instrument??'')+numeric('Bot budget (USD)','budget',launchBudget,1,1e9),
        unavailable+submit('Launch bot',!online)):
      empty('Save a strategy for an eligible instrument to launch another bot.'),link('Strategy Editor','strategies'))+
-   panel('Bots','Pause or stop to prevent new submissions. Existing orders stay at the broker.',
-     '<div class="bot-filters">'+filters+'</div>'+table(['Bot','Instrument / version','Status','Budget','Last evaluated bar','Latest order','Controls'],rows,'No bots in this view.'))+'</div>';
+   '</div><div id="bot-list">'+panel('Bots','Pause or stop to prevent new submissions. Existing orders stay at the broker.',
+     '<div class="bot-filters">'+filters+'</div>'+table(['Bot','Instrument / version','Status','Budget','Last evaluated bar','Latest order','Controls'],rows,'No bots in this view.'))+'</div>'+adoptPanel+'</div>';
 }
 function session(){
  const bot=state.bots[params().get('id')];
@@ -325,9 +406,45 @@ function session(){
        stamp(signal.t),badge(signal.direction),esc(signal.rationale),esc(signal.source)
      ]),'No signals recorded for this bot yet.'))+'</div>';
 }
+const catalogTypes={us_equity:'US equities & ETFs',crypto:'Spot crypto',us_option:'US options',crypto_perp:'Crypto perpetuals',treasury:'Treasuries',corporate:'Corporate bonds',global_equity:'Global equities',us_index:'US indices',us_equity_chain:'US equity chains',ipo:'IPOs'};
+let catalogSearch={query:'',assetClass:'',offset:0},catalogResults=null,catalogLoading=false,catalogError='';
+let assetSearchTimer;
+function assetPicker(label,name,value){
+ const list='asset-suggestions-'+name;
+ const options=state.market.filter(m=>m.eligible).slice(0,10);
+ return '<div class="asset-picker">'+field(label,name,value,`required maxlength="40" autocomplete="off" data-asset-picker list="${list}" placeholder="Search by ticker or name" aria-describedby="${list}-status"`)+
+   `<datalist id="${list}">${options.map(m=>`<option value="${esc(m.symbol)}" label="${esc(m.name)}"></option>`).join('')}</datalist><small id="${list}-status" class="sub" aria-live="polite">Enter a ticker or choose a search result.</small></div>`;
+}
+async function loadCatalog(){
+ catalogLoading=true;catalogError='';render(true);
+ try{catalogResults=await api('assets',catalogSearch)}
+ catch(error){catalogResults=null;catalogError=error.message}
+ finally{catalogLoading=false;render(true)}
+}
+function catalogPanel(){
+ const results=catalogResults;
+ const rows=(results?.items??[]).map(asset=>[
+   `<b>${esc(asset.symbol)}</b><br><small>${esc(asset.name)}</small>`,
+   esc(catalogTypes[asset.assetClass]??asset.assetClass),
+   asset.eligible?link('Build strategy','strategies?symbol='+encodeURIComponent(asset.symbol)):
+     badge(!asset.tradable?'Not tradable on Alpaca':asset.supported?'Trading currently unavailable':'Catalog only')
+ ]);
+ const summary=catalogLoading?'Searching asset catalog…':catalogError||(results?
+   `${results.total?results.offset+1:0}–${Math.min(results.offset+30,results.total)} of ${num(results.total)}${results.demo?' demo assets':results.partial?' results · Some Alpaca asset classes are unavailable or still loading':' results'}`:'Search by symbol or name, or select an asset class.');
+ const pagination=results&&!catalogLoading?`<div class="actions">
+   <button class="button" type="submit" name="page" value="previous" ${results.offset===0?'disabled':''}>Previous</button>
+   <button class="button" type="submit" name="page" value="next" ${results.offset+30>=results.total?'disabled':''}>Next</button>
+ </div>`:'';
+ return panel('Asset catalog','Browse Alpaca instruments and see which ones can be used in FastTrader bots.',
+   form('catalog-search',field('Symbol or name','query',catalogSearch.query,'type="search" maxlength="80"')+
+     select('Asset class','assetClass',[['','All asset classes'],...Object.entries(catalogTypes)],catalogSearch.assetClass),
+     submit('Search')+pagination)+`<p class="sub catalog-status" role="status">${esc(summary)}</p>`+
+   (results&&!catalogLoading?table(['Instrument','Asset class','FastTrader'],rows,'No matching instruments.'):''));
+}
 function screener(){
- const tabs=`<div class="tabs" role="tablist" aria-label="Asset class">${['Stocks','Crypto','Forex'].map(v=>btn(v,'asset',v,false,`role="tab" aria-selected="${v===assetClass}"`)).join('')}</div>`;
+ const tabs=`<div class="tabs market-tabs" role="tablist" aria-label="Asset class">${['Stocks','Crypto','Catalog','Forex'].map(v=>btn(v,'asset',v,false,`role="tab" aria-selected="${v===assetClass}"`)).join('')}</div>`;
  const heading=page('Market research','Screener','Find instruments by liquidity, volatility, and price movement.')+tabs;
+ if(assetClass==='Catalog')return heading+catalogPanel();
  if(assetClass==='Forex')return heading+panel('Forex universe','Spread, available leverage, and momentum',empty('This asset class requires a provider integration.'),link('View integrations','settings'));
  const crypto=assetClass==='Crypto', filter=crypto?cryptoScreen:screen, kind=crypto?'crypto':'stock';
  const matching=state.market.filter(m=>(m.assetClass??'stock')===kind&&(m.symbol+' '+m.name).toLowerCase().includes(filter.search.toLowerCase())&&(!filter.volume||m.volume>=filter.volume)&&(!filter.volatility||m.volatility>=filter.volatility));
@@ -364,48 +481,6 @@ const strategyTemplates={
  donchian:{label:'Donchian Breakout',name:'Donchian 20 Breakout',mode:'custom',timeframe:'15Min',trailingStop:2,stop:2.5,take:6,rules:{entryLogic:'all',exitLogic:'any',entry:[{left:{indicator:'close'},op:'gt',right:{indicator:'donchian_high',period:20}}],exit:[{left:{indicator:'close'},op:'lt',right:{indicator:'donchian_low',period:10}}]}},
  crypto_swing:{label:'Crypto Swing 15m',name:'Crypto Fee-Safe Swing',mode:'custom',timeframe:'15Min',sizeMode:'usd',sizeUsd:500,trailingStop:1.8,stop:2.5,take:5.5,cooldown:4,rules:{entryLogic:'all',exitLogic:'any',entry:[{left:{indicator:'close'},op:'gt',right:{indicator:'ema',period:20}},{left:{indicator:'rsi',period:14},op:'gt',right:{indicator:'number',value:52}},{left:{indicator:'rsi',period:14},op:'lt',right:{indicator:'number',value:72}}],exit:[{left:{indicator:'close'},op:'crosses_below',right:{indicator:'ema',period:20}},{left:{indicator:'rsi',period:14},op:'gt',right:{indicator:'number',value:78}}]}}
 };
-function clientAgg(bars,tf){
- const ms=tfMsMap[tf]??60000;
- if(!bars?.length||ms<=60000)return bars??[];
- const out=[];
- for(const b of bars){
-   const ts=Date.parse(b.t),bucket=Math.floor(ts/ms)*ms,prev=out.at(-1);
-   const h=Number.isFinite(b.h)?b.h:Math.max(b.o,b.c),l=Number.isFinite(b.l)?b.l:Math.min(b.o,b.c);
-   if(prev&&prev._b===bucket){prev.h=Math.max(prev.h,h);prev.l=Math.min(prev.l,l);prev.c=b.c;prev.v=(prev.v??0)+(b.v??0);prev.t=b.t}
-   else out.push({_b:bucket,t:b.t,o:b.o,h,l,c:b.c,v:b.v??0});
- }
- return out;
-}
-function clientEma(vals,p){if(vals.length<p)return null;const k=2/(p+1);let e=vals.slice(0,p).reduce((a,b)=>a+b,0)/p;for(let i=p;i<vals.length;i++)e=vals[i]*k+e*(1-k);return e}
-function clientRsi(vals,p){if(vals.length<=p)return null;const s=vals.slice(-(p+1));let g=0,l=0;for(let i=1;i<s.length;i++){const d=s[i]-s[i-1];if(d>0)g+=d;else l-=d}const ag=g/p,al=l/p;return al===0?(ag===0?50:100):100-100/(1+ag/al)}
-function clientInd(bars,spec,off=0){
- if(!spec)return null;
- if(spec.indicator==='number')return Number.isFinite(spec.value)?spec.value:null;
- const end=(bars?.length??0)-off;if(end<=0)return null;
- const sl=bars.slice(0,end),cs=sl.map(b=>b.c),p=Math.max(1,Math.round(spec.period??14)),last=sl.at(-1);
- if(spec.indicator==='close')return last.c;
- if(spec.indicator==='volume')return last.v??0;
- if(spec.indicator==='sma')return cs.length>=p?cs.slice(-p).reduce((a,b)=>a+b,0)/p:null;
- if(spec.indicator==='ema')return clientEma(cs,p);
- if(spec.indicator==='rsi')return clientRsi(cs,p);
- if(spec.indicator==='bb_upper'||spec.indicator==='bb_lower'){if(cs.length<p)return null;const w=cs.slice(-p),m=w.reduce((a,b)=>a+b,0)/p,sd=Math.sqrt(w.reduce((a,v)=>a+(v-m)**2,0)/p);return spec.indicator==='bb_upper'?m+2*sd:m-2*sd}
- if(spec.indicator==='macd'||spec.indicator==='macd_signal'){if(cs.length<35)return null;const s=[];for(let i=26;i<=cs.length;i++){const sub=cs.slice(0,i);s.push(clientEma(sub,12)-clientEma(sub,26))}return spec.indicator==='macd'?s.at(-1):clientEma(s,9)}
- if(spec.indicator==='donchian_high'||spec.indicator==='donchian_low'){if(sl.length<=p)return null;const pr=sl.slice(-(p+1),-1);return spec.indicator==='donchian_high'?Math.max(...pr.map(b=>b.h??Math.max(b.o,b.c))):Math.min(...pr.map(b=>b.l??Math.min(b.o,b.c)))}
- if(spec.indicator==='atr'){if(sl.length<=p)return null;const s=sl.slice(-(p+1));let sum=0;for(let i=1;i<s.length;i++){const h=s[i].h??Math.max(s[i].o,s[i].c),l=s[i].l??Math.min(s[i].o,s[i].c);sum+=Math.max(h-l,Math.abs(h-s[i-1].c),Math.abs(l-s[i-1].c))}return sum/p}
- if(spec.indicator==='avg_volume')return sl.length>=p?sl.slice(-p).reduce((a,b)=>a+(b.v??0),0)/p:null;
- if(spec.indicator==='pct_change'){if(cs.length<=p)return null;const pr=cs[cs.length-1-p];return pr>0?100*(last.c/pr-1):null}
- return null;
-}
-function clientEvalRule(bars,rule){
- const lv=clientInd(bars,rule.left,0),rv=clientInd(bars,rule.right,0);
- if(!Number.isFinite(lv)||!Number.isFinite(rv))return{ready:false,pass:false,lv,rv};
- if(rule.op==='crosses_above'||rule.op==='crosses_below'){
-   const pl=clientInd(bars,rule.left,1),pr=clientInd(bars,rule.right,1);
-   if(!Number.isFinite(pl)||!Number.isFinite(pr))return{ready:false,pass:false,lv,rv};
-   return{ready:true,pass:rule.op==='crosses_above'?pl<=pr&&lv>rv:pl>=pr&&lv<rv,lv,rv};
- }
- return{ready:true,pass:rule.op==='gt'?lv>rv:rule.op==='lt'?lv<rv:rule.op==='gte'?lv>=rv:lv<=rv,lv,rv};
-}
 const specLabel=sp=>!sp?'—':sp.indicator==='number'?String(sp.value??0):noPeriodInd.has(sp.indicator)?(ruleIndLabels[sp.indicator]??sp.indicator):`${ruleIndLabels[sp.indicator]??sp.indicator}(${sp.period??14})`;
 function ensureRules(){editor.rules??={entryLogic:'all',exitLogic:'any',entry:[],exit:[]};return editor.rules}
 function renderRuleGroup(side,title){
@@ -424,61 +499,115 @@ function renderRuleGroup(side,title){
  }).join('');
  return `<div class="rule-box"><div class="rule-head"><b>${title}</b><div class="actions">${logicBtns}${btn('+ Add rule','rule-add',side)}</div></div>${rows||'<small class="muted">No custom '+side+' conditions. Click + Add rule or choose a template above.</small>'}</div>`;
 }
-function renderLiveDebugger(){
- const sym=editor.symbol, tf=editor.timeframe??'1Min', mode=editor.mode??'momentum';
- const tfBars=sym?clientAgg(state.bars[sym]??[],tf):[];
- const rules=editor.rules;
- const hasCustom=Boolean(rules?.entry?.length||rules?.exit?.length);
- const sizeText=(editor.sizeMode==='usd'?usd(editor.sizeUsd??500)+' fixed':(editor.size??10)+'% equity');
- const riskBits=[`SL ${editor.stop??2}%`,editor.trailingStop>0?`Trail ${editor.trailingStop}%`:null,editor.atrStop>0?`ATR×${editor.atrStop}`:null,`TP ${editor.take??4}%`,editor.cooldown>0?`Cooldown ${editor.cooldown}b`:null,editor.maxHoldBars>0?`Max hold ${editor.maxHoldBars}b`:null].filter(Boolean).join(' · ');
- const summary=hasCustom
-   ?`Trades ${esc(sym||'selected asset')} on ${esc(tf)} candles using ${(rules.entry?.length??0)} custom entry (${(rules.entryLogic??'all').toUpperCase()}) & ${(rules.exit?.length??0)} exit (${(rules.exitLogic??'any').toUpperCase()}) rules · Size ${sizeText} · ${riskBits}.`
-   :`Trades ${esc(sym||'selected asset')} on ${esc(tf)} candles using ${esc(modeLabels[mode]??mode)} (period ${editor.period??12}) · Size ${sizeText} · ${riskBits}.`;
- let checks='';
- if(!sym||tfBars.length<2){
-   checks=empty('Select an instrument with candle history to see live PASS/WAIT condition values.');
- } else if(hasCustom){
-   const evalSection=(side,label)=>{
-     const list=rules[side]??[];if(!list.length)return '';
-     const items=list.map(rule=>{
-       const res=clientEvalRule(tfBars,rule);
-       const valText=res.ready?`${num(res.lv)} ${opLabels[rule.op]} ${num(res.rv)}`:'Warming up';
-       return `<div class="bot-row"><span><b>${esc(specLabel(rule.left))} ${opLabels[rule.op]} ${esc(specLabel(rule.right))}</b><small class="mono">${valText}</small></span>${badge(res.ready?(res.pass?'PASS':'WAIT'):'WARMUP',res.pass?'good':'')}</div>`;
-     }).join('');
-     return `<div class="section-label" style="padding:10px 16px 4px">${label} (${(side==='entry'?rules.entryLogic:rules.exitLogic).toUpperCase()})</div>${items}`;
-   };
-   checks=evalSection('entry','Entry conditions')+evalSection('exit','Exit conditions');
- } else {
-   const p=editor.period??12, cs=tfBars.map(b=>b.c), last=cs.at(-1), sma=clientInd(tfBars,{indicator:'sma',period:p});
-   const mom=sma?100*(last/sma-1):null, rsi=clientInd(tfBars,{indicator:'rsi',period:Math.min(14,p)});
-   checks=`<div class="bot-row"><span><b>Latest ${esc(tf)} Close</b><small class="mono">${usd(last)} · ${tfBars.length} bars loaded</small></span>${badge(tfBars.length>=p?'READY':'WARMUP',tfBars.length>=p?'good':'')}</div>`+
-     `<div class="bot-row"><span><b>Momentum vs SMA(${p})</b><small class="mono">${pct(mom)} (entry > ${editor.entry??0.1}%)</small></span>${badge(mom!==null&&mom>(editor.entry??0.1)?'PASS':'WAIT',mom!==null&&mom>(editor.entry??0.1)?'good':'')}</div>`+
-     `<div class="bot-row"><span><b>RSI(${Math.min(14,p)})</b><small class="mono">${num(rsi)}</small></span>${badge(rsi!==null&&rsi<40?'OVERSOLD':rsi!==null&&rsi>65?'OVERBOUGHT':'NEUTRAL')}</div>`;
- }
- return panel('Live rule debugger','Real-time check on '+esc(sym||'current')+' · '+esc(tf)+' candles',`<div class="form"><p class="sub" style="margin:0">${summary}</p></div>`+checks);
+let strategyPreview = { key: '', result: null, next: 0 };
+let previewTimer;
+
+function previewMarkup(result) {
+ if(!result)return empty('Checking closed candles...');
+ if(result.error)return empty(result.error);
+ const {ready,needed,count,latest,groups,entry,zeroVolume}=result;
+ if(!ready)return empty('Warming up closed candles ('+count+'/'+needed+').');
+ const candle=latest?'<div class="bot-row"><span><b>Latest closed candle</b><small>'+stamp(latest.t)+' · '+usd(latest.c)+'</small></span></div>':'';
+ const rows=Object.entries(groups).map(([side, group])=>{
+   const title=side==='entry'?'Entry conditions':'Exit conditions';
+   const checks=group.results.map(({rule,ready,pass,leftVal,rightVal})=>
+     '<div class="bot-row"><span><b>'+esc(specLabel(rule.left))+' '+esc(opLabels[rule.op])+' '+esc(specLabel(rule.right))+'</b><small class="mono">'+
+     (ready?num(leftVal)+' '+esc(opLabels[rule.op])+' '+num(rightVal):'Warming up')+'</small></span>'+badge(ready?(pass?'PASS':'WAIT'):'WARMUP',pass?'good':'')+'</div>'
+   ).join('');
+   const pass=group.pass&&(side!=='entry'||!zeroVolume);
+   return '<div class="bot-row"><b>'+title+' ('+esc(group.logic.toUpperCase())+')</b>'+badge(group.ready?(pass?'PASS':'WAIT'):'WARMUP',pass?'good':'')+'</div>'+checks;
+ }).join('');
+ const status=entry??(zeroVolume?'The latest candle has zero volume.':'The selected entry conditions did not match.');
+ return candle+'<div class="bot-row"><span><b>Entry signal</b><small>'+esc(status)+'</small></span>'+badge(entry?'PASS':'WAIT',entry?'good':'')+'</div>'+rows;
 }
+
+function requestStrategyPreview(){
+ const draft = Object.fromEntries(['name','symbol','mode','timeframe','sizeMode','rules',...fields.map(([,key])=>key)].map(key=>[key,editor[key]]));
+ const key=JSON.stringify(draft);
+ const unavailable=!online?'Connect to the worker to check closed candles.':!draft.symbol?'Select an instrument to preview closed candles.':'';
+ if(unavailable){
+   clearTimeout(previewTimer);
+   strategyPreview={key:'',result:null,next:0};
+   return empty(unavailable);
+ }
+ if(strategyPreview.key===key&&Date.now()<strategyPreview.next)return previewMarkup(strategyPreview.result);
+ clearTimeout(previewTimer);
+ const request={key,result:strategyPreview.key===key?strategyPreview.result:null,next:Infinity};
+ strategyPreview=request;
+ previewTimer=setTimeout(async()=>{
+   let result;
+   try{result=await api('strategy-preview',draft)}
+   catch(error){result={error:error.message}}
+   if(strategyPreview!==request)return;
+   strategyPreview={key,result,next:Date.now()+10000};
+   const target=$('#strategy-preview');
+   if(target)target.innerHTML=previewMarkup(result);
+ },300);
+ return previewMarkup(request.result);
+}
+
+function renderLiveDebugger(){
+ return panel('Live rule debugger','Closed-candle signals before account limits, positions, or AI confirmation.', '<div id="strategy-preview">'+requestStrategyPreview()+'</div>');
+}
+function renderPlaybooks(){
+ return '<div class="playbook-grid">'+Object.entries(strategyPlaybooks).map(([id,playbook])=>{
+   const run=state.runs.find(result=>result.playbookId===id);
+   const results=run
+     ? '<div class="playbook-result"><small>Latest linked replay · '+esc(run.symbol)+' · '+esc(run.timeframe)+' · v'+run.version+'</small>'+btn('View '+pct(100*(run.final/run.capital-1))+' return','open-playbook-run',run.id)+'</div>'
+     : '<small class="playbook-result">No FastTrader replays yet</small>';
+   return panel(esc(playbook.name),esc(playbook.author),
+     '<div class="playbook-body"><div class="actions">'+badge(esc(playbook.category))+'<small>'+esc(playbook.evidence)+'</small></div>'+
+     '<p class="sub">'+esc(playbook.setup)+'</p><dl class="playbook-rules"><dt>Entry</dt><dd>'+esc(playbook.entry)+'</dd>'+
+     '<dt>Exit</dt><dd>'+esc(playbook.exit)+'</dd><dt>When to be cautious</dt><dd>'+esc(playbook.caution)+'</dd></dl>'+
+     '<div class="playbook-adaptation"><b>FastTrader adaptation</b><p>'+esc(playbook.adaptation)+' The draft starts with standard app sizing and risk settings.</p></div>'+
+     '<a class="playbook-source" href="'+esc(playbook.url)+'" target="_blank" rel="noopener noreferrer">'+esc(playbook.source)+'</a>'+
+     results+btn('Create strategy draft','create-playbook-draft',id,true)+'</div>','','playbook-card');
+ }).join('')+'</div>';
+}
+
 function strategies(){
  const route=location.hash, requested=params().get('symbol');
  if(editorRoute!==route){
+    if(requested!==null||params().has('new'))playbookLibraryOpen=false;
    if(requested!==null&&(editor?.id||editor?.symbol!==requested))editor=fresh(requested);
-   if(params().has('new')&&requested===null&&editor?.id)editor=fresh();
+   if(params().has('new')&&requested===null){
+     const mode=params().get('mode');
+     if(mode==='ai_notepad')editor=fresh('',mode);
+     else if(editor?.id)editor=fresh();
+   }
    editorRoute=route;
  }
  editor??=fresh(requested??'');
  const saved=editor.id&&version(key(editor)),bot=saved&&state.bots[editor.id];
  const options=state.strategies.slice().reverse().map(s=>[key(s),s.name+' · '+s.symbol+' · v'+s.version]);
- const asset=state.market.find(m=>m.symbol===editor.symbol);
  const isNotepad=editor.mode==='ai_notepad';
  const isAutonomous=editor.mode==='ai_autonomous';
- const editorSwitcher=`<div class="tabs" role="tablist" aria-label="Editor type">${btn('Visual Rule Builder','editor-type','visual',false,`role="tab" aria-selected="${!isNotepad&&!isAutonomous}"`)}${btn('AI Strategy Notepad','editor-type','ai_notepad',false,`role="tab" aria-selected="${isNotepad}"`)}${btn('Autonomous AI','editor-type','ai_autonomous',false,`role="tab" aria-selected="${isAutonomous}"`)}</div>`;
+ const editorSwitcher=`<div class="tabs" role="tablist" aria-label="Strategy workspace">${btn('Visual Rule Builder','editor-type','visual',false,`role="tab" aria-selected="${!playbookLibraryOpen&&!isNotepad&&!isAutonomous}"`)}${btn('AI Strategy Notepad','editor-type','ai_notepad',false,`role="tab" aria-selected="${!playbookLibraryOpen&&isNotepad}"`)}${btn('Autonomous AI','editor-type','ai_autonomous',false,`role="tab" aria-selected="${!playbookLibraryOpen&&isAutonomous}"`)}${btn('Strategy Library','open-playbook-library','',false,`role="tab" aria-selected="${playbookLibraryOpen}"`)}</div>`;
+ if(playbookLibraryOpen){
+   return '<div class="strategy-page">'+page('Paper trading','Strategy Library','Browse published playbooks and open a draft to edit and backtest.')+editorSwitcher+renderPlaybooks()+'</div>';
+ }
+ const playbook=Object.hasOwn(strategyPlaybooks,editor.playbookId)?strategyPlaybooks[editor.playbookId]:null;
  const startTrade=s=>link('Start trade','trading?version='+encodeURIComponent(key(s)),true);
  const botActions=saved?`<div class="actions">${!['ai_notepad','ai_autonomous'].includes(saved.mode)?link('Backtest v'+saved.version,'backtesting?version='+key(saved)):''}${bot?link('Open bot session',sessionRoute(bot)+'&version='+saved.version):''}${startTrade(saved)}</div>`:'';
- const savedList=latest().map(s=>`<div class="bot-row"><div><b>${esc(s.name)}</b><small>${esc(s.symbol)} · ${s.mode==='ai_autonomous'?'Autonomous AI':s.mode==='ai_notepad'?'AI Notepad':esc(s.timeframe??'1Min')} · v${s.version}</small></div><div class="actions">${btn('Edit','edit',key(s))}${startTrade(s)}</div></div>`).join('');
+ const savedList=latest().map(s=>`<article class="library-item"><div><b>${esc(s.name)}</b><small>${esc(s.symbol)} · ${esc(modeLabels[s.mode]??'Visual rules')} · v${s.version}</small></div><div class="actions">${btn('Edit','edit',key(s))}${startTrade(s)}</div></article>`).join('');
+ const group=(title,content,layout='fields')=>`<section class="editor-group"><h3>${title}</h3><div class="${layout}">${content}</div></section>`;
+ const workspace=(sections,diagnostics,hidden='')=>{
+    const library=panel('Saved strategies','Latest saved versions',savedList||empty('Your saved strategies will appear here.'),'','editor-library');
+   const execution=panel('Paper trading',saved?'Selected version · v'+saved.version:'Save a version to enable trading',
+     (bot?`<div class="bot-row"><b>${esc(bot.symbol)}</b>${badge(botStatus(bot))}</div>`:'')+
+     (saved?`<div class="editor-actions">${botActions}</div>`:empty('Choose an instrument and a USD budget when you start a trade.')),'','editor-execution');
+   const heading=isAutonomous?'Autonomous AI':isNotepad?'AI strategy notepad':'Visual rule builder';
+   return `<div class="strategy-page">${page('Paper trading','Strategy Editor','Build, test, and launch versioned strategies.',btn(icon('plus')+' New strategy','new','',true))}
+     ${editorSwitcher}<div class="editor-layout"><div class="editor-main">${panel(heading,saved?esc(saved.name)+' · v'+saved.version:'New draft',
+      `<form class="editor-form" id="strategy">${hidden}${playbook?'<div class="playbook-origin"><small>Based on '+esc(playbook.name)+'</small>'+btn('View playbooks','open-playbook-library')+'</div>':''}${sections}<div class="editor-save">${submit(online?'Save version':'Queue draft sync')}<small id="draft-status">${editor.queued?'Queued for sync':editor.dirty?'Local draft':''}</small></div></form>`)}
+     </div><aside class="editor-rail">${library}${execution}${diagnostics}</aside></div></div>`;
+ };
+ const sizingMode=select('Position sizing mode','sizeMode',[['percent','% of Equity'],['usd','Fixed USD per trade']],editor.sizeMode??(isNotepad?'usd':'percent'),true);
  if(isAutonomous){
    const riskButtons=`<div class="template-bar"><span class="section-label">Risk Guardrail Presets</span><div class="actions">${Object.entries(autoRiskPresets).map(([k,p])=>btn(p.label,'apply-risk-preset',k,(editor.aiRiskProfile??'balanced')===k)).join('')}</div></div>`;
    const autoTf=[['5Min','5 Minutes'],['15Min','15 Minutes (Recommended)'],['1Hour','1 Hour']];
    const autoBase=field('Bot strategy name','name',editor.name,'required maxlength="60" placeholder="e.g. BTC Autonomous Agent"')+
-     select('Asset / Token to trade','symbol',[['','Choose an instrument'],...state.market.map(m=>[m.symbol,m.symbol+' · '+m.name])],asset?.symbol??'',true)+
+     assetPicker('Asset / Token to trade','symbol',editor.symbol)+
      select('Saved version','version',[['','New draft'],...options],saved?key(saved):'')+
      select('Candle timeframe','timeframe',autoTf,['5Min','15Min','1Hour'].includes(editor.timeframe)?editor.timeframe:'15Min',true)+
      select('AI wake-up mode','aiWakeMode',[['smart','Smart Wake-Up (saves ~80% AI calls)'],['fixed','Fixed Candle (every closed bar)']],editor.aiWakeMode??'smart',true)+
@@ -488,122 +617,256 @@ function strategies(){
    const hiddenAuto=`<input type="hidden" name="mode" value="ai_autonomous"><input type="hidden" name="aiRiskProfile" value="${esc(editor.aiRiskProfile??'balanced')}"><input type="hidden" name="sizeMode" value="percent"><input type="hidden" name="size" value="100"><input type="hidden" name="sizeUsd" value="${editor.sizeUsd??500}"><input type="hidden" name="exposure" value="100"><input type="hidden" name="period" value="12"><input type="hidden" name="entry" value="0.1"><input type="hidden" name="exit" value="-0.1"><input type="hidden" name="atrStop" value="0"><input type="hidden" name="maxHoldBars" value="0"><input type="checkbox" name="ai" checked hidden>`;
    const guidanceBox=`<label class="field notepad-field"><span>Optional guidance for the AI (leave blank for full autonomy)</span><textarea name="aiNotes" class="ai-notepad" rows="4" maxlength="1000" placeholder="Optional: e.g. Prefer swing dips, avoid chasing green spikes, hold winners patiently.">${esc(editor.aiNotes??'')}</textarea><small>Set the USD budget when launching on Live Trading. The AI sees live candles, EMA/RSI/MACD/Bollinger/ATR, Alpaca News, round-trip fee costs, and its own last 5 decisions.</small></label>`;
    const keySource=state.botAiConfigured?`Dedicated Bot Key (${state.botAiInfo.provider} · ${state.botAiInfo.masked})`:state.aiConfigured?`Fallback server key (${state.aiProvider})`:'No AI key configured';
-   const feeInfo=asset?.symbol?.includes('/')?'50 bps round-trip (Crypto)':'~2 bps round-trip (Stock)';
+   const feeInfo=editor.symbol?.includes('/')?'50 bps round-trip (Crypto)':'~2 bps round-trip (Stock)';
    const autoCard=panel('Autonomous AI guardrails','Hard safety limits stay enforced even if AI is offline',
      `<div class="bot-row"><span><b>AI API Key</b><small>${esc(keySource)}</small></span>${badge(state.botAiConfigured||state.aiConfigured?'Ready':'Key needed',state.botAiConfigured||state.aiConfigured?'good':'bad')}</div>`+
      `<div class="bot-row"><span><b>Hard safety net</b><small>SL -${editor.stop??5}% · Trail ${editor.trailingStop??3}% · Daily cap -${editor.dailyLoss??6}%</small></span>${badge('Hard-coded','good')}</div>`+
      `<div class="bot-row"><span><b>Fee-aware prompting</b><small>${feeInfo} · Cooldown ${editor.cooldown??2} bars</small></span>${badge(editor.aiWakeMode==='fixed'?'Fixed':'Smart Wake')}</div>`+
      `<div class="form" style="padding-top:4px">${link('Manage Dedicated AI Bot Key in Settings','settings')}</div>`);
-   return page('Automated trading','Strategy Editor','Give an Autonomous AI bot a token and budget — it manages entries, scaling, and exits under hard guardrails.',btn(icon('plus')+' New strategy','new','',true))+
-     editorSwitcher+
-     `<div class="grid">${panel('Autonomous AI Agent','Pick a token, timeframe, wake-up mode, and hard risk limits',riskButtons+form('strategy',autoBase+autoRisk,hiddenAuto+guidanceBox+submit(online?'Save Autonomous AI strategy':'Queue draft sync')+`<small id="draft-status">${editor.queued?'Queued for sync':editor.dirty?'Local draft':''}</small>`))}
-     <div class="stack">${autoCard}${panel('Paper bot',bot?'Pinned to version '+bot.version:'Select a saved strategy version',
-     (bot?`<div class="bot-row"><span>${esc(bot.symbol)}</span>${badge(botStatus(bot))}</div>`:empty('Save this strategy, then click Start trade to assign a USD budget and launch.'))+'<div class="form">'+botActions+'</div>')}
-     ${panel('Saved strategies','Latest versions',savedList)}</div></div>`;
+   return workspace(group('Strategy setup',autoBase)+group('AI guidance',guidanceBox,'editor-flow')+
+     group('Risk limits',riskButtons+'<div class="fields">'+autoRisk+'</div>','editor-flow'),autoCard,hiddenAuto);
  }
  if(isNotepad){
    const noteTemplates=`<div class="template-bar"><span class="section-label">AI Notepad Starters</span><div class="actions">${Object.entries(notepadTemplates).map(([k,t])=>btn(t.label,'apply-note-template',k)).join('')}</div></div>`;
    const noteBase=field('Strategy name','name',editor.name,'required maxlength="60" placeholder="e.g. AI Smart Dip Buyer"')+
-     select('Instrument or pair','symbol',[['','Choose an instrument'],...state.market.map(m=>[m.symbol,m.symbol+' · '+m.name])],asset?.symbol??'',true)+
+     assetPicker('Instrument or pair','symbol',editor.symbol)+
      select('Saved version','version',[['','New draft'],...options],saved?key(saved):'')+
-     select('Candle timeframe','timeframe',tfOptions,editor.timeframe??'15Min',true)+
-     select('Position sizing mode','sizeMode',[['percent','% of Equity'],['usd','Fixed USD per trade']],editor.sizeMode??'usd',true)+
-     numeric('Fixed size (USD)','sizeUsd',editor.sizeUsd??500,1,1e9,1);
+     select('Candle timeframe','timeframe',tfOptions,editor.timeframe??'15Min',true);
    const noteRisk=[['Position size (% equity)','size',.1,100],['Maximum exposure (% equity)','exposure',.1,100],['Stop-loss (%)','stop',.1,50],['Trailing stop (%, 0=off)','trailingStop',0,50,.1],['Take-profit (%)','take',.1,100],['Maximum daily loss (%)','dailyLoss',.1,50],['Stop-loss cooldown (bars)','cooldown',0,60,1],['Max hold (bars, 0=off)','maxHoldBars',0,1440,1]].map(([label,k,min,max,step])=>numeric(label,k,editor[k]??defaultParams[k],min,max,step)).join('');
    const hiddenDefaults=`<input type="hidden" name="mode" value="ai_notepad"><input type="hidden" name="period" value="${editor.period??12}"><input type="hidden" name="entry" value="${editor.entry??0.1}"><input type="hidden" name="exit" value="${editor.exit??-0.1}"><input type="hidden" name="atrStop" value="${editor.atrStop??0}"><input type="checkbox" name="ai" checked hidden>`;
    const notepadBox=`<label class="field notepad-field"><span>Write your strategy for the AI (plain English rules, entries, exits, news &amp; candle conditions)</span><textarea name="aiNotes" class="ai-notepad" rows="12" required minlength="10" maxlength="4000" placeholder="Example:\nBUY when price is above EMA 20 and RSI(14) pulls back below 40 with no bearish news.\nSELL when RSI(14) > 72 or price drops below EMA 20.\nOtherwise HOLD.">${esc(editor.aiNotes??'')}</textarea><small>${(editor.aiNotes??'').length} / 4000 characters · ${state.aiConfigured?esc(state.aiProvider)+' will read these notes + live candles, EMA/SMA/RSI/ATR, position P&amp;L, and Alpaca News on every bar.':'Configure GEMINI_API_KEY or OPENAI_API_KEY in server env to run AI Notepad bots.'}</small></label>`;
    const guardCard=panel('AI Notepad guardrails','Hard risk limits always stay enforced in code',`<div class="bot-row"><span><b>AI engine</b><small>${state.aiConfigured?esc(state.aiProvider)+' active':'API key required'}</small></span>${badge(state.aiConfigured?'Ready':'Unconfigured',state.aiConfigured?'good':'bad')}</div><div class="bot-row"><span><b>Protective exits</b><small>Stop-loss ${editor.stop??2}% · Trail ${editor.trailingStop??0}% · Take-profit ${editor.take??4}%</small></span>${badge('Hard-coded','good')}</div><div class="bot-row"><span><b>Live context sent to AI</b><small>OHLCV candles, SMA12, EMA20/50, RSI14, ATR14, open P&amp;L &amp; Alpaca News</small></span>${badge(editor.timeframe??'15Min')}</div>`);
-   return page('Automated trading','Strategy Editor','Write a plain-English strategy in the AI Notepad or switch to the Visual Rule Builder.',btn(icon('plus')+' New strategy','new','',true))+
-     editorSwitcher+
-     `<div class="grid">${panel('AI Strategy Notepad','Write how the AI should read the market, enter, and exit',noteTemplates+form('strategy',noteBase+noteRisk,hiddenDefaults+notepadBox+submit(online?'Save AI strategy':'Queue draft sync')+`<small id="draft-status">${editor.queued?'Queued for sync':editor.dirty?'Local draft':''}</small>`))}
-     <div class="stack">${guardCard}${panel('Paper bot',bot?'Pinned to version '+bot.version:'Select a saved strategy version',
-     (bot?`<div class="bot-row"><span>${esc(bot.symbol)}</span>${badge(botStatus(bot))}</div>`:empty('Save your AI Notepad strategy to launch a bot.'))+'<div class="form">'+botActions+'</div>')}
-     ${panel('Saved strategies','Latest versions',latest().map(s=>`<div class="bot-row"><div><b>${esc(s.name)}</b><small>${esc(s.symbol)} · ${s.mode==='ai_notepad'?'AI Notepad':esc(s.timeframe??'1Min')} · v${s.version}</small></div><div class="actions">${btn('Edit','edit',key(s))}${startTrade(s)}</div></div>`).join(''))}</div></div>`;
+   return workspace(group('Strategy setup',noteBase)+group('Trading instructions',noteTemplates+notepadBox,'editor-flow')+
+     group('Position sizing and risk',sizingMode+numeric('Fixed size (USD)','sizeUsd',editor.sizeUsd??500,1,1e9,1)+noteRisk),guardCard,hiddenDefaults);
  }
  const templatesBar=`<div class="template-bar"><span class="section-label">1-Click Templates</span><div class="actions">${Object.entries(strategyTemplates).map(([k,t])=>btn(t.label,'apply-template',k)).join('')}</div></div>`;
- const baseInputs=field('Strategy name','name',editor.name,'required maxlength="60"')+select('Instrument or pair','symbol',[['','Choose an instrument'],...state.market.map(m=>[m.symbol,m.symbol+' · '+m.name])],asset?.symbol??'',true)+
+ const baseInputs=field('Strategy name','name',editor.name,'required maxlength="60"')+assetPicker('Instrument or pair','symbol',editor.symbol)+
  select('Saved version','version',[['','New draft'],...options],saved?key(saved):'')+
  select('Strategy mode','mode',Object.entries(modeLabels).filter(([k])=>k!=='ai_notepad'&&k!=='ai_autonomous'),editor.mode??'momentum',true)+
- select('Candle timeframe','timeframe',tfOptions,editor.timeframe??'1Min',true)+
- select('Position sizing mode','sizeMode',[['percent','% of Equity'],['usd','Fixed USD per trade']],editor.sizeMode??'percent',true);
- const riskInputs=fields.map(([label,k,min,max,step])=>numeric(label,k,editor[k]??defaultParams[k],min,max,step)).join('');
+ select('Candle timeframe','timeframe',tfOptions,editor.timeframe??'1Min',true);
+ const numericFields=list=>list.map(([label,k,min,max,step])=>numeric(label,k,editor[k]??defaultParams[k],min,max,step)).join('');
+ const signalKeys=['period','entry','exit'];
+ const indicators=numericFields(fields.filter(([,k])=>signalKeys.includes(k)));
+ const riskInputs=numericFields(fields.filter(([,k])=>!signalKeys.includes(k)));
  const ruleBuilder=renderRuleGroup('entry','Entry Rules (Buy)')+renderRuleGroup('exit','Exit Rules (Sell)');
  const aiSection=check('Require AI confirmation for non-protective signals','ai',editor.ai)+
  field('Custom AI confirmation rule (optional)','aiPrompt',editor.aiPrompt??'','maxlength="300" placeholder="e.g. Veto buys if news is bearish or candle jumped >2%"')+
  '<small>'+(state.aiConfigured?esc(state.aiProvider ?? 'AI provider')+' configured (with live Alpaca News headlines). Historical replay uses deterministic rules.':'Configure a Gemini or OpenAI key in the server environment to enable AI confirmation.')+'</small>';
- return page('Automated trading','Strategy Editor','Build custom indicator rules or switch to the AI Strategy Notepad.',btn(icon('plus')+' New strategy','new','',true))+
- editorSwitcher+
- `<div class="grid">${panel('Strategy & rule builder','Pick a template or stack custom Entry/Exit conditions',templatesBar+form('strategy',baseInputs+riskInputs,ruleBuilder+aiSection+
- submit(online?'Save version':'Queue draft sync')+`<small id="draft-status">${editor.queued?'Queued for sync':editor.dirty?'Local draft':''}</small>`))}
- <div class="stack">${renderLiveDebugger()}${panel('Paper bot',bot?'Pinned to version '+bot.version:'Select a saved strategy version',
- (bot?`<div class="bot-row"><span>${esc(bot.symbol)}</span>${badge(botStatus(bot))}</div>`:empty('Save a strategy to enable paper bot controls.'))+'<div class="form">'+botActions+'</div>')}
- ${panel('Saved strategies','Latest versions',latest().map(s=>`<div class="bot-row"><div><b>${esc(s.name)}</b><small>${esc(s.symbol)} · ${s.mode==='ai_notepad'?'AI Notepad':esc(s.timeframe??'1Min')} · v${s.version}</small></div><div class="actions">${btn('Edit','edit',key(s))}${startTrade(s)}</div></div>`).join(''))}</div></div>`;
+ return workspace(group('Strategy setup',baseInputs)+group('Signal rules',templatesBar+'<div class="fields">'+indicators+'</div>'+ruleBuilder,'editor-flow')+
+   group('AI confirmation',aiSection,'editor-flow')+group('Position sizing and risk',sizingMode+riskInputs),renderLiveDebugger());
 }
 function backtesting(){
- const runs=state.runs,eligible=state.strategies.filter(s=>!['ai_notepad','ai_autonomous'].includes(s.mode)).reverse(),notepadCount=state.strategies.filter(s=>['ai_notepad','ai_autonomous'].includes(s.mode)).length,requested=params().get('version');
- const chosen=eligible.some(s=>key(s)===requested)?requested:'';
- const chosenStrat=eligible.find(s=>key(s)===chosen);
- const cryptoDefault=chosenStrat?.symbol?.includes('/');
- const option=run=>[run.id,run.name+' v'+run.version+' · '+run.symbol+' ('+(run.timeframe??'1Min')+') · '+stamp(run.t)];
- if(!runs.some(r=>r.id===runA))runA=runs[0]?.id??'';
- if(runB===null&&runs.length>1)runB=runs[1].id;
- const a=runs.find(r=>r.id===runA),b=runs.find(r=>r.id===runB);
- const inputs=select('Saved strategy','version',[['','Choose a saved strategy'],...eligible.map(s=>[key(s),s.name+' v'+s.version+' · '+s.symbol+' ('+(s.timeframe??'1Min')+')'+(s.ai?' · rules only':'')])],chosen,true)+
- field('Start date','start',date(Date.now()-86400000*7),'type="date" required')+field('End date','end',date(Date.now()),'type="date" required')+
- numeric('Starting capital ($)','capital',100000,100,1e9,1)+
- field('Bot budget cap ($, optional)','budget','','type="number" min="1" max="1000000000" step="0.01" placeholder="Optional cap"')+
- numeric('Fees (bps)','fees',cryptoDefault?25:1,0,500)+numeric('Slippage (bps)','slippage',cryptoDefault?5:2,0,500);
- const notepadHint=notepadCount?`<small style="display:block;margin-top:6px;color:var(--muted)">${notepadCount} AI-driven (AI Notepad / Autonomous AI) ${notepadCount===1?'strategy is':'strategies are'} excluded from historical replay because they evaluate live AI rather than deterministic rules. Rule-based strategies with AI confirmation enabled replay their underlying rules.</small>`:'';
- const pfText=m=>!m?'—':m.profitFactor!==null?m.profitFactor.toFixed(2):(m.wins>0&&m.losses===0?'∞':'—');
- const summary=r=>{
-   if(!r)return empty('Choose a second run to compare.');
-   const m=r.metrics, ret=100*(r.final/r.capital-1);
-   const stats=m?`<small>Win rate <b>${m.winRate!==null?m.winRate.toFixed(1)+'%':'—'}</b> (${m.wins}W/${m.losses}L) · Profit factor <b>${pfText(m)}</b> · Sharpe <b>${m.sharpe!==null?m.sharpe.toFixed(2):'—'}</b></small>`+
-     `<small>Buy &amp; Hold <b class="${color(m.buyAndHold)}">${pct(m.buyAndHold)}</b> · Fees <b>${usd(m.totalFees)}</b> · ${m.bars} ${esc(m.timeframe??r.timeframe??'1Min')} bars${m.openPosition?' · <span class="badge warn">Open at end ('+usd(m.openPosition.unrealized)+')</span>':''}</small>`:'';
-   return panel(esc(r.name)+' v'+r.version,esc(r.source)+' · '+esc(r.timeframe??'1Min')+' · '+esc(r.start)+' to '+esc(r.end)+(r.budget?' · Budget '+usd(r.budget):''),
-   `<div class="form"><b class="mono">${usd(r.final)} &nbsp; <span class="${color(r.final-r.capital)}">${pct(ret)}</span></b><small>Max drawdown ${pct(r.drawdown)} · ${m?m.closedTrades+' closed trades ('+(r.tradeCount??r.trades.length)+' fills)':(r.tradeCount??r.trades.length)+' executions'} · ${r.fees} bps fee / ${r.slippage} bps slip</small>${stats}</div>`+plot(r.curve));
+ const runs=state.runs;
+ const eligible=state.strategies.filter(strategy=>!['ai_notepad','ai_autonomous'].includes(strategy.mode)).toReversed();
+ const requested=params().get('version');
+ if(requested!==backtestVersionRoute){
+   backtestVersionRoute=requested;
+   backtestDraft=null;
+ }
+ const chosen=eligible.find(strategy=>key(strategy)===(backtestDraft?.version??requested));
+ const isCrypto=chosen?.symbol?.includes('/');
+ const draft=backtestDraft??{};
+ const options=runs.map(run=>[run.id,run.name+' v'+run.version+' · '+run.symbol+' · '+stamp(run.t)]);
+ if(!runs.some(run=>run.id===runA))runA=runs[0]?.id??'';
+ if(runB===null&&runs.length>1)runB=runs.find(run=>run.id!==runA)?.id??'';
+ const a=runs.find(run=>run.id===runA);
+ const b=runs.find(run=>run.id===runB&&run.id!==runA);
+ const inputs=select('Saved strategy','version',[['','Choose a saved strategy'],...eligible.map(strategy=>
+   [key(strategy),strategy.name+' v'+strategy.version+' · '+strategy.symbol+' ('+(strategy.timeframe??'1Min')+')'+(strategy.ai?' · rules only':'')])],chosen?key(chosen):'',true)+
+   field('Start date','start',draft.start??date(Date.now()-86400000*7),'type="date" required')+
+   field('End date','end',draft.end??date(Date.now()),'type="date" required')+
+   numeric('Starting capital (USD)','capital',draft.capital??100000,100,1e9,1)+
+   field('Bot budget cap (USD)','budget',draft.budget??'','type="number" min="1" max="1000000000" step="0.01" placeholder="Optional"')+
+   numeric('Fees (bps)','fees',draft.fees??(isCrypto?25:1),0,500)+
+   numeric('Slippage (bps)','slippage',draft.slippage??(isCrypto?5:2),0,500);
+ const configuration=panel('Run configuration','Choose a saved strategy and model execution costs.',
+   form('backtest',inputs,`<small>Orders fill at the next bar’s open. AI Notepad and Autonomous AI require live evaluation.</small>
+     ${!eligible.length?link('Create a rule-based strategy','strategies?new'):submit('Run backtest',!online)}`),'','backtest-config');
+ const m=a?.metrics;
+ const resultReturn=a?.capital>0?100*(a.final/a.capital-1):null;
+ const stats=`<div class="metrics dashboard-metrics backtest-metrics">
+   ${metric('Final equity',usd(a?.final),a?'Started with '+usd(a.capital):'Run a backtest','wallet')}
+   ${metric('Total return',pct(resultReturn),m?'Buy &amp; hold '+pct(m.buyAndHold):'From starting capital','equity')}
+   ${metric('Max drawdown',pct(a?.drawdown),'From peak equity','trading')}
+   ${metric('Win rate',Number.isFinite(m?.winRate)?m.winRate.toFixed(1)+'%':'—',m?m.wins+' wins · '+m.losses+' losses':'Closed trades','history')}
+ </div>`;
+ const runStats=run=>{
+   const metrics=run.metrics;
+   const profitFactor=Number.isFinite(metrics?.profitFactor)?num(metrics.profitFactor):metrics?.wins>0&&metrics.losses===0?'∞':'—';
+   return [
+     ['Starting capital',usd(run.capital)],['Final equity',usd(run.final)],
+     ['Return',pct(run.capital>0?100*(run.final/run.capital-1):null)],['Max drawdown',pct(run.drawdown)],
+     ['Win rate',Number.isFinite(metrics?.winRate)?metrics.winRate.toFixed(1)+'%':'—'],
+     ['Profit factor',profitFactor],['Sharpe ratio',num(metrics?.sharpe)],['Buy & hold',pct(metrics?.buyAndHold)],
+     ['Closed trades',num(metrics?.closedTrades)],['Fills',num(run.tradeCount??run.trades?.length)],
+     ['Total fees',usd(metrics?.totalFees)],['Fee / slippage',num(run.fees)+' / '+num(run.slippage)+' bps'],
+     ['Bot budget cap',run.budget?usd(run.budget):'—'],
+     ['Bars',Number.isFinite(metrics?.bars)?num(metrics.bars)+' '+esc(metrics.timeframe??run.timeframe??'1Min'):'—']
+   ];
  };
- const openNote=a?.metrics?.openPosition?`<small style="display:block;margin-bottom:8px;color:var(--muted)">Open position at end of test: ${qtyText(a.metrics.openPosition.qty)} @ ${usd(a.metrics.openPosition.entry)} (mark ${usd(a.metrics.openPosition.mark)}, unrealized <b class="${color(a.metrics.openPosition.unrealized)}">${usd(a.metrics.openPosition.unrealized)}</b>).</small>`:'';
- return page('Strategy research','Backtesting','Replay a saved strategy with next-bar-open fills, intrabar stops, and modeled trading costs.')+
- `<div class="stack">${panel('Run configuration','Signals evaluate on each strategy’s configured timeframe (1m / 5m / 15m / 1h). Next-bar open determines simulated execution; crypto defaults to 25 bps taker fees.',form('backtest',inputs,submit('Run backtest',!online||!eligible.length))+notepadHint)}
- ${a?panel('Run comparison','Compare equity curves and risk-adjusted metrics.',`<div id="run-select" class="form"><div class="fields">${select('First run','runA',runs.map(option),runA)}${select('Second run','runB',[['','Select run'],...runs.map(option)],runB)}</div></div><div class="form comparison">${summary(a)}${summary(b)}</div>`):''}
- ${a?panel('Drawdown','First run · decline from the equity high-water mark',plot(a.curve.map(p=>({t:p.t,value:p.drawdown})),'percent')):''}
- ${a?panel('Trade log','First run · latest 250 modeled fills, fees, and exit reasons',openNote+table(['Time','Side','Quantity','Fill price','Fees','Realized P&L','Reason'],a.trades.slice(-250).reverse().map(t=>[stamp(t.t),badge(t.side),qtyText(t.qty),usd(t.price),usd(t.fee),usd(t.pnl),esc(t.reason??'—')]),'No executions in this run.')):''}</div>`;
+ const runStatsB=b?runStats(b):[];
+ const comparisonRows=a?runStats(a).map(([label,value],i)=>[esc(label),value,...(b?[runStatsB[i][1]]:[])]):[];
+ const metadata=run=>esc(run.name)+' v'+esc(run.version)+' · '+esc(run.symbol)+' · '+esc(run.timeframe??'1Min')+
+   ' · '+esc(run.start)+' to '+esc(run.end)+(run.source?' · '+esc(run.source):'');
+ const equityChart=panel('Equity Curve',a?metadata(a):'',
+   a?plot(a.curve,'price','#20aaff'):empty('Run a saved strategy to see its equity curve.'),
+   a?`<strong class="mono backtest-equity-value">${usd(a.final)}</strong>`:'','dashboard-chart backtest-equity');
+ const open=a?.metrics?.openPosition;
+ const openNote=open?`<div class="backtest-open-note">Open at end · ${qtyText(open.qty)} units at ${usd(open.entry)} · Mark ${usd(open.mark)} · Unrealized ${usd(open.unrealized)}</div>`:'';
+ const results=a?`
+   <div class="backtest-result-grid">
+    ${panel('Drawdown','Decline from the primary run’s equity peak',
+      plot(a.curve.filter(point=>Number.isFinite(point.drawdown)).map(point=>({t:point.t,value:point.drawdown})),'percent','#b780ff'),'','dashboard-chart')}
+    ${b?panel('Comparison Equity Curve',metadata(b),plot(b.curve,'price','#43e2ae'),'','dashboard-chart'):''}
+   </div>
+   ${panel(b?'Run Comparison':'Run Statistics',b?'Metrics for the primary and comparison runs.':'Execution and risk metrics for the primary run.',
+     table(b?['Metric','Primary run','Comparison run']:['Metric','Primary run'],comparisonRows,'No statistics for this run.'),'','backtest-statistics')}
+   ${panel('Trade Log','Latest 250 simulated fills from the primary run',openNote+
+     table(['Time','Side','Quantity','Fill price','Fees','Realized P&L','Reason'],a.trades.slice(-250).toReversed().map(trade=>[
+       stamp(trade.t),badge(trade.side),qtyText(trade.qty),usd(trade.price),usd(trade.fee),usd(trade.pnl),esc(trade.reason??'—')
+     ]),'No executions in this run.'))}`:'';
+ const picker=a?`<div id="run-select" class="backtest-run-select">${select('Primary run','runA',options,runA)}
+   ${select('Compare with','runB',[['','No comparison'],...options.filter(([id])=>id!==runA)],b?.id??'')}</div>`:'';
+ return `<div class="dashboard backtest-overview">
+  <header class="dashboard-greeting"><div><h1>Backtesting</h1><p class="sub">Replay saved strategies and compare simulated performance.</p></div>${picker}</header>
+  ${!online?`<div class="notice">Showing cached workspace data · ${esc(syncLabel())}</div>`:''}
+  ${stats}
+  <div class="backtest-workbench">${configuration}${equityChart}</div>
+  ${results}
+ </div>`;
+}
+function portfolioData(){
+ const {positions,equity,account}=state;
+ const cutoff=Date.now()-portfolioRanges[accountRange]*86400000;
+ const points=equity.filter(point=>Number.isFinite(point.value)&&Date.parse(point.t)>=cutoff);
+ const fills=state.orders.filter(order=>order.filled>0&&Date.parse(order.filledAt??order.t)>=cutoff)
+   .toSorted((a,b)=>Date.parse(b.filledAt??b.t)-Date.parse(a.filledAt??a.t));
+ const holdings=positions.map(position=>({ ...position, value:position.qty*position.price,
+   pnl:position.qty*(position.price-position.entry) })).toSorted((a,b)=>Math.abs(b.value)-Math.abs(a.value));
+ return {account,points,fills,holdings};
+}
+function portfolioAllocation(holdings,cash){
+ const bySymbol=new Map(state.market.map(asset=>[asset.symbol,asset.assetClass]));
+ let stocks=0, crypto=0, other=0;
+ for(const holding of holdings){
+   if(!Number.isFinite(holding.value))continue;
+   const assetClass=holding.assetClass??bySymbol.get(holding.symbol);
+   if(assetClass==='crypto'||holding.symbol.endsWith('/USD'))crypto+=Math.abs(holding.value);
+   else if(assetClass==='stock'||assetClass==='us_equity'||!assetClass)stocks+=Math.abs(holding.value);
+   else other+=Math.abs(holding.value);
+ }
+ const parts=[
+   ['Stocks',stocks,'#167dff'],['Crypto',crypto,'#28cde9'],['Cash',Math.max(0,cash??0),'#43dbac'],['Other',other,'#ae59ff']
+ ].filter(([,value])=>value>0);
+ const total=parts.reduce((sum,[,value])=>sum+value,0);
+ if(!total)return empty('Allocation appears when cash or positions are available.');
+ let offset=0;
+ const stops=parts.map(([,value,shade])=>{
+   const end=offset+100*value/total;
+   const stop=shade+' '+offset+'% '+end+'%';
+   offset=end;
+   return stop;
+ });
+ return `<div class="portfolio-allocation">
+   <div class="allocation-donut" style="--allocation:conic-gradient(${stops.join(',')})"><div><b>${usd(total)}</b><small>Allocation total</small></div></div>
+   <ul class="allocation-legend">${parts.map(([label,value,shade])=>`<li><i style="background:${shade}" aria-hidden="true"></i><span>${label}</span><b>${(100*value/total).toFixed(1)}%</b></li>`).join('')}</ul>
+ </div>`;
 }
 function portfolio(){
- const {positions,equity,account}=state;
- let peak=0,drawdown=0;
- for(const p of equity){peak=Math.max(peak,p.value);if(peak>0)drawdown=Math.min(drawdown,100*(p.value/peak-1))}
- const start=equity[0]?.value,unrealized=positions.reduce((sum,p)=>sum+p.qty*(p.price-p.entry),0);
- const o=state.orders.filter(item=>(!historyFilter.asset||item.symbol===historyFilter.asset)&&(!historyFilter.strategy||item.strategy===historyFilter.strategy)&&(!historyFilter.start||item.t?.slice(0,10)>=historyFilter.start)&&(!historyFilter.end||item.t?.slice(0,10)<=historyFilter.end));
- const options=(k,label)=>[['',label],...Array.from(new Set(state.orders.map(o=>o[k]).filter(Boolean))).map(v=>[v,v])];
- const filter=select('Asset','asset',options('symbol','All assets'),historyFilter.asset)+select('Strategy','strategy',options('strategy','All strategies'),historyFilter.strategy)+field('From','start',historyFilter.start,'type="date"')+field('To','end',historyFilter.end,'type="date"');
- const holding=positions.map(p=>[esc(p.symbol),qtyText(p.qty),usd(p.entry),usd(p.price),usd(p.qty*p.price),pct(account.equity?100*p.qty*p.price/account.equity:null),`<span class="${color(p.qty*(p.price-p.entry))}">${usd(p.qty*(p.price-p.entry))}</span>`]);
- return page('Account analytics','Portfolio','Review holdings, exposure, historical orders, and paper account performance.')+
- `<div class="metrics">${metric('Unrealized P&L',usd(unrealized),'Open positions','equity',true)}${metric('Realized P&L',state.mode==='demo'?usd(o.reduce((sum,item)=>sum+(item.pnl??0),0)):'—',state.mode==='demo'?'Filtered demo executions':'Alpaca realized P&L pending','wallet')}
- ${metric('Tracked return',pct(start?100*(account.equity/start-1):null),'Since first account snapshot','equity')}${metric('Max drawdown',pct(start?drawdown:null),'From tracked equity peak','portfolio')}</div><div class="stack">
- ${panel('Holdings','Allocation uses current account equity.',table(['Asset','Units','Average entry','Mark','Market value','Allocation','Unrealized P&L'],holding,'No open positions.'))}
- ${panel('Order history','Filter executions by asset, strategy, and date.',form('history',filter,submit('Apply filters'))+orders(o))}</div>`;
+ const {account,points,fills,holdings}=portfolioData();
+ const hasAccount=state.mode==='demo'||state.equity.length>0;
+ const value=hasAccount?account.equity:null, cash=hasAccount?account.cash:null;
+ const dailyReturn=value!==null&&account.dayStart>0?100*(value/account.dayStart-1):null;
+ const base=points[0]?.value;
+ const periodReturn=points.length>1&&base>0&&value!==null?100*(value/base-1):null;
+ const change=value=>`<span class="${color(value)}">${pct(value)}</span>`;
+ const firstDate=points[0]?.t;
+ const metrics=[
+   metric('Portfolio value',usd(value),dailyReturn===null?'Awaiting account data':change(dailyReturn)+' today','portfolio'),
+   metric('Cash balance',usd(cash),'Account cash','wallet'),
+   metric('Buying power',usd(hasAccount?account.buyingPower:null),'Available for orders','trading'),
+   metric('Period return',change(periodReturn),periodReturn===null?'Awaiting equity history':'Since '+esc(stamp(firstDate,{month:'short',day:'numeric',year:'numeric'})),'equity')
+ ].join('');
+ const rangeTabs=Object.keys(accountPeriods).map(period=>btn(period,'account-range',period,false,
+   `aria-pressed="${period===accountRange}"`)).join('');
+ const rangeSelect=select('Period','portfolio-period',Object.entries(accountPeriods),accountRange);
+ const rows=(showAllPositions?holdings:holdings.slice(0,5)).map((holding,i)=>{
+   const basis=Math.abs(holding.qty*holding.entry);
+   const pctPnl=basis>0?100*holding.pnl/basis:null;
+   return [`<span class="inline">${mark(holding.symbol,i)}<b>${esc(holding.symbol)}</b></span>`,
+     qtyText(holding.qty),usd(holding.entry),usd(holding.price),usd(holding.value),
+     `<span class="portfolio-position-pnl ${color(holding.pnl)}">${usd(holding.pnl)}<small>${pct(pctPnl)}</small></span>`];
+ });
+ const positionAction=holdings.length>5?btn(showAllPositions?'Show preview':'View all positions','portfolio-positions'):'';
+ const activity=fills.slice(0,4).map(order=>`<div class="portfolio-activity-item">
+   <span class="portfolio-activity-icon ${order.side==='buy'?'good':''}">${icon(order.side==='buy'?'equity':'history')}</span>
+   <div><b>${order.side==='buy'?'Bought':order.side==='sell'?'Sold':'Filled'} ${esc(order.symbol)}</b>
+   <small>${stamp(order.filledAt??order.t)} · ${qtyText(order.filled)} units · ${usd(order.price)}</small></div>
+ </div>`).join('');
+ return `<div class="dashboard portfolio-overview">
+   <header class="dashboard-greeting"><div><h1>Portfolio Overview</h1><p class="sub">Track your portfolio performance and holdings.</p></div>
+   <div class="actions portfolio-controls">${rangeSelect}${btn('Export CSV','export-portfolio', '',true)}</div></header>
+   ${!online?`<div class="notice">Showing cached workspace data · ${esc(syncLabel())}</div>`:''}
+   <div class="metrics dashboard-metrics">${metrics}</div>
+   <div class="dashboard-primary">
+    ${panel('Portfolio Value Trend',firstDate?esc(stamp(firstDate,{month:'short',day:'numeric'}))+' – '+esc(stamp(points.at(-1).t,{month:'short',day:'numeric'})):'',
+      plot(points,'price','#20aaff'),`<div class="dashboard-chart-actions"><div class="segmented" aria-label="Portfolio chart range">${rangeTabs}</div></div>`,'dashboard-chart portfolio-trend')}
+    ${panel('Asset Allocation','Gross position value and positive cash',portfolioAllocation(holdings,cash),'','portfolio-allocation-panel')}
+   </div>
+   <div class="dashboard-primary portfolio-details">
+    ${panel('Positions','',table(['Symbol','Qty','Avg cost','Last price','Market value','P&L'],rows,'No open positions.'),positionAction,'portfolio-positions')}
+    ${panel('Recent Activity','',activity?`<div class="portfolio-activity">${activity}</div>`:empty('No fills in this period.'),
+      '<a class="dashboard-panel-link" href="#history?tab=orders">View all →</a>')}
+   </div>
+ </div>`;
+}
+function exportPortfolio(){
+ const {points,fills,holdings}=portfolioData();
+ const rows=[
+   ['Record','Timestamp','Symbol','Side','Quantity','Average cost','Price','Market value','P&L','Portfolio value'],
+   ...points.map(point=>['Equity',point.t,'','','','','','','',point.value]),
+   ...holdings.map(holding=>['Position','',holding.symbol,'',holding.qty,holding.entry,holding.price,holding.value,holding.pnl,'']),
+   ...fills.map(order=>['Fill',order.filledAt??order.t,order.symbol,order.side,order.filled,'',order.price,
+     Number.isFinite(order.price)?order.filled*order.price:'',order.pnl??'',''])
+ ];
+ const csv=rows.map(row=>row.map(value=>'"'+String(value??'').replace(/"/g,'""')+'"').join(',')).join('\r\n');
+ const url=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));
+ const download=document.createElement('a');
+ download.href=url;download.download='fasttrader-portfolio-'+accountRange.toLowerCase()+'.csv';download.click();
+ setTimeout(()=>URL.revokeObjectURL(url),1000);
 }
 function settings(){
  const row=(label,desc,status)=>`<div class="bot-row"><div><b>${label}</b><small>${desc}</small></div>${badge(status)}</div>`;
  const events=state.events.map(e=>`<div class="activity-item">${esc(e.message)}<small>${stamp(e.t)}</small></div>`).join('');
  const bai=state.botAiInfo;
  const perBotEntries=Object.entries(state.botAiKeys??{}).filter(([id])=>state.bots[id]);
- const perBotList=perBotEntries.length?'<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--line)"><small style="display:block;margin-bottom:6px;color:var(--muted)">Per-bot personal API keys</small>'+perBotEntries.map(([id,k])=>`<div class="bot-row"><div><b>${esc(state.bots[id].name)}</b><small>${esc(k.provider)} · ${esc(k.model)} · ${esc(k.masked)}</small></div><div class="actions">${link('Open bot',sessionRoute(state.bots[id]))}${btn('Remove','remove-per-bot-ai-key',id,false,`style="color:#ff8191;border-color:#592e42" ${!online?'disabled':''}`)}</div></div>`).join('')+'</div>':'';
- const botAiPanel=panel('AI Bot Trading Key','Dedicated API key for Autonomous AI bots (saved encrypted in Supabase). Individual bots can also override this with their own personal key in Bot Session → Advanced.',
+ const disabled=online?'':'disabled';
+ const perBotList=perBotEntries.length?'<section class="settings-overrides"><h3>Bot-specific keys</h3>'+perBotEntries.map(([id,k])=>`<div class="bot-row"><div><b>${esc(state.bots[id].name)}</b><small>${esc(k.provider)} · ${esc(k.model)} · ${esc(k.masked)}</small></div><div class="actions">${link('Open bot',sessionRoute(state.bots[id]))}${btn('Remove','remove-per-bot-ai-key',id,false,disabled)}</div></div>`).join('')+'</section>':'';
+ const botAiPanel=panel('AI trading key','Used by autonomous bots unless a bot has its own key.',
    row('Dedicated key status',bai?`${esc(bai.provider)} · ${esc(bai.model)} · ${esc(bai.masked)}`:'Not set — Autonomous AI falls back to server .env key',bai?'configured':'unconfigured')+
    `<form id="bot-ai-key" class="form"><div class="fields">`+
    select('AI Provider','provider',[['Gemini','Google Gemini'],['OpenAI','OpenAI']],bai?.provider??'Gemini',true)+
    field('Model (optional)','model',bai?.model??'','maxlength="80" placeholder="e.g. gemini-3.5-flash or gemini-3.5-flash-lite"')+
    field('API Key','key','','type="password" autocomplete="off" maxlength="300" placeholder="'+(bai?'Enter new key to replace saved key':'Paste Gemini or OpenAI API key')+'"')+
    `</div><div class="actions">${submit('Save trading key',!online)}${btn('Test key','test-bot-ai-key','',false,!online?'disabled':'')}${bai?btn('Remove key','remove-bot-ai-key','',false,`style="color:#ff8191;border-color:#592e42" ${!online?'disabled':''}`):''}</div></form>`+perBotList);
- return page('Workspace preferences','Settings','Review data providers, dedicated AI Bot Trading Key, paper connectivity, and notifications.')+
- `<div class="grid equal"><div class="stack">${panel('Integrations','Credentials are configured in the server environment.',row('Stock data',esc(state.feedName),state.feed)+row('Paper broker',state.mode==='demo'?'Local simulated fills':'Alpaca Paper API',state.broker)+row('General AI confirmation',esc(state.aiProvider ?? 'Gemini or OpenAI'),state.aiConfigured?'configured':'unconfigured')+row('Dedicated AI Bot Key',bai?esc(bai.provider+' · '+bai.masked):'Using fallback key',bai?'configured':'unconfigured')+row('Telegram alerts',state.telegramConfigured?'Bot connected':'Set TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID',state.telegramConfigured?'configured':'unconfigured')+row('Crypto data',state.mode==='demo'?'Synthetic market':'Alpaca Crypto US',state.cryptoFeed??'connecting'))}
- ${botAiPanel}
- ${state.mode==='demo'?panel('Connection simulator','Exercise bot behavior during feed or broker outages.',`<div class="form"><div class="actions">${btn('Disconnect feed','outage','feed')}${btn('Disconnect broker','outage','broker')}${btn('Reconnect both','outage','clear',true)}</div></div>`):''}</div>
- <div class="stack">${panel('Notifications','Choose which events appear in the workspace and push to Telegram.',`<form id="settings" class="form">${Object.entries({signals:'Trade signals',fills:'Order fills',risk:'Risk limits',connections:'Connection failures',telegram:'Push alerts to Telegram'}).map(([k,v])=>check(v,k,k==='telegram'?state.alerts[k]!==false:state.alerts[k])).join('')}<div class="actions">${submit('Save preferences',!online)}${state.telegramConfigured?btn('Send test alert','test-telegram','',false,!online?'disabled':''):''}</div></form>`)}
- ${panel('Recent notifications',syncLabel(),events?'<div class="activity">'+events+'</div>':empty('No notifications yet.'))}</div></div>`;
+ const feedStatus=value=>online?(value??'connecting'):'cached';
+ const connections=panel('Trading connections','Broker and feed credentials are managed on the server.',
+   row('Paper broker',state.mode==='demo'?'Local simulated fills':'Alpaca Paper API',feedStatus(state.broker))+
+   row('Stock market data',esc(state.feedName),feedStatus(state.feed))+
+   row('Crypto market data',state.mode==='demo'?'Synthetic market':'Alpaca Crypto US',feedStatus(state.cryptoFeed))+
+   row('AI signal confirmation',esc(state.aiProvider??'Gemini or OpenAI'),state.aiConfigured?'configured':'unconfigured'),'','settings-connections');
+ const notifications=panel('Notifications','Select the events you want to receive.',
+   `<form id="settings" class="form"><div class="settings-checks">${Object.entries({signals:'Trade signals',fills:'Order fills',risk:'Risk limits',connections:'Connection failures'}).map(([k,label])=>check(label,k,state.alerts[k])).join('')}</div>
+    <div class="settings-delivery"><div class="inline"><h3>Telegram delivery</h3>${badge(state.telegramConfigured?'Configured':'Unconfigured',state.telegramConfigured?'good':'')}</div>
+    ${check('Push alerts to Telegram','telegram',state.alerts.telegram!==false)}${state.telegramConfigured?'':'<small>Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID on the worker to connect Telegram.</small>'}</div>
+    <div class="actions">${submit('Save preferences',!online)}${state.telegramConfigured?btn('Send test alert','test-telegram','',false,disabled):''}</div></form>`,'','settings-notifications');
+ const simulator=state.mode==='demo'?panel('Connection simulator','Test how paper bots respond to a feed or broker outage.',
+   `<div class="settings-buttons actions">${btn('Disconnect feed','outage','feed',false,disabled)}${btn('Disconnect broker','outage','broker',false,disabled)}${btn('Reconnect both','outage','clear',false,disabled)}</div>`,'','settings-simulator'):'';
+ return `<div class="settings-page">${page('Workspace preferences','Settings','Manage trading connections, AI credentials, and alerts.',badge(state.mode==='demo'?'Demo workspace':'Alpaca Paper'))}
+  ${online?'':'<div class="notice">Showing cached settings · '+syncLabel()+'</div>'}
+  <div class="settings-layout"><div class="settings-column">${connections}${botAiPanel}${simulator}</div><div class="settings-column">${notifications}
+  ${panel('Recent notifications',syncLabel(),events?'<div class="activity">'+events+'</div>':empty('No notifications yet.'),'','settings-events')}</div></div></div>`;
+
 }
 function profile(){
  const p=state.profile??{};
@@ -626,33 +889,82 @@ function profile(){
      <div>
        <h2>${esc(p.name||'Paper Trader')}</h2>
        <small>${p.username?'@'+esc(p.username)+' · ':''}${esc(p.email||'No email set')}</small>
-       <div class="actions" style="margin-top:8px">${badge(p.riskTier||'moderate','good')}${badge((p.tradingStyle||'swing')+' trader')}${badge(activeBots+' active bots')}</div>
+       <div class="profile-traits">${badge((p.riskTier||'moderate')+' risk')}${badge(({scalp:'Scalping',day:'Day trading',swing:'Swing trading',position:'Position trading'})[p.tradingStyle]??'Swing trading')}</div>
      </div>
    </div>
    <div class="actions">
-     <label class="button primary" for="avatar-file">Upload photo</label>
-     <input type="file" id="avatar-file" accept="image/*" hidden>
-     ${photo?btn('Remove photo','remove-avatar'):''}
+     <label class="button profile-upload">Upload photo<input type="file" id="avatar-file" accept="image/*" aria-label="Upload profile photo"></label>
+     ${photo?btn('Remove photo','remove-avatar','',false,online?'':'disabled'):''}
    </div>
  </section>`;
  const profileFields=field('Display name','name',p.name??'Paper Trader','required maxlength="80"')+
    field('Username','username',p.username??'','maxlength="32" placeholder="trader_handle"')+
    field('Email','email',p.email??'','type="email" maxlength="120"')+
-   select('Timezone','timezone',tzOptions,p.timezone??'UTC')+
-   select('Risk profile','riskTier',[['conservative','Conservative'],['moderate','Moderate'],['aggressive','Aggressive']],p.riskTier??'moderate')+
+   select('Timezone','timezone',tzOptions,p.timezone??'UTC');
+ const tradingFields=select('Risk profile','riskTier',[['conservative','Conservative'],['moderate','Moderate'],['aggressive','Aggressive']],p.riskTier??'moderate')+
    select('Trading style','tradingStyle',[['scalp','Scalping'],['day','Day trading'],['swing','Swing trading'],['position','Position trading']],p.tradingStyle??'swing');
  const bioField=`<label class="field">Bio &amp; trading notes<textarea name="bio" rows="3" maxlength="280" placeholder="Strategy focus, risk rules, or personal trading notes...">${esc(p.bio??'')}</textarea></label>`;
- const equityCurve=panel('Portfolio equity curve',eqRet!==null?`<span class="${color(eqRet)}">${pct(eqRet)}</span> since first snapshot · ${syncLabel()}`:'Paper account equity over time · '+syncLabel(),plot(equityPts),'','chart-panel');
- return page('Trader identity','Profile','Manage your trader profile, photo, performance metrics, and trading preferences.')+
- `<div class="stack">${hero}<div class="metrics">${metric('Account equity',usd(state.account?.equity),'Paper portfolio','equity',true)}${metric('Buying power',usd(state.account?.buyingPower),'Available for orders','wallet')}${metric('Win / loss rate',winRate!==null?winRate.toFixed(1)+'%':'—',decided?`${wins}W / ${losses}L · ratio ${winRatio}`:'Awaiting closed trades','equity',true)}${metric('Account trades',filledOrders.length,activeBots+' active bots','portfolio')}</div>${equityCurve}<div class="grid">${panel('Profile details','Saved per isolated account',form('profile',profileFields,bioField+(authInfo?.required?'<small>Signed-in workspace data and drafts are kept in this tab during a disconnect.</small>':check('Cache workspace data in this browser','offlineSync',p.offlineSync))+submit('Save profile',!online)))}
- <div class="stack">${panel('Account isolation','Your trades are strictly partitioned by account key',`<div class="bot-row"><span><b>Account key</b><small class="mono">${esc(state.accountKey??state.mode)}</small></span>${badge('Isolated','good')}</div><div class="bot-row"><span><b>Broker environment</b><small>${state.mode==='demo'?'Local simulated broker':'Alpaca Paper API'}</small></span>${badge(state.broker)}</div><div class="bot-row"><span><b>Last sync</b><small>${syncLabel()}</small></span>${badge(online?'online':'offline',online?'good':'bad')}</div>`)}</div></div></div>`;
+ const syncControl=authInfo?.required?'<small>Workspace data and drafts stay in this tab during a disconnect.</small>':check('Cache workspace data in this browser','offlineSync',p.offlineSync);
+ const details=panel('Profile details','',
+   `<form id="profile" class="form profile-form"><div class="fields">${profileFields}</div>
+   <fieldset><legend>Trading preferences</legend><div class="fields">${tradingFields}</div>${bioField}</fieldset>
+   <fieldset><legend>Offline access</legend>${syncControl}</fieldset>
+   <div class="profile-save">${submit('Save profile',!online)}</div></form>`,'','profile-details');
+ const account=panel('Account connection','',`<dl class="profile-facts">
+   <div><dt>Environment</dt><dd>${state.mode==='demo'?'Local paper simulator':'Alpaca Paper'}</dd></div>
+   <div><dt>Broker status</dt><dd>${badge(online?state.broker:'cached')}</dd></div>
+   <div><dt>Account key</dt><dd class="mono">${esc(state.accountKey??state.mode)}</dd></div>
+   <div><dt>Last sync</dt><dd>${stamp(state.synced)}</dd></div></dl>`,'','profile-account');
+ const equityCurve=panel('Portfolio equity',eqRet!==null?`<span class="${color(eqRet)}">${pct(eqRet)}</span> since first snapshot`:'Recorded account snapshots',plot(equityPts),'','profile-curve');
+ const metrics=metric('Account equity',usd(state.account?.equity),'Paper portfolio','equity',true)+metric('Buying power',usd(state.account?.buyingPower),'Available for orders','wallet')+
+   metric('Win rate',winRate!==null?winRate.toFixed(1)+'%':'—',decided?`${wins}W / ${losses}L · ratio ${winRatio}`:'Awaiting closed trades','equity')+
+   metric('Filled orders',filledOrders.length,activeBots+' enabled bots','portfolio');
+ return `<div class="profile-page">${page('Workspace preferences','Profile','Manage your trader identity and paper account preferences.',badge(online?'Connected':'Offline',online?'good':'bad'))}
+   ${!online?'<div class="notice">Cached profile · '+syncLabel()+'</div>':''}
+   ${hero}<div class="profile-layout">${details}<div class="profile-summary">${account}<div class="metrics">${metrics}</div>${equityCurve}</div></div></div>`;
+
 }
+function historyOrders(){
+ return state.orders.filter(o=>(!historyFilter.asset||o.symbol===historyFilter.asset)&&(!historyFilter.strategy||o.strategy===historyFilter.strategy)&&(!historyFilter.side||o.side===historyFilter.side)&&(!historyFilter.status||o.status===historyFilter.status)&&(!historyFilter.start||o.t?.slice(0,10)>=historyFilter.start)&&(!historyFilter.end||o.t?.slice(0,10)<=historyFilter.end));
+}
+function historyPerformance(exits){
+ if(!exits.length)return empty('Performance appears when a sell fill has recorded realized P&L.');
+ const days=new Map();
+ for(const o of exits){
+   const day=(o.filledAt??o.t).slice(0,10);
+   const d=days.get(day)??{pnl:0,wins:0,count:0};
+   d.pnl+=o.pnl;d.wins+=Number(o.pnl>0);d.count++;days.set(day,d);
+ }
+ const data=[...days].sort(([a],[b])=>a.localeCompare(b));
+ const high=Math.max(0,...data.map(([,d])=>d.pnl)),low=Math.min(0,...data.map(([,d])=>d.pnl));
+ const y=v=>150-128*(v-low)/(high-low||1),x=i=>65+(i+.5)*560/data.length;
+ const width=Math.min(26,390/data.length),dots=[],bars=[];
+ data.forEach(([day,d],i)=>{
+   const rate=100*d.wins/d.count;
+   dots.push([x(i),150-1.28*rate]);
+   bars.push(`<g><title>${day} · ${usd(d.pnl)} · ${num(rate)}% wins</title><rect x="${x(i)-width/2}" y="${Math.min(y(0),y(d.pnl))}" width="${width}" height="${Math.max(1,Math.abs(y(d.pnl)-y(0)))}" rx="2" fill="${d.pnl<0?'#fb839a':'#299eff'}"/></g>`);
+ });
+ const ticks=[...new Set([0,Math.floor((data.length-1)/2),data.length-1])];
+ return `<svg class="history-plot" viewBox="0 0 685 184" role="img" aria-label="Daily realized profit or loss in dollars and percentage of profitable recorded exits"><g fill="currentColor" font-size="11">${[0,.5,1].map(f=>`<path d="M65 ${150-128*f}h560" stroke="#243450"/><text x="58" y="${154-128*f}" text-anchor="end">${usd(low+f*(high-low))}</text><text x="635" y="${154-128*f}">${100*f}%</text>`).join('')}${ticks.map(i=>`<text x="${x(i)}" y="174" text-anchor="middle">${data[i][0].slice(5)}</text>`).join('')}</g>${bars.join('')}<polyline points="${dots.map(p=>p.join(',')).join(' ')}" fill="none" stroke="#c681ff" stroke-width="2"/>${dots.filter((_,i)=>data.length<60||ticks.includes(i)).map(([cx,cy])=>`<circle cx="${cx}" cy="${cy}" r="3" fill="#d799ff"/>`).join('')}</svg>`;
+}
+let historyPeriod='all';
 function historyPage(){
- const filteredOrders=state.orders.filter(item=>(!historyFilter.asset||item.symbol===historyFilter.asset)&&(!historyFilter.strategy||item.strategy===historyFilter.strategy)&&(!historyFilter.side||item.side===historyFilter.side)&&(!historyFilter.status||item.status===historyFilter.status)&&(!historyFilter.start||item.t?.slice(0,10)>=historyFilter.start)&&(!historyFilter.end||item.t?.slice(0,10)<=historyFilter.end));
+ if(params().get('tab')==='orders'&&historyTab!=='orders')historyTab='orders';
+ const filteredOrders=historyOrders();
  const filteredSignals=state.signals.filter(item=>(!historyFilter.asset||item.symbol===historyFilter.asset)&&(!historyFilter.strategy||item.strategy===historyFilter.strategy)&&(!historyFilter.side||item.direction===historyFilter.side)&&(!historyFilter.start||item.t?.slice(0,10)>=historyFilter.start)&&(!historyFilter.end||item.t?.slice(0,10)<=historyFilter.end));
  const filled=filteredOrders.filter(o=>o.filled>0&&Number.isFinite(o.price));
- const buyVol=filled.filter(o=>o.side==='buy').reduce((sum,o)=>sum+o.filled*o.price,0);
- const sellVol=filled.filter(o=>o.side==='sell').reduce((sum,o)=>sum+o.filled*o.price,0);
+ const exits=filled.filter(o=>o.side==='sell'&&Number.isFinite(o.pnl));
+ const total=exits.reduce((sum,o)=>sum+o.pnl,0),wins=exits.filter(o=>o.pnl>0).length;
+ const returns=exits.filter(o=>o.price*o.filled-o.pnl>0).map(o=>100*o.pnl/(o.price*o.filled-o.pnl));
+ const groups=new Map();
+ for(const row of [...filteredOrders,...filteredSignals]){
+   if(!row.strategyId)continue;
+   const group=groups.get(row.strategyId)??{name:row.strategy,symbols:new Set(),time:'',exits:0,pnl:0};
+   group.symbols.add(row.symbol);
+   if((row.t??'')>group.time)group.time=row.t;
+   if(row.side==='sell'&&row.filled>0&&Number.isFinite(row.pnl)){group.exits++;group.pnl+=row.pnl}
+   groups.set(row.strategyId,group);
+ }
  const opt=(list,label)=>[['',label],...Array.from(new Set(list.filter(Boolean))).map(v=>[v,v])];
  const filterFields=select('Asset','asset',opt([...state.orders.map(o=>o.symbol),...state.signals.map(s=>s.symbol)],'All assets'),historyFilter.asset)+
    select('Strategy','strategy',opt([...state.orders.map(o=>o.strategy),...state.signals.map(s=>s.strategy)],'All strategies'),historyFilter.strategy)+
@@ -671,9 +983,19 @@ function historyPage(){
    : panel('Backtest runs','Historical replay snapshots.',table(['Run time','Strategy','Asset','Period','Capital','Final','Return','Max DD','Trades'],state.runs.map(r=>[
        stamp(r.t),esc(r.name)+' v'+r.version,esc(r.symbol),esc(r.start)+' → '+esc(r.end),usd(r.capital),usd(r.final),`<span class="${color(r.final-r.capital)}">${pct(100*(r.final/r.capital-1))}</span>`,pct(r.drawdown),num(r.tradeCount??r.trades.length)
      ]),'No backtest runs saved yet.'),link('Run backtest','backtesting',true));
- return page('Execution audit','History','Inspect filled trades, strategy signals, and historical backtests.',btn('Export CSV','export-history'))+
-   `<div class="metrics">${metric('Filled orders',filled.length,filteredOrders.length+' total matching','portfolio')}${metric('Buy volume',usd(buyVol),'Filled purchases','wallet',true)}${metric('Sell volume',usd(sellVol),'Filled sales','equity')}${metric('Signals logged',filteredSignals.length,state.runs.length+' backtests saved','bot',true)}</div>`+
-   `<div class="stack">${panel('Filters','Slice executions and signals by asset, strategy, side, or date.',form('history',filterFields,submit('Apply filters')))}${tabs}${content}</div>`;
+ const toolbar=select('Period','history-period',[['all','All time'],['7','Last 7 days'],['30','Last 30 days'],['90','Last 90 days'],...(historyPeriod==='custom'?[['custom','Custom dates']]:[])],historyPeriod)+select('Symbol','history-symbol',opt([...state.orders,...state.signals].map(r=>r.symbol),'All symbols'),historyFilter.asset)+btn('Export orders','export-history','',true);
+ const sessions=[...groups].sort((a,b)=>b[1].time.localeCompare(a[1].time)).map(([id,g])=>{
+   const bot=state.bots[id];
+   return [stamp(g.time),esc(g.name),esc([...g.symbols].join(', ')),g.exits?`<span class="${color(g.pnl)}">${usd(g.pnl)}</span>`:'—',bot?badge(botStatus(bot)):badge('Archived'),bot?link('View',sessionRoute(bot)):'—'];
+ });
+ const best=exits.reduce((a,b)=>!a||b.pnl>a.pnl?b:a,null);
+ return `<div class="history-page">${page('Paper trading','Trading History','Review your past trading sessions and performance.','<div class="history-toolbar">'+toolbar+'</div>')}
+ ${online?'':'<p class="notice">Cached history · '+syncLabel()+'</p>'}
+ <div class="metrics">${metric('Bot sessions',groups.size,'Bots with matching activity','bot')}${metric('Realized P&L','<span class="'+color(total)+'">'+usd(exits.length?total:null)+'</span>',exits.length+' priced exits','equity')}${metric('Win rate',exits.length?num(100*wins/exits.length)+'%':'—',wins+' profitable exits','backtesting')}${metric('Avg. return',pct(returns.length?returns.reduce((a,b)=>a+b,0)/returns.length:null),'Per exit with known cost','portfolio')}</div>
+ <div class="history-grid"><div class="history-main">${panel('Performance overview','Daily realized results',''+historyPerformance(exits),'<small class="history-legend">● P&L &nbsp; <em>● Win rate</em></small>')}
+ ${panel('Recent sessions','Latest matching activity per bot',table(['Last activity','Strategy','Symbols','Realized P&L','Current status','Session'],sessions,'No bot sessions match these filters.'))}</div>
+ ${panel('Key insights','','<div class="history-insights"><small>Best recorded exit</small><strong>'+usd(best?.pnl)+'</strong><p>'+esc(best?best.symbol+' · '+stamp(best.filledAt??best.t):'Awaiting a realized exit.')+'</p><hr><small>Order activity</small><strong>'+filled.length+'</strong><p>Orders with fills across '+new Set(filled.map(o=>o.symbol)).size+' symbols.</p></div>','','history-aside')}</div>
+ <div class="stack">${panel('Detailed filters','',form('history',filterFields,submit('Apply filters')))}${tabs}${content}</div></div>`;
 }
 function combinedLogs(){
  const raw=Array.isArray(state.logs)?state.logs:[];
@@ -756,7 +1078,9 @@ function logsPage(){
 }
 const renderers={dashboard,trading,session,screener,strategies,backtesting,portfolio,history:historyPage,logs:logsPage,settings,profile};
 function clearWorkspace(){
- state=null;editor=null;runA='';runB=null;online=false;
+ playbookLibraryOpen=false;
+ state=null;editor=null;runA='';runB=null;backtestDraft=null;backtestVersionRoute=null;online=false;
+ clearTimeout(previewTimer);strategyPreview={key:'',result:null,next:0};
  write('ft-cache',null);write('ft-draft',null);
 }
 function authenticationView(){
@@ -821,7 +1145,7 @@ function render(force=false){
  if(markup!==main.dataset.html){main.innerHTML=markup;main.dataset.html=markup}
 }
 async function api(path,data){
- const res=await fetch('/api/'+path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(data),signal:timeoutSignal(path==='backtest'?70000:30000)});
+ const res=await fetch('/api/'+path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(data),signal:timeoutSignal(['backtest','strategy-preview'].includes(path)?70000:30000)});
  const result=await res.json();
  if(!res.ok){
    if(res.status===401&&path!=='auth') signInRequired();
@@ -833,6 +1157,7 @@ const values=form=>Object.fromEntries(new FormData(form));
 function capture(form){
  const data=values(form);
  delete data.version;
+ if(data.symbol!==undefined)data.symbol=data.symbol.trim().toUpperCase();
  for(const [,k]of fields)if(data[k]!==undefined)data[k]=+data[k];
  if(data.aiDailyCap!==undefined)data.aiDailyCap=+data.aiDailyCap;
  const changed=Object.entries({...data,ai:form.elements.ai.checked}).some(([k,v])=>editor[k]!==v);
@@ -941,6 +1266,30 @@ document.addEventListener('click',async event=>{
    render(true);
    return;
  }
+ if(action==='fleet-jump'){
+   if(value==='bot-list'){botFilter='all';render(true)}
+   const target=document.getElementById(value);
+   target?.scrollIntoView({block:'start'});
+   target?.querySelector('select,button')?.focus({preventScroll:true});
+   return;
+ }
+ if(action==='fleet-command'){
+   if(!online||pending||!['paused','stopped'].includes(value))return;
+   const targets=Object.values(state.bots).filter(b=>value==='paused'?b.desired==='running':b.desired!=='stopped');
+   const verb=value==='paused'?'Pause':'Stop';
+   if(!targets.length||!confirm(verb+' '+targets.length+' paper bot(s)? Existing orders and positions will stay at the broker.'))return;
+   pending=true;el.disabled=true;
+   const failures=[];
+   try{
+     for(const b of targets){
+       try{await api('bot',{id:b.id,version:b.version,action:value})}
+       catch(error){failures.push(b.name+' · '+error.message)}
+     }
+     await refresh(true);
+     toast(failures.length?'Updated '+(targets.length-failures.length)+' of '+targets.length+'. '+failures.join(', '):targets.length+' bot(s) '+value+'.');
+   }finally{pending=false;el.disabled=false}
+   return;
+ }
  if(action==='cancel-delete-bot'){
    deleteBotId=null;
    render(true);
@@ -954,7 +1303,7 @@ document.addEventListener('click',async event=>{
    try{
      const res=await api('bot',{delete:true,id:value,liquidate});
      deleteBotId=null;
-     toast(res.liquidated?`Deleted ${bot?.name??'bot'} & submitted market sell for ${bot?.symbol??'position'}.`:res.leftOpen?`Deleted ${bot?.name??'bot'}. Open ${bot?.symbol??'position'} left unmanaged.`:`Deleted ${bot?.name??'bot'}.`);
+     toast(res.pending?'Liquidation pending. The bot will be deleted once the position is confirmed closed.':res.liquidated?`Liquidated the position and deleted ${bot?.name??'bot'}.`:res.leftOpen?(res.deleted?`Deleted ${bot?.name??'bot'}. Open ${bot?.symbol??'position'} left unmanaged.`:'Liquidation incomplete. The bot was kept.'):`Deleted ${bot?.name??'bot'}.`);
      if(active==='session'&&params().get('id')===value)location.hash='#trading';
      await refresh(true);
    }catch(error){toast(error.message)}
@@ -1042,6 +1391,10 @@ document.addEventListener('click',async event=>{
  }
  if(action==='watch'){selected=value;chartMode='Price'}
  if(action==='range')range=value;
+ if(action==='portfolio-range')portfolioRange=value;
+ if(action==='account-range'&&Object.hasOwn(accountPeriods,value))accountRange=value;
+ if(action==='portfolio-positions')showAllPositions=!showAllPositions;
+ if(action==='export-portfolio'){exportPortfolio();return}
  if(action==='chart')chartMode=value;
  if(action==='tv-style')tvStyle=value;
  if(action==='tv-range')tvRange=value;
@@ -1064,22 +1417,43 @@ document.addEventListener('click',async event=>{
    finally{pending=false;el.disabled=false}
    return;
  }
- if(action==='history-tab')historyTab=value;
+ if(action==='history-tab'){
+   if(params().has('tab'))window.history.replaceState(null,'','#history');
+   historyTab=value;
+ }
  if(action==='export-history'){
-   const rows=[['Time','Asset','Strategy','Side','Qty','Filled','Price','Status'],...state.orders.map(o=>[o.filledAt??o.t??'',o.symbol??'',o.strategy??'External',o.side??'',o.qty??'',o.filled??'',o.price??'',o.status??''])];
+   const rows=[['Time','Asset','Strategy','Side','Qty','Filled','Price','Status','Realized P&L'],...historyOrders().map(o=>[o.filledAt??o.t??'',o.symbol??'',o.strategy??'External',o.side??'',o.qty??'',o.filled??'',o.price??'',o.status??'',o.pnl??''])];
    const csv=rows.map(r=>r.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(',')).join('\n');
    const a=document.createElement('a');a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(csv);a.download='fasttrader-history.csv';a.click();
    toast('Exported trade history CSV.');return;
  }
- if(action==='asset')assetClass=value;
+ if(action==='asset'){
+   assetClass=value;
+   if(value==='Catalog'&&!catalogResults&&!catalogLoading)void loadCatalog();
+ }
  if(action==='bot-filter')botFilter=value;
  if(action==='edit')editor=structuredClone(version(value));
- if(action==='new')editor=fresh();
+ if(action==='new'){editor=fresh();playbookLibraryOpen=false}
+ if(action==='open-playbook-library')playbookLibraryOpen=true;
+ if(action==='open-playbook-run'){
+   runA=value;
+   location.hash='backtesting';
+ }
+ if(action==='create-playbook-draft'&&Object.hasOwn(strategyPlaybooks,value)){
+   if(editor?.dirty&&!confirm('Replace the current unsaved strategy draft?'))return;
+   const playbook=strategyPlaybooks[value];
+   editor={...fresh(editor?.symbol??'','custom'),...structuredClone(playbook.draft),name:playbook.name,
+     playbookId:value,dirty:true,mutation:crypto.randomUUID()};
+   if(!authInfo?.required)write('ft-draft',editor);
+   playbookLibraryOpen=false;
+   toast('Playbook draft created. Review the rules and risk settings before saving.');
+ }
  if(action==='apply-template'){
    const tpl=strategyTemplates[value];
-   if(tpl){editor={...editor,...structuredClone(tpl),id:editor?.id??'',version:editor?.version??0,symbol:editor?.symbol||state.market[0]?.symbol||'',dirty:true,mutation:crypto.randomUUID()};toast('Loaded template: '+tpl.label)}
+   if(tpl){editor={...editor,...structuredClone(tpl),playbookId:undefined,id:editor?.id??'',version:editor?.version??0,symbol:editor?.symbol||state.market[0]?.symbol||'',dirty:true,mutation:crypto.randomUUID()};toast('Loaded template: '+tpl.label)}
  }
  if(action==='editor-type'){
+   playbookLibraryOpen=false;
    if(value==='ai_notepad'){
      editor={...editor,mode:'ai_notepad',ai:true,timeframe:editor?.timeframe==='1Min'?'15Min':(editor?.timeframe??'15Min'),dirty:true,mutation:crypto.randomUUID()};
    }else if(value==='ai_autonomous'){
@@ -1098,7 +1472,7 @@ document.addEventListener('click',async event=>{
  }
  if(action==='apply-note-template'){
    const tpl=notepadTemplates[value];
-   if(tpl){editor={...editor,...structuredClone(tpl),mode:'ai_notepad',ai:true,id:editor?.id??'',version:editor?.version??0,symbol:editor?.symbol||state.market[0]?.symbol||'',dirty:true,mutation:crypto.randomUUID()};toast('Loaded AI Notepad starter: '+tpl.label)}
+   if(tpl){editor={...editor,...structuredClone(tpl),playbookId:undefined,mode:'ai_notepad',ai:true,id:editor?.id??'',version:editor?.version??0,symbol:editor?.symbol||state.market[0]?.symbol||'',dirty:true,mutation:crypto.randomUUID()};toast('Loaded AI Notepad starter: '+tpl.label)}
  }
  if(action==='rule-logic'){
    const r=ensureRules();
@@ -1131,6 +1505,25 @@ document.addEventListener('click',async event=>{
 });
 document.addEventListener('input',event=>{
  const t=event.target;
+ if(t.matches('[data-asset-picker]')){
+   clearTimeout(assetSearchTimer);
+   const query=t.value.trim(), list=t.list;
+   const status=document.getElementById(list.id+'-status');
+   assetSearchTimer=setTimeout(async()=>{
+     try{
+       const result=await api('assets',{query,eligible:true});
+       if(!t.isConnected||t.value.trim()!==query)return;
+       list.replaceChildren(...result.items.map(asset=>{
+         const option=document.createElement('option');
+         option.value=asset.symbol;option.label=asset.name;return option;
+       }));
+       status.textContent=result.total?'Enter a ticker or choose a search result.':
+         result.partial?'Some Alpaca assets are unavailable or still loading.':'No eligible instruments found.';
+     }catch(error){
+       if(t.isConnected&&t.value.trim()===query)status.textContent=error.message;
+     }
+   },200);
+ }
  if(t.dataset?.ruleSide){
    const r=ensureRules(), row=r[t.dataset.ruleSide][+t.dataset.ruleIdx];
    if(row){
@@ -1138,16 +1531,33 @@ document.addEventListener('input',event=>{
      if(p2)row[p1][p2]=p2==='indicator'?t.value:+t.value;
      else row[p1]=t.value;
      editor.mode='custom';editor.dirty=true;editor.mutation=crypto.randomUUID();
+      const preview=$('#strategy-preview');
+      if(preview)preview.innerHTML=requestStrategyPreview();
    }
    return;
  }
  const form=t.closest('#strategy');
- if(form&&t.name!=='version')capture(form);
+  if(form&&t.name!=='version'){
+    capture(form);
+    const preview=$('#strategy-preview');
+    if(preview)preview.innerHTML=requestStrategyPreview();
+  }
+ if(t.closest('#backtest'))backtestDraft=values(t.form);
+ if(t.matches('#launch-bot [name=instrument]'))launchInstrument=t.value;
  if(t.matches('#launch-bot [name=budget]'))launchBudget=t.value;
  if(t.matches('#fund-bot [name=budget]'))fundBudget=t.value;
 });
 document.addEventListener('change',event=>{
  const t=event.target;
+ if(t.name==='history-period'){
+   historyPeriod=t.value;historyFilter.start='';historyFilter.end='';
+   if(t.value!=='all'){historyFilter.end=date(Date.now());historyFilter.start=date(Date.now()-(Number(t.value)-1)*86400000)}
+   render(true);return;
+ }
+ if(t.name==='history-symbol'){historyFilter.asset=t.value;render(true);return}
+ if(t.name==='portfolio-period'&&Object.hasOwn(accountPeriods,t.value)){
+   accountRange=t.value;render(true);return;
+ }
  if(t.id==='avatar-file'&&t.files?.[0]){
    const reader=new FileReader();
    reader.onload=()=>{
@@ -1194,7 +1604,7 @@ document.addEventListener('change',event=>{
    }
    return;
  }
- if(t.matches('#strategy [name=symbol], #strategy [name=timeframe], #strategy [name=mode]')){
+ if(t.matches('#strategy [name=timeframe], #strategy [name=mode]')){
    capture(t.form);render(true);return;
  }
  if(event.target.matches('#launch-bot [name=version]')){
@@ -1202,7 +1612,7 @@ document.addEventListener('change',event=>{
    const form=event.target.form;
    const symbol=version(launchVersion)?.symbol;
    const instrument=form.elements.instrument;
-   instrument.value=Array.from(instrument.options).some(option=>option.value===symbol)?symbol:'';
+   instrument.value=symbol??'';
    launchInstrument=instrument.value;
  }
  if(event.target.matches('#launch-bot [name=instrument]'))launchInstrument=event.target.value;
@@ -1216,11 +1626,14 @@ document.addEventListener('change',event=>{
      const isCryptoAsset=strat.symbol?.includes('/');
      event.target.form.elements.fees.value=isCryptoAsset?25:1;
      event.target.form.elements.slippage.value=isCryptoAsset?5:2;
+     backtestDraft=values(event.target.form);
    }
  }
  if(event.target.closest('#run-select')){
-   if(event.target.name==='runA')runA=event.target.value;
-   else runB=event.target.value;
+   if(event.target.name==='runA'){
+     runA=event.target.value;
+     if(runB===runA)runB='';
+   }else runB=event.target.value;
    render(true);
  }
 });
@@ -1230,11 +1643,25 @@ document.addEventListener('submit',async event=>{
  event.preventDefault();
  if(pending||syncing)return;
  const data=values(form),control=event.submitter;
+ if(form.id==='dashboard-search'){
+   catalogSearch={query:data.query.trim(),assetClass:'',offset:0};
+   assetClass='Catalog';
+   location.hash='screener';
+   await loadCatalog();return;
+ }
+ if(form.id==='catalog-search'){
+   if(catalogLoading)return;
+   const sameSearch=data.query.trim()===catalogSearch.query&&data.assetClass===catalogSearch.assetClass;
+   const direction=control?.name==='page'?control.value:'';
+   const offset=sameSearch&&direction?Math.max(0,catalogSearch.offset+(direction==='next'?30:-30)):0;
+   catalogSearch={query:data.query.trim(),assetClass:data.assetClass,offset};
+   await loadCatalog();return;
+ }
  if(form.id==='screen'){
    Object.assign(assetClass==='Crypto'?cryptoScreen:screen,data,{volume:+data.volume,volatility:+data.volatility});
    render(true);return;
  }
- if(form.id==='history'){Object.assign(historyFilter,data);render(true);return}
+ if(form.id==='history'){if(data.start!==historyFilter.start||data.end!==historyFilter.end)historyPeriod=data.start||data.end?'custom':'all';Object.assign(historyFilter,data);render(true);return}
  if(form.id==='logs-filter'){Object.assign(logFilter,data);render(true);return}
  pending=true;if(control)control.disabled=true;
  try{
@@ -1248,7 +1675,7 @@ document.addEventListener('submit',async event=>{
    if(form.id==='launch-bot'){
      const selected=version(data.version);
      if(!selected)throw Error('Choose a saved strategy version.');
-     const launched=await api('bot',{id:selected.id,version:selected.version,symbol:selected.symbol,instrument:data.instrument,action:'running',budget:+data.budget,create:true});
+     const launched=await api('bot',{id:selected.id,version:selected.version,symbol:selected.symbol,instrument:data.instrument.trim().toUpperCase(),action:'running',budget:+data.budget,create:true});
      launchVersion=null;launchInstrument=null;launchBudget='';botFilter='all';
      toast(selected.name+' launched.');
      location.hash=sessionRoute(launched);
@@ -1326,6 +1753,11 @@ document.addEventListener('pointerout',event=>{
  node.querySelector('.tooltip').hidden=true;
 });
 document.addEventListener('keydown',event=>{
+ if(active==='dashboard'&&(event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='k'){
+   event.preventDefault();
+   $('#dashboard-search input')?.focus();
+   return;
+ }
  const node=event.target.closest('.plot');
  if(!node||!['ArrowRight','ArrowLeft'].includes(event.key))return;
  event.preventDefault();inspect(node,(node.index??0)+(event.key==='ArrowRight'?1:-1));
