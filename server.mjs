@@ -1,3 +1,4 @@
+import { replayPortfolio, createPaperPortfolio, stepPaperPortfolio, paperPortfolioSummary } from './portfolio.mjs';
 import { createServer } from 'node:http';
 import { readFile, mkdir, writeFile, rename } from 'node:fs/promises';
 import { randomUUID, createHash, createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
@@ -155,7 +156,7 @@ const catalogClasses = ['us_equity', 'crypto', 'us_option', 'crypto_perp', 'trea
 const catalog = new Map();
 const assetFetchedAt = {};
 const assetFailures = new Set();
-const trackedSymbols = () => [...new Set([...symbols, ...Object.values(state.bots).filter(bot => bot.desired === 'running').map(bot => bot.symbol)])];
+const trackedSymbols = () => [...new Set([...symbols, ...(state.paperPortfolio?.running ? [state.paperPortfolio.symbol] : []), ...Object.values(state.bots).filter(bot => bot.desired === 'running').map(bot => bot.symbol)])];
 const supportsSymbol = symbol => Object.hasOwn(instruments, symbol) || (!demo && eligible.has(symbol));
 const validateStrategy = input => strategy(input, supportsSymbol);
 const assetEligible = symbol => eligible.has(symbol) && (demo || !isCrypto(symbol) || state.cryptoSessionOpen);
@@ -1062,8 +1063,9 @@ async function cycle() {
         brokerAt = 0;
       }
       if (brokerAt) await reconcileClosingBots();
+      await advancePaperPortfolio();
       const bots = Object.values(state.bots).filter(bot => bot.desired === 'running');
-      seedBotHistory(bots);
+      seedBotHistory(state.paperPortfolio?.running ? [...bots, state.paperPortfolio] : bots);
       for (const bot of bots) {
         const s = state.strategies.find(item => item.id === bot.id && item.version === bot.version);
         if (s && eligible.has(s.symbol)) void loadTimeframe(s);
@@ -1388,7 +1390,13 @@ function snapshot() {
     return [bot.id, { ...ledger, available: reserved === null ? 0 : Math.max(0, ledger.available - reserved), reserved, mark, unrealized }];
   }));
   return {
-    ...state, botSessions, knowledge: (state.knowledge ?? []).map(({ text, ...file }) => file),
+    ...state, botSessions,
+    paperPortfolio: state.paperPortfolio ? {
+      ...paperPortfolioSummary(state.paperPortfolio), symbol: state.paperPortfolio.symbol,
+      timeframe: state.paperPortfolio.timeframe, running: state.paperPortfolio.running,
+      lastBar: state.paperPortfolio.lastBar, lossLocked: state.paperPortfolio.lossLocked
+    } : null,
+    knowledge: (state.knowledge ?? []).map(({ text, ...file }) => file),
     orders: state.orders.toSorted((a, b) => (b.t ?? '').localeCompare(a.t ?? '')).slice(0, 500),
     runs: state.runs.map(({ curve, trades, ...run }) => ({
       ...run, curve: curve.filter((_, idx) => idx % Math.ceil(curve.length / 650) === 0 || idx === curve.length - 1),
@@ -1410,7 +1418,32 @@ async function body(req, limit = 20000) {
   }
   return JSON.parse(raw || '{}');
 }
+function testSavedAiKey(input) {
+  const saved = typeof input.botId === 'string' && input.botId ? perBotAiProviders.get(input.botId) : botAiProvider;
+  const candidate = input.key?.trim()
+    ? { name: input.provider === 'OpenAI' ? 'OpenAI' : 'Gemini', key: input.key.trim(), model: input.model?.trim() || (input.provider === 'OpenAI' ? 'gpt-4.1-mini' : defaultGeminiModel) }
+    : saved;
+  if (!candidate) throw Error('Save or enter an API key first.');
+  return testProviderKey(candidate);
+}
+
 async function change(path, input) {
+  if (path === '/api/portfolio-session') {
+    const current = state.paperPortfolio;
+    if (input.action === 'pause' || input.action === 'resume') {
+      if (!current) throw Error('Start a paper portfolio first.');
+      current.running = input.action === 'resume';
+      current.started = Date.now();
+      for (const book of current.books) book.pending = null;
+      return { running: current.running };
+    }
+    if (input.action !== 'start' || current) throw Error('This workspace already has a paper portfolio, or the action is invalid.');
+    const { strategies, config } = portfolioSettings(input);
+    const [first] = strategies;
+    state.paperPortfolio = { ...createPaperPortfolio(strategies, config), running: true,
+      symbol: first.symbol, timeframe: first.timeframe ?? '1Min', started: Date.now(), lastBar: null };
+    return { running: true };
+  }
   if (path === '/api/knowledge') {
     const name = typeof input.name === 'string' ? input.name.trim() : '';
     const text = typeof input.text === 'string' ? input.text.replace(/^\uFEFF/, '').trim() : '';
@@ -1696,14 +1729,6 @@ async function change(path, input) {
       await saveBotAiProvider(null);
       return { configured: false };
     }
-    if (input.testBotAiKey === true) {
-      const saved = typeof input.botId === 'string' && input.botId ? perBotAiProviders.get(input.botId) : botAiProvider;
-      const candidate = input.key?.trim()
-        ? { name: input.provider === 'OpenAI' ? 'OpenAI' : 'Gemini', key: input.key.trim(), model: input.model?.trim() || (input.provider === 'OpenAI' ? 'gpt-4.1-mini' : defaultGeminiModel) }
-        : saved;
-      if (!candidate) throw Error('Save or enter an API key first.');
-      return testProviderKey(candidate);
-    }
     if (input.botAiKey && typeof input.botAiKey === 'object') {
       const name = input.botAiKey.provider === 'OpenAI' ? 'OpenAI' : 'Gemini';
       const key = String(input.botAiKey.key ?? '').trim();
@@ -1770,6 +1795,50 @@ async function previewStrategy(input) {
   return { ready, needed, count: bars.length, latest, groups, zeroVolume, entry: ready && !zeroVolume ? entrySignal(s, bars) : null };
 }
 
+function portfolioSettings(input) {
+  const strategies = Array.isArray(input.versions) && input.versions.length === 2
+    ? input.versions.map(key => state.strategies.find(item => item.id + '@' + item.version === key)) : [];
+  const [first, second] = strategies;
+  if (!first || !second || first.id === second.id || first.symbol !== second.symbol ||
+    (first.timeframe ?? '1Min') !== (second.timeframe ?? '1Min') ||
+    strategies.some(item => item.ai || ['ai_notepad', 'ai_autonomous'].includes(item.mode))) {
+    throw Error('Choose two distinct rules-only strategies with the same instrument and timeframe.');
+  }
+  const { capital, split, fees, slippage } = input;
+  if (![capital, split, fees, slippage].every(Number.isFinite) || capital < 100 || capital > 1e9 ||
+    split < 0.01 || split > 0.99 || Math.min(fees, slippage) < 0 || Math.max(fees, slippage) > 500) {
+    throw Error('Enter valid capital, allocation, fees, and slippage.');
+  }
+  return { strategies, config: { capital, split, fees, slippage } };
+}
+
+async function advancePaperPortfolio() {
+  const session = state.paperPortfolio;
+  if (!session?.running) return;
+  const s = session.books[0].s;
+  void loadTimeframe(s);
+  if (!ready(s.symbol)) return;
+  const bars = strategyBars(s);
+  const bar = bars.at(-1);
+  const duration = demo && session.timeframe === '1Min' ? 0 : timeframes[session.timeframe];
+  if (!bar || bar.t === session.lastBar || Date.parse(bar.t) + duration < session.started) return;
+  const price = quotePrice(s.symbol, state.bars[s.symbol]?.at(-1));
+  if (!Number.isFinite(price) || price <= 0) return;
+  stepPaperPortfolio(session, bar, bars, price);
+  session.lastBar = bar.t;
+}
+
+async function portfolioReplay(input) {
+  const { strategies, config } = portfolioSettings(input);
+  const [first] = strategies;
+  const end = Date.now() - 60000;
+  const timeframe = first.timeframe ?? '1Min';
+  const bars = closedStrategyBars(await history(first.symbol, end - 14 * 86400000, end, timeframe), timeframe, end);
+  if (bars.length <= Math.max(...strategies.map(ruleWarmupBars))) throw Error('Insufficient closed candles for both strategies.');
+  return { symbol: first.symbol, timeframe, ...replayPortfolio(strategies, bars, config),
+    benchmarks: strategies.map(s => ({ name: s.name, ...replayPortfolio([s], bars, { ...config, split: 1 }) })) };
+}
+
 async function backtest(input) {
   const s = state.strategies.find(item => item.id === input.id && item.version === input.version);
   if (!s || s.mode === 'ai_notepad' || s.mode === 'ai_autonomous') throw Error('AI Notepad and Autonomous AI strategies cannot be replayed deterministically. Select a Rule Builder or preset strategy.');
@@ -1829,6 +1898,10 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname.startsWith('/api/')) {
       const input = await body(req, ['/api/profile', '/api/knowledge'].includes(url.pathname) ? 220000 : 20000);
       if (url.pathname === '/api/strategy-preview') return respond(200, await previewStrategy(input));
+      if (url.pathname === '/api/settings' && input.testBotAiKey === true) {
+        return respond(200, await testSavedAiKey(input));
+      }
+      if (url.pathname === '/api/portfolio-replay') return respond(200, await portfolioReplay(input));
       const result = url.pathname === '/api/backtest' ? await backtest(input) : await serial(async () => {
         if (!auth.authenticated(req.headers.cookie)) throw Object.assign(Error('Sign in to FastTrader.'), { status: 401 });
         const value = await change(url.pathname, input);

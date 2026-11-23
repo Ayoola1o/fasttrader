@@ -14,6 +14,22 @@ import { signalProvider, assessSignal } from './signal-ai.mjs';
 import { createTelegram } from './telegram.mjs';
 import { handleBridge } from './api/bridge.js';
 import { strategyPlaybooks } from './public/strategy-playbooks.mjs';
+import { replayPortfolio } from './portfolio.mjs';
+
+test('portfolio nets opposing orders and preserves each strategy allocation', () => {
+  const condition = (op, value) => ({ left: { indicator: 'close' }, op, right: { indicator: 'number', value } });
+  const base = { ...defaults, mode: 'custom', size: 100, exposure: 100, take: 50 };
+  const a = { ...base, name: 'A', rules: { entry: [condition('lt', 105)], exit: [condition('gte', 110)] } };
+  const b = { ...base, name: 'B', rules: { entry: [condition('gte', 110)], exit: [] } };
+  const bars = [100, 100, 110, 110].map((c, i) => ({
+    t: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(), o: i === 2 ? 100 : c, c
+  }));
+  const result = replayPortfolio([a, b], bars, { capital: 1000, split: 0.5, fees: 0, slippage: 0 });
+  assert.deepEqual(result.orders.map(({ side, qty }) => [side, qty]), [['buy', 5], ['sell', 1]]);
+  assert.equal(result.internalQty, 4);
+  assert.deepEqual(result.strategies.map(item => item.qty), [0, 4]);
+  assert.equal(result.final, 1050);
+});
 
 test('strategy waits for the timeframe to close and treats max hold as a protective exit', () => {
   const bars = ['12:00', '12:14', '12:15'].map((stamp, index) => ({
@@ -344,6 +360,28 @@ async function withWorker(run, mockAI, env = {}, preloadSource = '') {
     await rm(cwd,{recursive:true,force:true});
   }
 }
+
+test('portfolio replay compares standalone runs and the forward paper session can pause and resume', async () => {
+  await withWorker(async (api, until) => {
+    const a = await api('strategy', { ...defaults, name: 'Portfolio A' });
+    const b = await api('strategy', { ...defaults, name: 'Portfolio B', mode: 'mean_reversion' });
+    const config = {
+      versions: [a, b].map(s => s.id + '@' + s.version), capital: 10000, split: 0.5, fees: 1, slippage: 2
+    };
+    const result = await api('portfolio-replay', config);
+    assert.equal(result.symbol, 'SPY');
+    assert.equal(result.strategies.length, 2);
+    assert.ok(Number.isFinite(result.final));
+    assert.equal(result.benchmarks.length, 2);
+    await api('portfolio-session', { ...config, action: 'start' });
+    await until(async () => (await api('state')).paperPortfolio.lastBar);
+    await api('portfolio-session', { action: 'pause' });
+    const paused = (await api('state')).paperPortfolio;
+    assert.equal(paused.running, false);
+    await api('portfolio-session', { action: 'resume' });
+    assert.equal((await api('state')).paperPortfolio.running, true);
+  });
+});
 
 test('strategy preview backfills hourly history and evaluates the selected rule engine', async () => {
   await withWorker(async api => {

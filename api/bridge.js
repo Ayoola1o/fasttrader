@@ -1,5 +1,5 @@
 const getRoutes = new Set(['auth', 'state']);
-const postRoutes = new Set(['auth', 'assets', 'strategy', 'strategy-preview', 'knowledge', 'bot', 'settings', 'profile', 'demo', 'backtest']);
+const postRoutes = new Set(['auth', 'assets', 'strategy', 'strategy-preview', 'knowledge', 'bot', 'settings', 'profile', 'demo', 'backtest', 'portfolio-replay', 'portfolio-session']);
 const json = (status, error) => Response.json({ error }, { status, headers: { 'Cache-Control': 'no-store' } });
 const maxBodyBytes = 220000;
 
@@ -46,14 +46,15 @@ export async function handleBridge(request, env = process.env, upstreamFetch = f
   try {
     const response = await upstreamFetch(new URL('/api/' + route, worker), {
       method: request.method, headers, body, redirect: 'error', cache: 'no-store',
-      signal: AbortSignal.timeout(['backtest', 'strategy-preview'].includes(route) ? 65000 : 10000)
+      signal: AbortSignal.timeout(['backtest', 'strategy-preview', 'portfolio-replay'].includes(route) ? 65000 : route === 'settings' ? 25000 : 10000)
     });
     if (!response.headers.get('content-type')?.startsWith('application/json')) return json(502, 'The FastTrader worker returned an unexpected response.');
     const output = new Headers({ 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
     const setCookie = route === 'auth' && response.headers.get('set-cookie');
     if (setCookie) output.set('Set-Cookie', setCookie);
     return new Response(response.body, { status: response.status, headers: output });
-  } catch {
+  } catch (error) {
+    if (error?.name === 'TimeoutError') return json(504, 'The FastTrader worker did not respond in time.');
     return json(502, 'The FastTrader worker is unreachable.');
   }
 }

@@ -44,7 +44,11 @@ export async function testProviderKey(provider, request = fetch) {
   } catch {
     throw Error(provider.name + ' connection timed out.');
   }
-  if (!response.ok) throw Error(provider.name + ' rejected key (HTTP ' + response.status + ')');
+  if (response.status === 429) throw Object.assign(Error(provider.name + ' rate limit or quota reached (HTTP 429).'), { status: 429 });
+  if (!response.ok) {
+    const reason = [401, 403].includes(response.status) ? ' denied access' : ' key test failed';
+    throw Error(provider.name + reason + ' (HTTP ' + response.status + ').');
+  }
   return { ok: true, provider: provider.name, model: resolvedModel };
 }
 

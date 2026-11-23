@@ -295,7 +295,38 @@ function tradingOverview(bots,mode){
  ${panel('Market status','',`<b>${!online?'Cached snapshot':state.mode==='demo'?'Simulated market':state.broker!=='connected'?'Broker unavailable':state.sessionOpen?'Stock market open':'Stock market closed'}</b><small>Stocks · ${esc(online?state.feed:'cached')} &nbsp; Crypto · ${esc(online?state.cryptoFeed??state.feed:'cached')}</small>`)}
  ${panel('Risk monitor','',`<b>${Number.isFinite(ratio)?num(ratio)+'% gross exposure':'Awaiting exposure'}</b><small>Position value / account equity</small><meter min="0" max="100" value="${Number.isFinite(ratio)?ratio:0}" aria-label="Gross exposure percent"></meter>`)}</div></div>`;
 }
+let portfolioResult=null,portfolioDraft={};
+function multiStrategy(){
+ const eligible=state.strategies.filter(s=>!s.ai&&!['ai_autonomous','ai_notepad'].includes(s.mode)).toReversed();
+ const options=[['','Choose a saved strategy'],...eligible.map(s=>[key(s),s.name+' · '+s.symbol+' · '+(s.timeframe??'1Min')+' · v'+s.version])];
+ const draft=portfolioDraft;
+ const fields=select('Strategy A','first',options,draft.first??'',true)+select('Strategy B','second',options,draft.second??'',true)+
+   numeric('Starting capital ($)','capital',draft.capital??10000,100,1e9,1)+numeric('Allocation to strategy A (%)','split',draft.split??50,1,99,1)+
+   numeric('Fees (bps)','fees',draft.fees??25,0,500)+numeric('Slippage (bps)','slippage',draft.slippage??5,0,500);
+ const live=state.paperPortfolio;
+ const resultPanel=(r,title,extra='')=>r?panel(title,esc(r.symbol)+' · '+esc(r.timeframe),
+   '<div class="metrics">'+metric('Ending equity',usd(r.final),pct(100*(r.final/r.capital-1)),'equity')+
+   metric('Net orders',num(r.orderCount),'Simulated external orders','trading')+metric('Internally offset',num(r.internalQty),'Units transferred between strategy allocations','portfolio')+'</div>'+
+   table(['Strategy','Cash','Open quantity','Equity'],r.strategies.map(s=>[esc(s.name)+' · v'+s.version,usd(s.cash),num(s.qty),usd(s.equity)]),'No strategy allocations.')+
+   table(['Time','Side','Quantity','Price','Fee'],r.orders.toReversed().map(o=>[stamp(o.t),badge(o.side),num(o.qty),usd(o.price),usd(o.fee)]),'No simulated net orders yet.')+extra):'';
+ const session=resultPanel(live,'Continuous paper session',live?'<div class="form"><div class="actions">'+
+   badge(live.running?'Running':'Paused',live.running?'good':'')+
+   (live.lossLocked?badge('Daily portfolio loss limit','bad'):'')+
+   btn(live.running?'Pause':'Resume','portfolio-session',live.running?'pause':'resume',false,online?'':'disabled')+
+   '</div><small>'+(live.lastBar?'Last candle '+stamp(live.lastBar):'Waiting for a fresh candle')+'</small></div>':'');
+ const results=resultPanel(portfolioResult,'Portfolio replay',portfolioResult?
+   table(['Run','Ending equity','Return'],[
+     ['Combined',usd(portfolioResult.final),pct(100*(portfolioResult.final/portfolioResult.capital-1))],
+     ...portfolioResult.benchmarks.map(run=>[esc(run.name)+' alone',usd(run.final),pct(100*(run.final/run.capital-1))])
+   ],'No comparisons yet.'):'');
+ return page('Paper trading','Multi-strategy','Run two strategies on one asset with separate allocations and simulated net orders.',link('Live Trading','trading'))+
+   '<div class="stack">'+panel('Portfolio setup','Select two rules-only strategies with the same asset and timeframe. The replay uses the last 14 days, evaluates closed candles, and fills at the next open.',
+     form('portfolio-replay',fields,submit('Run portfolio replay',!online||eligible.length<2)+
+       (live?'':`<button class="button primary" type="submit" name="action" value="start" ${!online||eligible.length<2?'disabled':''}>Start paper session</button>`)))+session+results+'</div>';
+}
+
 function trading(){
+ if(params().get('view')==='multi-strategy')return multiStrategy();
  const bots=Object.values(state.bots);
  if(!bots.some(b=>b.id===tvBotId))tvBotId=bots.find(b=>b.desired==='running')?.id??bots[0]?.id??'';
  const activeTvBot=bots.find(b=>b.id===tvBotId);
@@ -342,7 +373,7 @@ function trading(){
      select('Strategy to manage position','version',[['','Choose a strategy version'],...options],chosen,true)+
      numeric('Additional funds to add (USD)','addFunds',0,0,1e9),
      submit('Assign position & start bot',!online))):'';
- return tradingOverview(bots,mode)+'<div class="stack live-workflow">'+tvPanel+'<div id="bot-launch">'+panel('Launch a bot','Choose the saved trading rules, the instrument to trade, and the maximum USD budget.',
+ return tradingOverview(bots,mode)+'<div class="stack live-workflow"><div class="actions">'+link('Multi-strategy','trading?view=multi-strategy')+'</div>'+tvPanel+'<div id="bot-launch">'+panel('Launch a bot','Choose the saved trading rules, the instrument to trade, and the maximum USD budget.',
      options.length?form('launch-bot',select('Strategy version','version',[['','Choose a strategy version'],...options],chosen,true)+
        assetPicker('Ticker or crypto pair','instrument',instrument??'')+numeric('Bot budget (USD)','budget',launchBudget,1,1e9),
        unavailable+submit('Launch bot',!online)):
@@ -1099,6 +1130,7 @@ function logsPage(){
 }
 const renderers={dashboard,trading,session,screener,strategies,backtesting,portfolio,history:historyPage,logs:logsPage,settings,profile};
 function clearWorkspace(){
+ portfolioResult=null;portfolioDraft={};
  playbookLibraryOpen=false;
  state=null;editor=null;runA='';runB=null;backtestDraft=null;backtestVersionRoute=null;online=false;
  clearTimeout(previewTimer);strategyPreview={key:'',result:null,next:0};
@@ -1166,7 +1198,7 @@ function render(force=false){
  if(markup!==main.dataset.html){main.innerHTML=markup;main.dataset.html=markup}
 }
 async function api(path,data){
- const res=await fetch('/api/'+path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(data),signal:timeoutSignal(['backtest','strategy-preview'].includes(path)?70000:30000)});
+ const res=await fetch('/api/'+path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(data),signal:timeoutSignal(['backtest','strategy-preview','portfolio-replay'].includes(path)?70000:30000)});
  const result=await res.json();
  if(!res.ok){
    if(res.status===401&&path!=='auth') signInRequired();
@@ -1461,6 +1493,13 @@ document.addEventListener('click',async event=>{
  if(action==='edit')editor=structuredClone(version(value));
  if(action==='new'){editor=fresh();playbookLibraryOpen=false}
  if(action==='open-playbook-library')playbookLibraryOpen=true;
+ if(action==='portfolio-session'){
+   if(!online||pending)return;
+   pending=true;
+   try{await api('portfolio-session',{action:value});await refresh(true)}
+   catch(error){toast(error.message)}
+   finally{pending=false}
+ }
  if(action==='open-playbook-run'){
    runA=value;
    location.hash='backtesting';
@@ -1740,6 +1779,18 @@ document.addEventListener('submit',async event=>{
       form.reset();
       toast('Strategy document uploaded.');
     }
+   if(form.id==='portfolio-replay'){
+     portfolioDraft=data;
+     const config={versions:[data.first,data.second],capital:+data.capital,split:+data.split/100,fees:+data.fees,slippage:+data.slippage};
+     if(control?.value==='start'){
+       await api('portfolio-session',{...config,action:'start'});
+       toast('Paper session started.');
+     }else{
+       portfolioResult=await api('portfolio-replay',config);
+       toast('Portfolio replay complete.');
+     }
+     render(true);
+   }
    if(form.id==='backtest'){
      if(control)control.textContent='Running…';
      const [id,version]=data.version.split('@');
