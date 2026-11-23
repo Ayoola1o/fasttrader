@@ -202,6 +202,8 @@ test('telegram notifier formats HTML safely, throttles connection spam, and send
   const res = await tg.sendTest('alpaca');
   assert.equal(res.sent, true);
   assert.equal(sent.length, 3);
+  assert.equal(typeof tg.startPolling, 'function');
+  assert.equal(typeof tg.stopPolling, 'function');
 });
 
 test('AI Notepad strategy validates notes, enforces hard stop-loss, and sends user notes to AI', async () => {
@@ -256,7 +258,7 @@ test('Autonomous AI strategy supports smart wake-up, hard stop-loss, fee-aware p
   assert.match(captured.systemInstruction.parts[0].text, /50 bps/);
 });
 
-async function withDemo(run, mockAI, env = {}) {
+async function withWorker(run, mockAI, env = {}, preloadSource = '') {
   const cwd = await mkdtemp(join(tmpdir(), 'fasttrader-test-'));
   const preload = mockAI ? ['--import=data:text/javascript,' + encodeURIComponent(`
     const request = globalThis.fetch;
@@ -264,6 +266,7 @@ async function withDemo(run, mockAI, env = {}) {
       ? request(process.env.MOCK_GEMINI_URL, { ...options, headers: { 'Content-Type': 'application/json' } })
       : request(url, options);
   `)] : [];
+  if (preloadSource) preload.push('--import=data:text/javascript,' + encodeURIComponent(preloadSource));
   const child = spawn(process.execPath, [...preload, fileURLToPath(new URL('./server.mjs', import.meta.url))], {
     cwd, env: { ...process.env, PORT: '0', FASTTRADER_MODE: 'demo', GEMINI_API_KEY: mockAI ? 'test-key' : '', OPENAI_API_KEY: '', MOCK_GEMINI_URL: mockAI ?? '',
       FASTTRADER_SIGNUP_CODE: '', WORKER_SHARED_SECRET: '', FASTTRADER_AUTH: '', FASTTRADER_HOST: '127.0.0.1', FASTTRADER_DATA_DIR: '.fasttrader', ...env },
@@ -300,7 +303,7 @@ async function withDemo(run, mockAI, env = {}) {
 }
 
 test('screen, version, replay and execute a demo strategy, then pause safely through feed and broker outages', { timeout: 95000 }, async () => {
-  await withDemo(async (api, until) => {
+  await withWorker(async (api, until) => {
     const initial = await api('state');
     const stock = initial.market.find(item => item.symbol === 'SPY');
     assert.ok(stock.price > 0 && stock.volume > 0);
@@ -377,7 +380,7 @@ test('screen, version, replay and execute a demo strategy, then pause safely thr
 });
 
 test('saved stock rules can launch a budgeted crypto bot without changing the source strategy', { timeout: 70000 }, async () => {
-  await withDemo(async (api, until) => {
+  await withWorker(async (api, until) => {
     const initial = await api('state');
     const pair = initial.market.find(item => item.symbol === 'BTC/USD');
     assert.equal(pair.assetClass,'crypto');
@@ -444,7 +447,7 @@ test('AI bots send isolated confirmations concurrently and pausing discards an i
     ] } }] }));
   };
   try {
-    await withDemo(async (api, until) => {
+    await withWorker(async (api, until) => {
       const symbols = ['SPY', 'QQQ', 'AAPL', 'NVDA'];
       const bots = await Promise.all(symbols.map(symbol => api('strategy', { ...defaults, name: symbol, symbol, period: 2, entry: 0, ai: true })));
       for (const bot of bots) await api('bot', { id: bot.id, version: bot.version, action: 'running', budget:650 });
@@ -494,7 +497,7 @@ test('the hosted bridge and worker enforce owner sign-up, authentication and sig
   const setup = randomUUID();
   const origin = 'https://fasttrader.example';
   const env = { WORKER_SHARED_SECRET: shared, FASTTRADER_WORKER_URL: 'https://worker.example' };
-  await withDemo(async (_, _until, worker) => {
+  await withWorker(async (_, _until, worker) => {
     const send = (route, data, cookie, requestOrigin = origin) => {
       const options = { headers: {} };
       if (cookie) options.headers.Cookie = cookie;
@@ -534,4 +537,61 @@ test('the hosted bridge and worker enforce owner sign-up, authentication and sig
     assert.equal((await send('auth', { ...owner, action:'login', password:'wrong' })).status, 401);
     assert.equal((await send('auth', { ...owner, action:'login' })).status, 200);
   }, null, { FASTTRADER_SIGNUP_CODE: setup, WORKER_SHARED_SECRET: shared });
+});
+
+
+test('Alpaca catalog pages include assets beyond the watchlist and only eligible instruments can launch bots', async () => {
+  await withWorker(async (api, until) => {
+    const first = await until(async () => {
+      const result = await api('assets', { assetClass: 'us_equity' });
+      return !result.partial && result;
+    });
+    assert.equal(first.total, 36);
+    assert.equal(first.items.length, 30);
+    const next = await api('assets', { assetClass: 'us_equity', offset: 30 });
+    assert.equal(next.items.length, 6);
+    assert.ok(next.items.every(asset => !first.items.some(prev => prev.symbol === asset.symbol)));
+    const matches = await api('assets', { query: 'ALTERNATIVE', eligible: true });
+    assert.deepEqual(matches.items.map(asset => asset.symbol), ['GLD']);
+    const crypto = await api('assets', { assetClass: 'crypto' });
+    assert.equal(crypto.items.find(asset => asset.symbol === 'DOGE/USD').eligible, true);
+    assert.equal(crypto.items.find(asset => asset.symbol === 'DOGE/USDT').eligible, false);
+    const indexes = await api('assets', { assetClass: 'us_index' });
+    assert.equal(indexes.items[0].eligible, false);
+    const saved = await api('strategy', { ...defaults, name: 'Gold strategy', symbol: 'GLD' });
+    await api('bot', { id: saved.id, version: saved.version, action: 'running', create: true, instrument: 'DOGE/USD', budget: 100 });
+    const snapshot = await api('state');
+    assert.ok(snapshot.market.some(asset => asset.symbol === 'DOGE/USD'));
+    assert.ok(!snapshot.market.some(asset => asset.symbol === 'TEST01'));
+  }, null, { FASTTRADER_MODE: 'alpaca', ALPACA_KEY: 'test-key', ALPACA_SECRET: 'test-secret' }, `
+    const originalFetch = globalThis.fetch;
+    const asset = (symbol, kind, details = {}) => ({ symbol, class: kind, name: symbol, tradable: true, ...details });
+    const cryptoRules = { fractionable: true, min_trade_increment: '0.1', min_order_size: '1', price_increment: '0.000001' };
+    globalThis.WebSocket = class {
+      addEventListener() {}
+      close() {}
+    };
+    globalThis.fetch = async (input, options) => {
+      const url = new URL(input);
+      if (url.hostname === 'data.alpaca.markets') return Response.json({ bars: {} });
+      if (url.hostname !== 'paper-api.alpaca.markets') return originalFetch(input, options);
+      switch (url.pathname) {
+        case '/v2/assets': {
+          const kind = url.searchParams.get('asset_class');
+          const assets = {
+            us_equity: [
+              asset('GLD', kind, { name: 'Gold Alternative ETF' }),
+              ...Array.from({ length: 35 }, (_, index) => asset('TEST' + String(index).padStart(2, '0'), kind))
+            ],
+            crypto: [asset('DOGE/USD', kind, cryptoRules), asset('DOGE/USDT', kind, cryptoRules)],
+            us_index: [asset('SPX', kind, { tradable: false })]
+          };
+          return Response.json(assets[kind] ?? []);
+        }
+        case '/v2/account': return Response.json({ status: 'ACTIVE', cash: '10000', equity: '10000', buying_power: '10000' });
+        case '/v2/clock': return Response.json({ is_open: false });
+        default: return Response.json([]);
+      }
+    };
+  `);
 });

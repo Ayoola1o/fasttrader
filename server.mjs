@@ -151,8 +151,21 @@ let brokerAt = 0, busy = false, simulated = {}, latestDemo = Date.now() - 5000;
 let lastSubmittingBot;
 const eligible = new Set(demo ? symbols : []);
 const cryptoRules = new Map(demo ? symbols.filter(isCrypto).map(symbol => [symbol, cryptoReplayRules]) : []);
-const assetFetchedAt = { us_equity: 0, crypto: 0 };
-const canonicalSymbol = symbol => symbols.find(candidate => isCrypto(candidate) && candidate.replace('/', '') === symbol) ?? symbol;
+const catalogClasses = ['us_equity', 'crypto', 'us_option', 'crypto_perp', 'treasury', 'corporate', 'global_equity', 'us_index', 'us_equity_chain', 'ipo'];
+const catalog = new Map();
+const assetFetchedAt = {};
+const assetFailures = new Set();
+const trackedSymbols = () => [...new Set([...symbols, ...Object.values(state.bots).filter(bot => bot.desired === 'running').map(bot => bot.symbol)])];
+const supportsSymbol = symbol => Object.hasOwn(instruments, symbol) || (!demo && eligible.has(symbol));
+const validateStrategy = input => strategy(input, supportsSymbol);
+const assetEligible = symbol => eligible.has(symbol) && (demo || !isCrypto(symbol) || state.cryptoSessionOpen);
+const canonicalSymbol = (symbol, assetClass) => {
+  if (/^[A-Z0-9]+USD$/.test(symbol)) {
+    const pair = symbol.slice(0, -3) + '/USD';
+    if (assetClass === 'crypto' || (!assetClass && (symbols.includes(pair) || cryptoRules.has(pair)))) return pair;
+  }
+  return symbol;
+};
 const sourceFor = symbol => demo ? 'Synthetic market' : isCrypto(symbol) ? 'Alpaca Crypto US' : 'Alpaca ' + feed.toUpperCase();
 const validBar = bar => Number.isFinite(bar.c) && bar.c > 0 && Number.isFinite(bar.o) && bar.o > 0;
 const maxAge = 150000;
@@ -309,10 +322,17 @@ function connect(key, retry = 1000) {
 }
 
 async function pollMarket(key) {
-  if (demo || wsConnected[key] || Date.now() - polledAt[key] < 15000) return;
+  if (demo || Date.now() - polledAt[key] < 15000) return;
   polledAt[key] = Date.now();
+  const list = trackedSymbols().filter(symbol => feedKey(symbol) === key &&
+    (!wsConnected[key] || !symbols.includes(symbol)));
+  for (let offset = 0; offset < list.length; offset += 50) {
+    await pollSymbols(key, list.slice(offset, offset + 50));
+  }
+}
+
+async function pollSymbols(key, list) {
   const crypto = key === 'cryptoFeed';
-  const list = symbols.filter(symbol => feedKey(symbol) === key);
   const params = new URLSearchParams({ symbols: list.join(',') });
   if (!crypto) params.set('feed', feed === 'delayed_sip' ? 'sip' : feed);
   const barPath = crypto ? '/v1beta3/crypto/us/latest/bars?' : '/v2/stocks/bars/latest?';
@@ -340,7 +360,7 @@ async function pollMarket(key) {
 
 function normalize(order) {
   return {
-    id: order.id, client: order.client_order_id, symbol: canonicalSymbol(order.symbol), side: order.side, qty: +order.qty,
+    id: order.id, client: order.client_order_id, symbol: canonicalSymbol(order.symbol, order.asset_class), side: order.side, qty: +order.qty,
     filled: +order.filled_qty, status: order.status, price: order.filled_avg_price ? +order.filled_avg_price : null,
     limitPrice: order.limit_price ? +order.limit_price : null, filledAt: order.filled_at || null, t: order.submitted_at || order.created_at
   };
@@ -360,29 +380,65 @@ function updateOrder(order) {
   if (prior) Object.assign(prior, order);
   else state.orders.unshift(order);
 }
-async function refreshAssets(assetClass) {
-  if (Date.now() - assetFetchedAt[assetClass] < 60000) return;
-  assetFetchedAt[assetClass] = Date.now();
+function catalogEntry(row, assetClass) {
+  const symbol = canonicalSymbol(row.symbol, assetClass);
+  const name = String(row.name || symbol);
   const crypto = assetClass === 'crypto';
+  const rules = { increment: +row.min_trade_increment, minimum: +row.min_order_size, tick: +row.price_increment, minValue: 0 };
+  const supported = assetClass === 'us_equity' ? /^[A-Z0-9][A-Z0-9.-]*$/.test(symbol) :
+    crypto && /^[A-Z0-9]+\/USD$/.test(symbol) && row.fractionable &&
+    [rules.increment, rules.minimum, rules.tick].every(value => Number.isFinite(value) && value > 0);
+  return { symbol, name, assetClass, tradable: row.tradable === true, supported: Boolean(supported), ...(crypto ? { rules } : {}) };
+}
+
+async function refreshAssets(assetClass) {
+  if (Date.now() - (assetFetchedAt[assetClass] ?? 0) < 900000) return;
+  assetFetchedAt[assetClass] = Date.now();
   try {
     const assets = await broker('/assets?status=active&asset_class=' + assetClass);
-    for (const symbol of symbols.filter(item => isCrypto(item) === crypto)) {
-      eligible.delete(symbol);
-      cryptoRules.delete(symbol);
-    }
-    for (const asset of assets) {
-      const symbol = canonicalSymbol(asset.symbol);
-      if (!Object.hasOwn(instruments, symbol) || isCrypto(symbol) !== crypto || !asset.tradable) continue;
-      if (crypto) {
-        const rules = { increment: +asset.min_trade_increment, minimum: +asset.min_order_size, tick: +asset.price_increment, minValue: 0 };
-        if (!asset.fractionable || ![rules.increment, rules.minimum, rules.tick].every(value => Number.isFinite(value) && value > 0)) continue;
-        cryptoRules.set(symbol, rules);
+    if (!Array.isArray(assets)) throw Error('Invalid asset response');
+    const entries = assets.filter(asset => asset.class === assetClass && typeof asset.symbol === 'string')
+      .map(asset => catalogEntry(asset, assetClass));
+    if (assetClass === 'us_equity' || assetClass === 'crypto') {
+      for (const { symbol } of catalog.get(assetClass) ?? []) {
+        eligible.delete(symbol);
+        cryptoRules.delete(symbol);
       }
-      eligible.add(symbol);
+      for (const entry of entries) {
+        if (!entry.tradable || !entry.supported) continue;
+        eligible.add(entry.symbol);
+        if (entry.rules) cryptoRules.set(entry.symbol, entry.rules);
+      }
     }
+    catalog.set(assetClass, entries);
+    assetFailures.delete(assetClass);
   } catch {
-    event('connections', (crypto ? 'Crypto' : 'Stock') + ' eligibility could not be refreshed');
+    assetFailures.add(assetClass);
+    assetFetchedAt[assetClass] = Date.now() - 840000;
+    event('connections', 'Alpaca asset catalog could not load ' + assetClass);
   }
+}
+
+function searchAssets(input) {
+  const query = typeof input.query === 'string' ? input.query.trim().toUpperCase().slice(0, 80) : '';
+  const offset = Number.isSafeInteger(input.offset) ? Math.max(0, input.offset) : 0;
+  const classes = input.assetClass ? catalogClasses.filter(value => value === input.assetClass) : catalogClasses;
+  const source = demo ? symbols.map(symbol => ({
+    symbol, name: instruments[symbol][0], assetClass: isCrypto(symbol) ? 'crypto' : 'us_equity', tradable: true, supported: true
+  })).filter(asset => classes.includes(asset.assetClass)) : classes.flatMap(value => catalog.get(value) ?? []);
+  const matching = source.filter(asset => (!input.eligible || (asset.supported && asset.tradable && assetEligible(asset.symbol))) &&
+    (!query || asset.symbol.includes(query) || asset.name.toUpperCase().includes(query)));
+  const rank = asset => asset.symbol === query ? 0 : asset.symbol.startsWith(query) ? 1 : 2;
+  matching.sort((a, b) => rank(a) - rank(b) || a.symbol.localeCompare(b.symbol));
+  return {
+    total: matching.length, offset, demo, partial: !demo && classes.some(value => !catalog.has(value) || assetFailures.has(value)),
+    items: matching.slice(offset, offset + 30).map(({ rules, ...asset }) => ({
+      ...asset, eligible: asset.supported && asset.tradable && assetEligible(asset.symbol)
+    }))
+  };
+}
+async function refreshAdditionalAssets() {
+  for (const assetClass of catalogClasses.slice(2)) await refreshAssets(assetClass);
 }
 async function reconcile() {
   if (demo) {
@@ -420,7 +476,7 @@ async function reconcile() {
         }
       }
     }
-    state.positions = positions.map(p => ({ symbol: canonicalSymbol(p.symbol), qty: +p.qty, entry: +p.avg_entry_price, price: +p.current_price }));
+    state.positions = positions.map(p => ({ symbol: canonicalSymbol(p.symbol, p.asset_class), qty: +p.qty, entry: +p.avg_entry_price, price: +p.current_price }));
     state.account = {
       equity: +account.equity, cash: +account.cash, buyingPower: +account.buying_power, dayStart: +account.last_equity,
       cryptoBuyingPower: account.non_marginable_buying_power == null ? +account.cash : +account.non_marginable_buying_power,
@@ -818,21 +874,41 @@ async function applySignal(candidate, model = null) {
     } else throw error;
   }
 }
+async function seedHistory(symbol) {
+  const end = Date.now() - (isCrypto(symbol) || feed === 'iex' ? 1 : 16) * 60000;
+  const bars = await history(symbol, Date.now() - 3 * 86400000, end);
+  await serial(() => {
+    const merged = new Map([...bars, ...(state.bars[symbol] ?? [])].map(bar => [bar.t, bar]));
+    state.bars[symbol] = [...merged.values()].sort((a, b) => a.t.localeCompare(b.t)).slice(-1500);
+  });
+}
+const historySeeded = new Set(symbols);
+const historyRetryAt = new Map();
+let seedingHistory = false;
+function seedBotHistory(bots) {
+  if (demo || seedingHistory) return;
+  const bot = bots.find(({ symbol }) => eligible.has(symbol) && !historySeeded.has(symbol) &&
+    Date.now() >= (historyRetryAt.get(symbol) ?? 0));
+  if (!bot) return;
+  const { symbol } = bot;
+  seedingHistory = true;
+  void seedHistory(symbol).then(() => {
+    historySeeded.add(symbol);
+    historyRetryAt.delete(symbol);
+  }).catch(() => historyRetryAt.set(symbol, Date.now() + 60000))
+    .finally(() => { seedingHistory = false; });
+}
 if (demo) {
   feedEpoch.feed = feedEpoch.cryptoFeed = Date.now() - 10000;
   for (const symbol of symbols) {
     if (!state.bars[symbol]?.length) state.bars[symbol] = synthetic(symbol, Date.now() - 86400000, Date.now(), 60000);
   }
 } else {
+  void refreshAdditionalAssets();
+  setInterval(refreshAdditionalAssets, 60000);
   connect('feed');
   connect('cryptoFeed');
-  for (const symbol of symbols) {
-    const end = Date.now() - (isCrypto(symbol) || feed === 'iex' ? 1 : 16) * 60000;
-    history(symbol, Date.now() - 3 * 86400000, end).then(bars => serial(() => {
-      const merged = new Map([...bars, ...(state.bars[symbol] ?? [])].map(bar => [bar.t, bar]));
-      state.bars[symbol] = [...merged.values()].sort((a, b) => a.t.localeCompare(b.t)).slice(-1500);
-    })).catch(() => { });
-  }
+  for (const symbol of symbols) void seedHistory(symbol).catch(() => {});
 }
 async function cycle() {
   if (busy) return;
@@ -861,6 +937,7 @@ async function cycle() {
         brokerAt = 0;
       }
       const bots = Object.values(state.bots).filter(bot => bot.desired === 'running');
+      seedBotHistory(bots);
       const offset = bots.findIndex(bot => bot.id === lastSubmittingBot) + 1;
       for (const bot of [...bots.slice(offset), ...bots.slice(0, offset)]) {
         const count = state.orders.length;
@@ -887,10 +964,274 @@ async function cycle() {
 await cycle();
 setInterval(cycle, 5000);
 
+let pendingTelegramClose = null;
+const tgEsc = v => String(v ?? '').replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
+const tgUsd = v => Number.isFinite(v) ? (v < 0 ? '-$' : '$') + Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—';
+const tgPct = v => Number.isFinite(v) ? (v > 0 ? '+' : '') + v.toFixed(2) + '%' : '—';
+const tgQty = v => Number.isFinite(v) ? v.toLocaleString('en-US', { maximumFractionDigits: 8 }) : '—';
+
+function botWinLoss(botId) {
+  const filled = botOrders(botId).filter(o => o.filled > 0 && Number.isFinite(o.price)).sort((a, b) => (a.filledAt ?? a.t ?? '').localeCompare(b.filledAt ?? b.t ?? ''));
+  let qty = 0, cost = 0, wins = 0, losses = 0;
+  for (const o of filled) {
+    if (o.side === 'buy') { qty += o.filled; cost += o.filled * o.price; }
+    else if (o.side === 'sell') {
+      const avg = qty > 0 ? cost / qty : null;
+      const pnl = Number.isFinite(o.pnl) ? o.pnl : (avg !== null ? o.filled * (o.price - avg) : null);
+      if (pnl !== null) { if (pnl > 0) wins++; else if (pnl < 0) losses++; }
+      const used = qty > 0 ? cost * Math.min(1, o.filled / qty) : 0;
+      qty = Math.max(0, qty - o.filled);
+      cost = Math.max(0, cost - used);
+    }
+  }
+  return { wins, losses, total: wins + losses };
+}
+
+function formatBotDetail(bot) {
+  const s = state.strategies.find(item => item.id === bot.id && item.version === bot.version);
+  const ledger = botLedger(botOrders(bot.id), bot.symbol, bot.budget);
+  const wl = botWinLoss(bot.id);
+  const pos = state.positions.find(p => p.symbol === bot.symbol && p.qty > 0);
+  const mark = pos?.price ?? state.quotes[bot.symbol]?.price ?? state.bars[bot.symbol]?.at(-1)?.c ?? null;
+  const heldQty = ledger.qty > 0 ? ledger.qty : 0;
+  const avgEntry = heldQty > 0 && ledger.complete ? ledger.cost / heldQty : null;
+  const mktVal = heldQty > 0 && Number.isFinite(mark) ? heldQty * mark : 0;
+  const unreal = heldQty > 0 && ledger.complete && Number.isFinite(mark) ? mktVal - ledger.cost : 0;
+  const unrealPct = ledger.cost > 0 ? 100 * (unreal / ledger.cost) : null;
+  const wr = wl.total ? `${((100 * wl.wins) / wl.total).toFixed(0)}%` : '—';
+  const stateIcon = bot.desired === 'running' ? (bot.lastAiError ? '🔴' : '🟢') : bot.desired === 'paused' ? '🟡' : '⚪';
+  const modeStr = s?.mode === 'ai_autonomous' ? 'Autonomous AI' : s?.mode === 'ai_notepad' ? 'AI Notepad' : (s?.mode ?? 'rules');
+  const holdingLine = heldQty > 0
+    ? `• Holding: <code>${tgQty(heldQty)} ${tgEsc(bot.symbol)}</code> @ ${tgUsd(avgEntry)} → ${tgUsd(mark)} (${tgUsd(mktVal)})`
+    : `• Holding: Flat (${bot.desired === 'running' ? 'Waiting to enter market' : bot.desired})`;
+  const lines = [
+    `${stateIcon} <b>${tgEsc(bot.name)}</b> (<code>${tgEsc(bot.symbol)}</code> · ${tgEsc(modeStr)} · ${tgEsc(s?.timeframe ?? '1Min')})`,
+    `• Status: <b>${tgEsc(bot.desired === 'running' ? bot.status : bot.desired)}</b>`,
+    `• Budget: ${tgUsd(bot.budget)} | Available: ${tgUsd(ledger.available)} | Invested: ${tgUsd(ledger.invested)}`,
+    holdingLine,
+    `• Unrealized P&amp;L: <b>${tgUsd(unreal)}</b>${unrealPct !== null ? ` (${tgPct(unrealPct)})` : ''} | Realized: <b>${tgUsd(ledger.realized)}</b>`,
+    `• Trades: <b>${ledger.buyFills + ledger.sellFills}</b> (${ledger.buyFills}B / ${ledger.sellFills}S) | W/L: <b>${wl.wins}W / ${wl.losses}L</b> (${wr})`
+  ];
+  if (s?.ai) {
+    const aiLine = bot.lastAiError
+      ? `• AI Health: ❌ ${tgEsc(bot.lastAiError.message)}`
+      : `• AI Health: ✅ Healthy${s.mode === 'ai_autonomous' ? ` (${bot.aiCallsToday ?? 0}${s.aiDailyCap ? '/' + s.aiDailyCap : ''} calls today)` : ''}`;
+    lines.push(aiLine);
+  }
+  if (bot.lastEvaluation?.rationale) {
+    lines.push(`• Latest: <i>${tgEsc(bot.lastEvaluation.rationale.slice(0, 120))}</i>`);
+  }
+  return lines.join('\n');
+}
+
+function findBotByQuery(query) {
+  const q = query.trim().toLowerCase();
+  if (!q) return null;
+  const list = Object.values(state.bots);
+  return list.find(b => b.name.toLowerCase() === q || b.symbol.toLowerCase() === q || b.id === q)
+    ?? list.find(b => b.name.toLowerCase().includes(q) || b.symbol.toLowerCase().includes(q));
+}
+
+function resolveSymbolQuery(query) {
+  const q = query.trim().toUpperCase();
+  if (!q) return null;
+  return symbols.find(s => s === q || s === q + '/USD' || s.replace('/', '') === q) ?? null;
+}
+
+async function handleTelegramCommand(cmd, arg) {
+  if (cmd === 'start' || cmd === 'help') {
+    return [
+      '🤖 <b>FastTrader Telegram Commands</b>',
+      '',
+      '<b>Info &amp; Monitoring</b>',
+      '/status — Account equity, P&amp;L, broker &amp; feed health',
+      '/bots — Full details for every bot (invested, P&amp;L, W/L, holding)',
+      '/bot &lt;name&gt; — Deep details for a single bot',
+      '/positions — Open broker positions &amp; unrealized P&amp;L',
+      '/pnl — Realized + unrealized P&amp;L and win/loss summary',
+      '/trades — Latest 8 filled orders',
+      '/signals — Latest 8 AI &amp; rule decisions',
+      '/logs — Latest 10 workspace logs',
+      '/errors — Recent warnings &amp; AI/broker errors',
+      '/price &lt;symbol&gt; — Live price, 1H change &amp; RSI/EMA',
+      '',
+      '<b>Remote Controls</b>',
+      '/pause &lt;bot&gt; — Pause a bot',
+      '/resume &lt;bot&gt; — Resume a paused bot',
+      '/pauseall — Pause all running bots immediately',
+      '/close &lt;symbol&gt; — Liquidate an open position (requires /confirm)'
+    ].join('\n');
+  }
+  if (cmd === 'status') {
+    const a = state.account;
+    const dayPnl = Number.isFinite(a.equity) && Number.isFinite(a.dayStart) ? a.equity - a.dayStart : null;
+    const dayPct = a.dayStart > 0 && dayPnl !== null ? 100 * (dayPnl / a.dayStart) : null;
+    const bots = Object.values(state.bots);
+    const active = bots.filter(b => b.desired === 'running').length;
+    const paused = bots.filter(b => b.desired === 'paused').length;
+    const aiErrs = bots.filter(b => b.lastAiError).length;
+    return [
+      `📊 <b>FastTrader Status</b> (<code>${tgEsc(mode)}</code>)`,
+      `• Equity: <b>${tgUsd(a.equity)}</b> (${tgUsd(dayPnl)} / ${tgPct(dayPct)} today)`,
+      `• Cash: ${tgUsd(a.cash)} | Exposure: ${tgUsd(a.exposure)}`,
+      `• Broker: <code>${tgEsc(state.broker)}</code> | Stock: <code>${tgEsc(state.feed)}</code> | Crypto: <code>${tgEsc(state.cryptoFeed)}</code>`,
+      `• Bots: <b>${active} active</b>, ${paused} paused (${bots.length} total)${aiErrs ? ` · ⚠️ ${aiErrs} AI error(s)` : ''}`,
+      `• Open positions: <b>${state.positions.length}</b>`
+    ].join('\n');
+  }
+  if (cmd === 'bots' || cmd === 'bot') {
+    const bots = arg ? [findBotByQuery(arg)].filter(Boolean) : Object.values(state.bots);
+    if (!bots.length) return arg ? `No bot found matching "<code>${tgEsc(arg)}</code>".` : 'No bots configured yet.';
+    return `🤖 <b>Bot Details (${bots.length})</b>\n\n` + bots.map(formatBotDetail).join('\n\n');
+  }
+  if (cmd === 'positions') {
+    if (!state.positions.length) return '📭 <b>No open positions.</b>';
+    const lines = state.positions.map(p => {
+      const val = p.qty * p.price;
+      const pnl = p.qty * (p.price - p.entry);
+      const pctChg = p.entry > 0 ? 100 * (p.price / p.entry - 1) : null;
+      return `• <b>${tgEsc(p.symbol)}</b>: <code>${tgQty(p.qty)}</code> @ ${tgUsd(p.entry)} → ${tgUsd(p.price)}\n  Value: ${tgUsd(val)} | P&amp;L: <b>${tgUsd(pnl)}</b> (${tgPct(pctChg)})`;
+    });
+    return `📦 <b>Open Positions (${state.positions.length})</b>\n\n` + lines.join('\n');
+  }
+  if (cmd === 'pnl') {
+    const unreal = state.positions.reduce((sum, p) => sum + p.qty * (p.price - p.entry), 0);
+    let realized = 0, wins = 0, losses = 0, trades = 0;
+    for (const bot of Object.values(state.bots)) {
+      const l = botLedger(botOrders(bot.id), bot.symbol, bot.budget);
+      const wl = botWinLoss(bot.id);
+      realized += l.realized;
+      wins += wl.wins;
+      losses += wl.losses;
+      trades += l.buyFills + l.sellFills;
+    }
+    const wr = wins + losses ? `${((100 * wins) / (wins + losses)).toFixed(1)}%` : '—';
+    const dayPnl = Number.isFinite(state.account.equity) && Number.isFinite(state.account.dayStart) ? state.account.equity - state.account.dayStart : null;
+    return [
+      '💰 <b>P&amp;L Summary</b>',
+      `• Today's Equity P&amp;L: <b>${tgUsd(dayPnl)}</b>`,
+      `• Unrealized P&amp;L: <b>${tgUsd(unreal)}</b>`,
+      `• Bot Realized P&amp;L: <b>${tgUsd(realized)}</b>`,
+      `• Total Bot Fills: <b>${trades}</b> | Win/Loss: <b>${wins}W / ${losses}L</b> (${wr})`
+    ].join('\n');
+  }
+  if (cmd === 'trades') {
+    const filled = state.orders.filter(o => o.filled > 0).slice(0, 8);
+    if (!filled.length) return '📭 No filled trades recorded yet.';
+    const lines = filled.map(o => `${o.side === 'buy' ? '🟢' : '🔴'} <b>${o.side.toUpperCase()} ${tgEsc(o.symbol)}</b> · <code>${tgQty(o.filled)}</code> @ ${tgUsd(o.price)}\n  ${tgEsc(o.strategy ?? 'External')} · ${tgEsc((o.filledAt ?? o.t ?? '').slice(0, 16).replace('T', ' '))}`);
+    return `🧾 <b>Latest Filled Trades (${filled.length})</b>\n\n` + lines.join('\n');
+  }
+  if (cmd === 'signals') {
+    const sigs = state.signals.slice(0, 8);
+    if (!sigs.length) return '📭 No signals logged yet.';
+    const lines = sigs.map(s => `⚡ <b>${s.direction.toUpperCase()} ${tgEsc(s.symbol)}</b> (${tgEsc(s.strategy)} · ${tgEsc(s.source)})\n  <i>${tgEsc(s.rationale)}</i>`);
+    return `📡 <b>Latest Signals (${sigs.length})</b>\n\n` + lines.join('\n');
+  }
+  if (cmd === 'logs') {
+    const items = (state.logs ?? []).slice(0, 10);
+    if (!items.length) return '📭 No activity logs yet.';
+    const lines = items.map(l => `[<code>${tgEsc((l.category ?? 'sys').toUpperCase())}</code>] <b>${tgEsc(l.message)}</b>${l.detail ? `\n  ${tgEsc(l.detail.slice(0, 120))}` : ''}`);
+    return `📋 <b>Latest Logs (${items.length})</b>\n\n` + lines.join('\n');
+  }
+  if (cmd === 'errors') {
+    const errs = (state.logs ?? []).filter(l => l.level === 'error' || l.level === 'warn').slice(0, 10);
+    const botErrs = Object.values(state.bots).filter(b => b.lastAiError).map(b => `🔴 <b>${tgEsc(b.name)}</b> (${tgEsc(b.symbol)}): ${tgEsc(b.lastAiError.detail)}`);
+    if (!errs.length && !botErrs.length) return '✅ <b>No recent warnings or errors.</b> All systems clean.';
+    const parts = [];
+    if (botErrs.length) parts.push('<b>Active Bot AI Errors</b>\n' + botErrs.join('\n'));
+    if (errs.length) parts.push('<b>Recent Warnings &amp; Errors</b>\n' + errs.map(l => `• [${tgEsc(l.category)}] <b>${tgEsc(l.message)}</b>${l.detail ? ` — ${tgEsc(l.detail.slice(0, 120))}` : ''}`).join('\n'));
+    return parts.join('\n\n');
+  }
+  if (cmd === 'price') {
+    const sym = resolveSymbolQuery(arg || 'BTC/USD');
+    if (!sym) return `Unknown symbol "<code>${tgEsc(arg)}</code>". Try: ${symbols.join(', ')}`;
+    const bars = state.bars[sym] ?? [];
+    const last = bars.at(-1);
+    const px = state.quotes[sym]?.price ?? last?.c ?? null;
+    const first = bars.at(-60)?.c;
+    const chg = first && px ? 100 * (px / first - 1) : null;
+    const rsi = computeRSI(bars.map(b => b.c), 14);
+    const ema20 = indicatorValue(bars, { indicator: 'ema', period: 20 });
+    return [
+      `📈 <b>${tgEsc(sym)}</b> — ${tgEsc(instruments[sym][0])}`,
+      `• Live Price: <b>${tgUsd(px)}</b> (1H: ${tgPct(chg)})`,
+      `• RSI(14): <code>${rsi !== null ? rsi.toFixed(1) : '—'}</code> | EMA(20): <code>${tgUsd(ema20)}</code>`,
+      `• Bars cached: ${bars.length}`
+    ].join('\n');
+  }
+  if (cmd === 'pause' || cmd === 'resume') {
+    const bot = findBotByQuery(arg);
+    if (!bot) return `Specify a bot name, e.g. <code>/${cmd} Aitrader</code>.\nBots: ${Object.values(state.bots).map(b => tgEsc(b.name)).join(', ') || 'none'}`;
+    const action = cmd === 'pause' ? 'paused' : 'running';
+    await serial(async () => {
+      await change('/api/bot', { id: bot.id, version: bot.version, action, ...(bot.budget ? { budget: bot.budget } : {}) });
+      await persist();
+    });
+    return `${action === 'paused' ? '🟡 Paused' : '🟢 Resumed'} <b>${tgEsc(bot.name)}</b> (<code>${tgEsc(bot.symbol)}</code>).`;
+  }
+  if (cmd === 'pauseall') {
+    const running = Object.values(state.bots).filter(b => b.desired === 'running');
+    if (!running.length) return 'No running bots to pause.';
+    await serial(async () => {
+      for (const bot of running) {
+        await change('/api/bot', { id: bot.id, version: bot.version, action: 'paused', ...(bot.budget ? { budget: bot.budget } : {}) });
+      }
+      await persist();
+    });
+    return `🛑 <b>Paused ${running.length} bot(s):</b>\n` + running.map(b => `• ${tgEsc(b.name)} (${tgEsc(b.symbol)})`).join('\n');
+  }
+  if (cmd === 'close') {
+    const sym = resolveSymbolQuery(arg);
+    if (!sym) return `Specify an open symbol, e.g. <code>/close BTC/USD</code>.`;
+    const pos = state.positions.find(p => p.symbol === sym && p.qty > 0);
+    if (!pos) return `No open position found for <code>${tgEsc(sym)}</code>.`;
+    const bot = Object.values(state.bots).find(b => b.symbol === sym);
+    if (!bot) return `Position <code>${tgEsc(sym)}</code> has no assigned bot. Assign or close it from the FastTrader UI.`;
+    pendingTelegramClose = { botId: bot.id, symbol: sym, qty: pos.qty, expires: Date.now() + 60000 };
+    return `⚠️ <b>Confirm Market Liquidation</b>\nClose <code>${tgQty(pos.qty)} ${tgEsc(sym)}</code> (~${tgUsd(pos.qty * pos.price)}) and pause <b>${tgEsc(bot.name)}</b>?\n\nReply <code>/confirm</code> within 60 seconds to execute.`;
+  }
+  if (cmd === 'confirm') {
+    if (!pendingTelegramClose || Date.now() > pendingTelegramClose.expires) {
+      pendingTelegramClose = null;
+      return 'No pending liquidation to confirm (expired or none requested).';
+    }
+    const target = pendingTelegramClose;
+    pendingTelegramClose = null;
+    await serial(async () => {
+      await change('/api/bot', { liquidate: true, id: target.botId, pause: true });
+      await persist();
+    });
+    return `🔴 <b>Submitted market sell</b> for <code>${tgEsc(target.symbol)}</code> and paused its bot.`;
+  }
+  return `Unknown command <code>/${tgEsc(cmd)}</code>. Type /help to see all commands.`;
+}
+
+if (telegram.configured) {
+  telegram.startPolling(handleTelegramCommand, [
+    { command: 'status', description: 'Account equity, P&L & system health' },
+    { command: 'bots', description: 'Full bot details (invested, P&L, W/L, holding)' },
+    { command: 'bot', description: 'Details for a specific bot by name' },
+    { command: 'positions', description: 'Open broker positions & unrealized P&L' },
+    { command: 'pnl', description: 'Realized & unrealized P&L summary' },
+    { command: 'trades', description: 'Latest 8 filled orders' },
+    { command: 'signals', description: 'Latest 8 AI & rule decisions' },
+    { command: 'logs', description: 'Latest 10 workspace logs' },
+    { command: 'errors', description: 'Recent warnings & AI/broker errors' },
+    { command: 'price', description: 'Live price & RSI/EMA for a symbol' },
+    { command: 'pause', description: 'Pause a bot by name' },
+    { command: 'resume', description: 'Resume a paused bot by name' },
+    { command: 'pauseall', description: 'Emergency pause all running bots' },
+    { command: 'close', description: 'Close an open position (with /confirm)' },
+    { command: 'help', description: 'List all FastTrader commands' }
+  ]);
+}
+
 const assets = { '/': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/style.css': ['style.css', 'text/css'], '/sw.js': ['sw.js', 'text/javascript'], '/mark.svg': ['mark.svg', 'image/svg+xml'], '/favicon.ico': ['mark.svg', 'image/svg+xml'] };
 function snapshot() {
-  const market = symbols.map(symbol => {
-    const [name] = instruments[symbol];
+  const visibleSymbols = [...new Set([...trackedSymbols(), ...Object.values(state.bots).map(bot => bot.symbol), ...state.strategies.map(item => item.symbol)])];
+  const market = visibleSymbols.map(symbol => {
+    const assetClass = isCrypto(symbol) ? 'crypto' : 'us_equity';
+    const name = instruments[symbol]?.[0] ?? catalog.get(assetClass)?.find(asset => asset.symbol === symbol)?.name ?? symbol;
     const crypto = isCrypto(symbol);
     const status = state[feedKey(symbol)];
     const bars = state.bars[symbol] ?? [];
@@ -947,7 +1288,7 @@ async function change(path, input) {
     const id = existing?.id ?? randomUUID();
     const latest = state.strategies.findLast(item => item.id === id);
     if (latest && latest.version !== input.baseVersion) throw Error('Strategy changed. Review the latest version before saving.');
-    const item = { ...strategy(input), id, version: (latest?.version ?? 0) + 1, mutation, sourceStrategy: latest?.sourceStrategy };
+    const item = { ...validateStrategy(input), id, version: (latest?.version ?? 0) + 1, mutation, sourceStrategy: latest?.sourceStrategy };
     state.strategies.push(item);
     if (item.mode === 'ai_autonomous' && !state.bots[id]) {
       const now = Date.now();
@@ -961,7 +1302,7 @@ async function change(path, input) {
   }
   if (path === '/api/bot') {
     if (input.adopt === true) {
-      const symbol = canonicalSymbol(input.symbol);
+      const symbol = input.symbol;
       const position = state.positions.find(p => p.symbol === symbol && p.qty > 0);
       if (!position) throw Error('No open broker position found for ' + symbol + '.');
       const source = state.strategies.find(item => item.id === input.id && item.version === input.version);
@@ -989,7 +1330,7 @@ async function change(path, input) {
         if (reused) s = reused;
         else {
           s = {
-            ...strategy({ ...source, symbol }), id: randomUUID(), version: 1,
+            ...validateStrategy({ ...source, symbol }), id: randomUUID(), version: 1,
             sourceStrategy: { id: source.id, version: source.version, symbol: source.symbol, rootId }
           };
           state.strategies.push(s);
@@ -1123,7 +1464,7 @@ async function change(path, input) {
           state.bots[item.id]?.symbol === input.instrument);
         if (reused) throw Error('A bot already uses this strategy on that instrument. Open its session to resume it.');
         s = {
-          ...strategy({ ...source, symbol: input.instrument }), id: randomUUID(), version: 1,
+          ...validateStrategy({ ...source, symbol: input.instrument }), id: randomUUID(), version: 1,
           sourceStrategy: { id: source.id, version: source.version, symbol: source.symbol, rootId }
         };
       }
@@ -1293,6 +1634,7 @@ const server = createServer(async (req, res) => {
     }
     if (url.pathname.startsWith('/api/') && !auth.authenticated(req.headers.cookie)) return respond(401, { error: 'Sign in to FastTrader.' });
     if (req.method === 'GET' && url.pathname === '/api/state') return respond(200, snapshot());
+    if (req.method === 'POST' && url.pathname === '/api/assets') return respond(200, searchAssets(await body(req, 2000)));
     if (req.method === 'POST' && url.pathname.startsWith('/api/')) {
       const input = await body(req, url.pathname === '/api/profile' ? 220000 : 20000);
       const result = url.pathname === '/api/backtest' ? await backtest(input) : await serial(async () => {
