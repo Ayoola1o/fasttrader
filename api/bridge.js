@@ -22,6 +22,10 @@ export async function handleBridge(request, env = process.env, upstreamFetch = f
   const headers = new Headers({ 'x-fasttrader-worker-secret': secret, Accept: 'application/json' });
   const cookie = request.headers.get('cookie')?.match(/(?:^|;\s*)(ft_session=[\w-]{43})(?:;|$)/)?.[1];
   if (cookie) headers.set('Cookie', cookie);
+  const idem = request.headers.get('idempotency-key')?.trim();
+  if (idem && /^[a-zA-Z0-9_-]{8,80}$/.test(idem)) headers.set('Idempotency-Key', idem);
+  const clientIp = (request.headers.get('x-forwarded-for')?.split(',')[0] || request.headers.get('x-real-ip') || '').trim().slice(0, 64);
+  if (clientIp) headers.set('x-fasttrader-client-ip', clientIp);
   let body;
   if (post) {
     headers.set('Content-Type', 'application/json');
@@ -43,13 +47,21 @@ export async function handleBridge(request, env = process.env, upstreamFetch = f
     } catch { return json(400, 'Unable to read request body.'); }
     body = Buffer.concat(chunks, bytes);
   }
+  const timeoutMs = ['backtest', 'strategy-preview', 'portfolio-replay'].includes(route) ? 65000
+    : ['bot', 'strategy', 'profile', 'knowledge', 'settings', 'portfolio-session'].includes(route) ? 25000 : 15000;
   try {
     const response = await upstreamFetch(new URL('/api/' + route, worker), {
       method: request.method, headers, body, redirect: 'error', cache: 'no-store',
-      signal: AbortSignal.timeout(['backtest', 'strategy-preview', 'portfolio-replay'].includes(route) ? 65000 : route === 'settings' ? 25000 : 10000)
+      signal: AbortSignal.timeout(timeoutMs)
     });
     if (!response.headers.get('content-type')?.startsWith('application/json')) return json(502, 'The FastTrader worker returned an unexpected response.');
-    const output = new Headers({ 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
+    const output = new Headers({
+      'Content-Type': 'application/json',
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options': 'DENY',
+      'Referrer-Policy': 'no-referrer'
+    });
     const setCookie = route === 'auth' && response.headers.get('set-cookie');
     if (setCookie) output.set('Set-Cookie', setCookie);
     return new Response(response.body, { status: response.status, headers: output });

@@ -648,8 +648,8 @@ test('the hosted bridge and worker enforce owner sign-up, authentication and sig
   const origin = 'https://fasttrader.example';
   const env = { WORKER_SHARED_SECRET: shared, FASTTRADER_WORKER_URL: 'https://worker.example' };
   await withWorker(async (_, _until, worker) => {
-    const send = (route, data, cookie, requestOrigin = origin) => {
-      const options = { headers: {} };
+    const send = (route, data, cookie, requestOrigin = origin, extraHeaders = {}) => {
+      const options = { headers: { ...extraHeaders } };
       if (cookie) options.headers.Cookie = cookie;
       if (data) {
         options.method = 'POST';
@@ -679,9 +679,18 @@ test('the hosted bridge and worker enforce owner sign-up, authentication and sig
     assert.equal((await send('auth', signup)).status, 403);
     assert.equal((await send('bot', { id:'default', version:1, action:'running', budget:650 })).status, 401);
     assert.equal((await send('bot', { id:'default', version:1, action:'running', budget:650 }, cookie)).status, 200);
+    // Idempotency-Key deduplicates retried financial mutations (topUp only applied once)
+    const idem = randomUUID();
+    const top1 = await send('bot', { topUp:true, id:'default', addFunds:250 }, cookie, origin, { 'Idempotency-Key': idem });
+    const top2 = await send('bot', { topUp:true, id:'default', addFunds:250 }, cookie, origin, { 'Idempotency-Key': idem });
+    assert.equal(top1.status, 200);
+    assert.equal(top2.status, 200);
+    assert.equal((await top1.json()).budget, 900);
+    assert.equal((await top2.json()).budget, 900);
     const snapshot = await send('state', null, cookie);
     assert.equal(snapshot.headers.get('cache-control'), 'no-store');
-    assert.equal((await snapshot.json()).bots.default.desired, 'running');
+    assert.equal(snapshot.headers.get('x-frame-options'), 'DENY');
+    assert.equal((await snapshot.json()).bots.default.budget, 900);
     assert.equal((await send('auth', { action:'logout' }, cookie)).status, 200);
     assert.equal((await send('state', null, cookie)).status, 401);
     assert.equal((await send('auth', { ...owner, action:'login', password:'wrong' })).status, 401);

@@ -8,12 +8,6 @@ export const sameSecret = (a, b) => typeof a === 'string' && typeof b === 'strin
 const cookieName = 'ft_session';
 const duration = 12 * 60 * 60 * 1000;
 
-const defaultOwner = {
-  email: 'ayoolaadebisi5@gmail.com',
-  salt: 'ft-owner-salt-v1',
-  hash: '46b941a5734888d3a2123df88fca9e8f737653174c252da741fcd3cfc53f0d4263d2ebc464aefbab9ba1ef894e3dc0f348145d5f8c0c973b607c8d688e75d911'
-};
-
 export async function createAuth({ file, required, secure, signupCode, ownerEmail, ownerPassword, remoteStore, storeKey = 'auth' }) {
   let store = { owner: null, sessions: {} };
   const remote = remoteStore?.enabled ? await remoteStore.load(storeKey) : null;
@@ -24,7 +18,7 @@ export async function createAuth({ file, required, secure, signupCode, ownerEmai
     catch (error) { if (error.code !== 'ENOENT') throw error; }
   }
   required ||= Boolean(store.owner);
-  const attempts = [];
+  const attemptsByIp = new Map();
   let queue = Promise.resolve();
   const keyFor = cookie => {
     const token = cookie?.match(/(?:^|;\s*)ft_session=([a-zA-Z0-9_-]{43})(?:;|$)/)?.[1];
@@ -39,17 +33,24 @@ export async function createAuth({ file, required, secure, signupCode, ownerEmai
     await writeFile(file + '.tmp', JSON.stringify(next), { mode: 0o600 });
     await rename(file + '.tmp', file);
     store = next;
-    if (remoteStore?.enabled) await remoteStore.save(storeKey, next);
+    if (remoteStore?.enabled) await remoteStore.save(storeKey, next, { force: true });
   };
   const fail = (message, code = 400) => { throw Object.assign(Error(message), { status: code }); };
-  const change = async (input, cookie) => {
+  const change = async (input, cookie, clientIp = 'local') => {
     if (!required) fail('Sign-in is disabled on this local workspace.');
     if (!['signup','login','logout'].includes(input?.action)) fail('Invalid sign-in request.');
     if (input.action !== 'logout') {
       const now = Date.now();
-      while (attempts.length && attempts[0] <= now - 60000) attempts.shift();
-      if (attempts.length >= 10) fail('Too many sign-in attempts. Try again in a minute.', 429);
-      attempts.push(now);
+      const bucketKey = String(clientIp || 'local').slice(0, 64);
+      const list = (attemptsByIp.get(bucketKey) ?? []).filter(ts => ts > now - 60000);
+      if (list.length >= 10) fail('Too many sign-in attempts. Try again in a minute.', 429);
+      list.push(now);
+      attemptsByIp.set(bucketKey, list);
+      if (attemptsByIp.size > 1000) {
+        for (const [k, v] of attemptsByIp) {
+          if (!v.some(ts => ts > now - 60000)) attemptsByIp.delete(k);
+        }
+      }
     } else if (!authenticated(cookie)) {
       return { data: status(), cookie: sessionCookie('', 0) };
     }
@@ -77,7 +78,8 @@ export async function createAuth({ file, required, secure, signupCode, ownerEmai
         owner = { email, salt, hash: (await derive(password, salt, 64)).toString('hex') };
       } else {
         const envOwner = ownerEmail && ownerPassword ? { email: ownerEmail.trim().toLowerCase(), password: ownerPassword } : null;
-        const active = owner ?? envOwner ?? defaultOwner;
+        const active = owner ?? envOwner;
+        if (!active) fail('No owner account configured. Complete workspace setup first.', 401);
         const ok = active.password
           ? sameSecret(email, active.email) && sameSecret(password, active.password)
           : sameSecret(email, active.email) && sameSecret((await derive(password, active.salt, 64)).toString('hex'), active.hash);

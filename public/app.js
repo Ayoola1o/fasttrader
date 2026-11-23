@@ -1197,13 +1197,21 @@ function render(force=false){
  const markup=renderers[active]()+renderDeleteModal();
  if(markup!==main.dataset.html){main.innerHTML=markup;main.dataset.html=markup}
 }
-async function api(path,data){
- const res=await fetch('/api/'+path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(data),signal:timeoutSignal(['backtest','strategy-preview','portfolio-replay'].includes(path)?70000:30000)});
- const result=await res.json();
+async function api(path,data,opts={}){
+ const idemKey=opts.idempotencyKey||(typeof data?.mutation==='string'?data.mutation:crypto.randomUUID());
+ const res=await fetch('/api/'+path,{
+   method:'POST',credentials:'same-origin',
+   headers:{'Content-Type':'application/json','Idempotency-Key':idemKey},
+   body:JSON.stringify(data),
+   signal:timeoutSignal(['backtest','strategy-preview','portfolio-replay'].includes(path)?70000:30000)
+ });
+ let result=null;
+ try{result=await res.json()}catch{}
  if(!res.ok){
    if(res.status===401&&path!=='auth') signInRequired();
-   throw Error(result.error??'Request failed');
+   throw Error(result?.error??`Request failed (HTTP ${res.status})`);
  }
+ if(result===null) throw Error('Invalid server response.');
  return result;
 }
 const values=form=>Object.fromEntries(new FormData(form));
@@ -1856,5 +1864,17 @@ window.addEventListener('hashchange',()=>{
 });
 window.addEventListener('online',()=>refresh(true));
 window.addEventListener('offline',()=>{online=false;render(true)});
-render(true);refresh(true);setInterval(refresh,3500);
+let pollTimer=null, pollFailures=0;
+function scheduleRefresh(){
+ clearTimeout(pollTimer);
+ if(document.hidden)return;
+ const delay=online?3500:Math.min(30000,3500*Math.pow(2,Math.min(3,pollFailures)));
+ pollTimer=setTimeout(async()=>{
+   await refresh(false);
+   pollFailures=online?0:pollFailures+1;
+   scheduleRefresh();
+ },delay);
+}
+document.addEventListener('visibilitychange',()=>{if(!document.hidden){pollFailures=0;refresh(false).finally(scheduleRefresh)}else clearTimeout(pollTimer)});
+render(true);refresh(true).finally(scheduleRefresh);
 if('serviceWorker'in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});

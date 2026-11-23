@@ -1411,12 +1411,36 @@ function snapshot() {
   };
 }
 async function body(req, limit = 20000) {
-  let raw = '';
+  const chunks = [];
+  let bytes = 0;
   for await (const chunk of req) {
-    raw += chunk;
-    if (raw.length > limit) throw Error('Request too large');
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytes += buf.byteLength;
+    if (bytes > limit) throw Object.assign(Error('Request too large'), { status: 413 });
+    chunks.push(buf);
   }
-  return JSON.parse(raw || '{}');
+  return JSON.parse(Buffer.concat(chunks, bytes).toString('utf8') || '{}');
+}
+const idempotencyCache = new Map();
+function readIdempotencyKey(req) {
+  const raw = req.headers['idempotency-key'];
+  return typeof raw === 'string' && /^[a-zA-Z0-9_-]{8,80}$/.test(raw.trim()) ? raw.trim() : null;
+}
+function getIdempotent(cacheKey) {
+  const entry = idempotencyCache.get(cacheKey);
+  if (!entry) return undefined;
+  if (entry.expires <= Date.now()) { idempotencyCache.delete(cacheKey); return undefined; }
+  return entry.value;
+}
+function setIdempotent(cacheKey, value) {
+  const now = Date.now();
+  idempotencyCache.set(cacheKey, { value, expires: now + 300000 });
+  if (idempotencyCache.size > 500) {
+    for (const [k, v] of idempotencyCache) {
+      if (v.expires <= now) idempotencyCache.delete(k);
+    }
+    while (idempotencyCache.size > 500) idempotencyCache.delete(idempotencyCache.keys().next().value);
+  }
 }
 function testSavedAiKey(input) {
   const saved = typeof input.botId === 'string' && input.botId ? perBotAiProviders.get(input.botId) : botAiProvider;
@@ -1748,8 +1772,8 @@ async function change(path, input) {
   }
   if (path === '/api/profile') {
     const rawAvatar = typeof input.avatar === 'string' ? input.avatar.trim() : (state.profile?.avatar ?? '');
-    const validAvatar = rawAvatar === '' || /^data:image\/(png|jpeg|webp);base64,[a-zA-Z0-9+/=]+$/.test(rawAvatar) || /^https:\/\/\S+$/.test(rawAvatar);
-    if (!validAvatar || rawAvatar.length > 180000) throw Error('Use a valid image under 160 KB for the profile photo.');
+    const validAvatar = rawAvatar === '' || /^data:image\/(png|jpeg|webp);base64,[a-zA-Z0-9+/=]+$/.test(rawAvatar);
+    if (!validAvatar || rawAvatar.length > 180000) throw Error('Use a valid PNG, JPEG, or WebP image under 160 KB for the profile photo.');
     const riskTier = ['conservative', 'moderate', 'aggressive'].includes(input.riskTier) ? input.riskTier : (state.profile?.riskTier ?? 'moderate');
     const tradingStyle = ['scalp', 'day', 'swing', 'position'].includes(input.tradingStyle) ? input.tradingStyle : (state.profile?.tradingStyle ?? 'swing');
     state.profile = {
@@ -1871,8 +1895,9 @@ async function backtest(input) {
     return { id: run.id };
   });
 }
+const secHeaders = { 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer' };
 const server = createServer(async (req, res) => {
-  const respond = (status, value, headers = {}) => { res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...headers }); res.end(JSON.stringify(value)); };
+  const respond = (status, value, headers = {}) => { res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...secHeaders, ...headers }); res.end(JSON.stringify(value)); };
   try {
     const url = new URL(req.url, 'http://localhost');
     if (req.method === 'GET' && url.pathname === '/health') return respond(200, { ok: true });
@@ -1882,14 +1907,20 @@ const server = createServer(async (req, res) => {
     } else if (!['127.0.0.1:' + port, 'localhost:' + port].includes(req.headers.host)) {
       return respond(403, { error: 'Use the loopback workspace address.' });
     }
-    if (req.method === 'POST' && url.pathname.startsWith('/api/') &&
-      (!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] ?? '') ||
-        (req.headers.origin && new URL(req.headers.origin).host !== req.headers.host))) {
-      return respond(403, { error: 'Use a same-origin JSON request.' });
+    if (req.method === 'POST' && url.pathname.startsWith('/api/')) {
+      let originOk = true;
+      if (req.headers.origin) {
+        try { originOk = new URL(req.headers.origin).host === req.headers.host; }
+        catch { originOk = false; }
+      }
+      if (!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] ?? '') || !originOk) {
+        return respond(403, { error: 'Use a same-origin JSON request.' });
+      }
     }
     if (req.method === 'GET' && url.pathname === '/api/auth') return respond(200, auth.status(req.headers.cookie));
     if (req.method === 'POST' && url.pathname === '/api/auth') {
-      const result = await auth.change(await body(req), req.headers.cookie);
+      const clientIp = (bridgeSecret ? req.headers['x-fasttrader-client-ip'] : null) || req.socket?.remoteAddress || 'local';
+      const result = await auth.change(await body(req), req.headers.cookie, clientIp);
       return respond(200, result.data, { 'Set-Cookie': result.cookie });
     }
     if (url.pathname.startsWith('/api/') && !auth.authenticated(req.headers.cookie)) return respond(401, { error: 'Sign in to FastTrader.' });
@@ -1902,19 +1933,36 @@ const server = createServer(async (req, res) => {
         return respond(200, await testSavedAiKey(input));
       }
       if (url.pathname === '/api/portfolio-replay') return respond(200, await portfolioReplay(input));
+      const idemKey = readIdempotencyKey(req);
+      const cacheKey = idemKey ? url.pathname + ':' + idemKey : null;
+      if (cacheKey) {
+        const cached = getIdempotent(cacheKey);
+        if (cached !== undefined) return respond(200, cached);
+      }
       const result = url.pathname === '/api/backtest' ? await backtest(input) : await serial(async () => {
         if (!auth.authenticated(req.headers.cookie)) throw Object.assign(Error('Sign in to FastTrader.'), { status: 401 });
+        if (cacheKey) {
+          const cached = getIdempotent(cacheKey);
+          if (cached !== undefined) return cached;
+        }
         const value = await change(url.pathname, input);
         await persist();
+        if (cacheKey) setIdempotent(cacheKey, value);
         return value;
       });
+      if (cacheKey && url.pathname === '/api/backtest') setIdempotent(cacheKey, result);
       return respond(200, result);
     }
     const asset = assets[url.pathname];
     if (req.method !== 'GET' || !asset) return respond(404, { error: 'Not found' });
     const contents = await readFile(new URL('./public/' + asset[0], import.meta.url));
-    res.writeHead(200, { 'Content-Type': asset[1].startsWith('image/png') ? asset[1] : asset[1] + '; charset=utf-8', 'Cache-Control': 'no-cache', 'X-Content-Type-Options': 'nosniff' });
+    res.writeHead(200, { 'Content-Type': asset[1].startsWith('image/png') ? asset[1] : asset[1] + '; charset=utf-8', 'Cache-Control': 'no-cache', ...secHeaders });
     res.end(contents);
-  } catch (error) { respond(error.status >= 400 && error.status < 600 ? error.status : 400, { error: error instanceof SyntaxError ? 'Invalid JSON' : error.message }); }
+  } catch (error) {
+    const status = error.status >= 400 && error.status < 600 ? error.status : error instanceof SyntaxError ? 400 : 400;
+    respond(status, { error: error instanceof SyntaxError ? 'Invalid JSON' : error.message });
+  }
 });
+server.requestTimeout = 30000;
+server.headersTimeout = 15000;
 server.listen(Number(process.env.PORT || 3000), host, () => console.log('FastTrader ' + mode + ' running at http://' + host + ':' + server.address().port));
