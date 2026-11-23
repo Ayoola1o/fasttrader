@@ -2,7 +2,7 @@ import { createServer } from 'node:http';
 import { readFile, mkdir, writeFile, rename } from 'node:fs/promises';
 import { randomUUID, createHash, createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { instruments, defaults, strategy, decision, replay, downsampleCurve, synthetic, botLedger, isCrypto, cryptoReplayRules, roundDown, contiguousBars, aggregateBars, computeATR, computeRSI, indicatorValue, timeframes, ruleWarmupBars, shouldWakeAutonomousAI } from './engine.mjs';
-import { assessSignal, signalProvider, testProviderKey } from './signal-ai.mjs';
+import { assessSignal, signalProvider, testProviderKey, defaultGeminiModel } from './signal-ai.mjs';
 import { createAuth, sameSecret } from './auth.mjs';
 import { createStore } from './store.mjs';
 import { createTelegram } from './telegram.mjs';
@@ -44,7 +44,13 @@ function decryptSecret(enc) {
     return JSON.parse(raw);
   } catch { return null; }
 }
-const validProvider = p => (p?.key && ['Gemini', 'OpenAI'].includes(p?.name) ? p : null);
+const validProvider = p => {
+  if (!p?.key || !['Gemini', 'OpenAI'].includes(p?.name)) return null;
+  if (p.name === 'Gemini' && (!p.model || p.model.replace(/^models\//, '') === 'gemini-2.5-flash')) {
+    return { ...p, model: defaultGeminiModel };
+  }
+  return p;
+};
 const maskKey = k => (typeof k === 'string' && k.length > 8 ? k.slice(0, 4) + '…' + k.slice(-4) : '••••');
 let botAiProvider = null;
 const perBotAiProviders = new Map();
@@ -1181,7 +1187,7 @@ async function change(path, input) {
     if (input.testBotAiKey === true) {
       const saved = typeof input.botId === 'string' && input.botId ? perBotAiProviders.get(input.botId) : botAiProvider;
       const candidate = input.key?.trim()
-        ? { name: input.provider === 'OpenAI' ? 'OpenAI' : 'Gemini', key: input.key.trim(), model: input.model?.trim() || (input.provider === 'OpenAI' ? 'gpt-4.1-mini' : 'gemini-2.5-flash') }
+        ? { name: input.provider === 'OpenAI' ? 'OpenAI' : 'Gemini', key: input.key.trim(), model: input.model?.trim() || (input.provider === 'OpenAI' ? 'gpt-4.1-mini' : defaultGeminiModel) }
         : saved;
       if (!candidate) throw Error('Save or enter an API key first.');
       return testProviderKey(candidate);
@@ -1190,7 +1196,7 @@ async function change(path, input) {
       const name = input.botAiKey.provider === 'OpenAI' ? 'OpenAI' : 'Gemini';
       const key = String(input.botAiKey.key ?? '').trim();
       if (key.length < 10 || key.length > 300) throw Error('Enter a valid Gemini or OpenAI API key.');
-      const model = String(input.botAiKey.model ?? '').trim().slice(0, 80) || (name === 'OpenAI' ? 'gpt-4.1-mini' : 'gemini-2.5-flash');
+      const model = String(input.botAiKey.model ?? '').trim().slice(0, 80) || (name === 'OpenAI' ? 'gpt-4.1-mini' : defaultGeminiModel);
       if (typeof input.botAiKey.botId === 'string' && input.botAiKey.botId) {
         if (!state.bots[input.botAiKey.botId]) throw Error('Bot not found.');
         perBotAiProviders.set(input.botAiKey.botId, { name, key, model });

@@ -62,7 +62,7 @@ test('replay honors intrabar stops, budget caps, and default Gemini model', () =
   assert.equal(result.metrics.closedTrades, 1);
   assert.equal(result.metrics.losses, 1);
   assert.equal(result.metrics.winRate, 0);
-  assert.equal(signalProvider({ GEMINI_API_KEY: 'test-key' }).model, 'gemini-2.5-flash');
+  assert.equal(signalProvider({ GEMINI_API_KEY: 'test-key' }).model, 'gemini-3.5-flash');
 });
 
 test('replay avoids same-bar trailing-stop look-ahead bias, computes quant metrics, and downsamples curves', () => {

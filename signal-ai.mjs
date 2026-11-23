@@ -1,6 +1,14 @@
+import dns from 'node:dns';
+
+try { dns.setDefaultResultOrder('ipv4first'); } catch {}
+
+export const defaultGeminiModel = 'gemini-3.5-flash';
+
 export function signalProvider(env) {
   if (env.GEMINI_API_KEY?.trim()) {
-    return { name: 'Gemini', key: env.GEMINI_API_KEY.trim(), model: env.GEMINI_MODEL?.trim() || 'gemini-2.5-flash' };
+    const raw = env.GEMINI_MODEL?.trim();
+    const model = !raw || raw.replace(/^models\//, '') === 'gemini-2.5-flash' ? defaultGeminiModel : raw;
+    return { name: 'Gemini', key: env.GEMINI_API_KEY.trim(), model };
   }
   if (env.OPENAI_API_KEY?.trim()) {
     return { name: 'OpenAI', key: env.OPENAI_API_KEY.trim(), model: env.OPENAI_MODEL?.trim() || 'gpt-4.1-mini' };
@@ -13,8 +21,11 @@ export async function testProviderKey(provider, request = fetch) {
   const gemini = provider.name === 'Gemini';
   const headers = { 'Content-Type': 'application/json' };
   let url, body;
+  const resolvedModel = gemini
+    ? (!provider.model || provider.model.replace(/^models\//, '') === 'gemini-2.5-flash' ? defaultGeminiModel : provider.model)
+    : (provider.model || 'gpt-4.1-mini');
   if (gemini) {
-    url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent((provider.model || 'gemini-2.5-flash').replace(/^models\//, '')) + ':generateContent';
+    url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(resolvedModel.replace(/^models\//, '')) + ':generateContent';
     headers['x-goog-api-key'] = provider.key;
     body = {
       contents: [{ role: 'user', parts: [{ text: 'Reply with JSON {"ok":true}' }] }],
@@ -23,18 +34,18 @@ export async function testProviderKey(provider, request = fetch) {
   } else {
     url = 'https://api.openai.com/v1/chat/completions';
     headers.Authorization = 'Bearer ' + provider.key;
-    body = { model: provider.model || 'gpt-4.1-mini', response_format: { type: 'json_object' }, max_tokens: 32, messages: [
+    body = { model: resolvedModel, response_format: { type: 'json_object' }, max_tokens: 32, messages: [
       { role: 'user', content: 'Reply with JSON {"ok":true}' }
     ] };
   }
   let response;
   try {
-    response = await request(url, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(10000) });
+    response = await request(url, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(15000) });
   } catch {
     throw Error(provider.name + ' connection timed out.');
   }
   if (!response.ok) throw Error(provider.name + ' rejected key (HTTP ' + response.status + ')');
-  return { ok: true, provider: provider.name, model: provider.model };
+  return { ok: true, provider: provider.name, model: resolvedModel };
 }
 
 export async function assessSignal(provider, symbol, side, bars, request = fetch, context = null) {
@@ -66,7 +77,8 @@ export async function assessSignal(provider, symbol, side, bars, request = fetch
   const headers = { 'Content-Type': 'application/json' };
   let url, body;
   if (gemini) {
-    url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(provider.model.replace(/^models\//, '')) + ':generateContent';
+    const modelName = (!provider.model || provider.model.replace(/^models\//, '') === 'gemini-2.5-flash') ? defaultGeminiModel : provider.model.replace(/^models\//, '');
+    url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(modelName) + ':generateContent';
     headers['x-goog-api-key'] = provider.key;
     const properties = {
       side: { type: 'STRING', enum: ['buy', 'sell', 'hold'] },
@@ -91,9 +103,9 @@ export async function assessSignal(provider, symbol, side, bars, request = fetch
 
   let response;
   try {
-    response = await request(url, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(12000) });
+    response = await request(url, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(18000) });
   } catch {
-    throw Object.assign(Error('AI provider unavailable (timeout)'), { status: 0, detail: `${provider.name} did not respond within 12s.` });
+    throw Object.assign(Error('AI provider unavailable (timeout)'), { status: 0, detail: `${provider.name} did not respond within 18s.` });
   }
   if (!response.ok) {
     let detail = '';
