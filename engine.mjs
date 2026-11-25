@@ -38,17 +38,25 @@ export const candleIndicators = [
   'morning_star', 'evening_star',
   'tweezer_bottom', 'tweezer_top'
 ];
+export const chartIndicators = [
+  'double_bottom', 'double_top',
+  'inv_head_shoulders', 'head_shoulders',
+  'bull_flag', 'ascending_triangle', 'descending_triangle',
+  'cup_and_handle',
+  'breakaway_gap', 'exhaustion_gap'
+];
+export const patternIndicators = [...candleIndicators, ...chartIndicators];
 export const ruleIndicators = [
-  'close', 'sma', 'ema', 'rsi', 'adx', 'vwap', 'bb_upper', 'bb_lower', 'bb_width',
+  'close', 'sma', 'ema', 'rsi', 'adx', 'vwap', 'cmf', 'bb_upper', 'bb_lower', 'bb_width',
   'keltner_upper', 'keltner_lower', 'macd', 'macd_signal', 'donchian_high', 'donchian_low',
-  'fib_retracement', 'sr_room_ratio', ...candleIndicators,
+  'fib_retracement', 'sr_room_ratio', ...candleIndicators, ...chartIndicators,
   'atr', 'volume', 'avg_volume', 'rvol', 'pct_change', 'number'
 ];
 export const ruleOperators = ['gt', 'lt', 'gte', 'lte', 'eq', 'crosses_above', 'crosses_below'];
 
 export const defaults = {
   name: 'Momentum Alpha', symbol: 'SPY', mode: 'momentum', timeframe: '1Min', period: 12, entry: 0.1, exit: -0.1,
-  sizeMode: 'percent', size: 10, sizeUsd: 500, riskPct: 1, candleStop: false, exposure: 20, dailyLoss: 3, stop: 2, take: 4, trailingStop: 0,
+  sizeMode: 'percent', size: 10, sizeUsd: 500, riskPct: 1, candleStop: false, antiChase: false, exposure: 20, dailyLoss: 3, stop: 2, take: 4, trailingStop: 0,
   atrStop: 0, cooldown: 5, maxHoldBars: 0, htfEma: 0, minAdx: 0, ai: false, aiPrompt: '', aiNotes: '',
   aiWakeMode: 'smart', aiRiskProfile: 'balanced', aiSizing: 'dynamic', aiDailyCap: 100, rules: null
 };
@@ -282,6 +290,204 @@ export function detectCandlestickPatterns(bars) {
   return { active, flags, setupLow, atr, anatomy };
 }
 
+export function computeCMF(bars, period = 20) {
+  if (!Array.isArray(bars) || bars.length < period) return null;
+  const w = bars.slice(-period);
+  let mfv = 0, volSum = 0, rawSum = 0;
+  for (const b of w) {
+    const { h, l, c } = barOHLC(b);
+    const hl = h - l;
+    const mfm = hl > 0 ? ((c - l) - (h - c)) / hl : 0;
+    const v = Number.isFinite(b.v) && b.v > 0 ? b.v : 0;
+    mfv += mfm * v;
+    volSum += v;
+    rawSum += mfm;
+  }
+  return volSum > 0 ? mfv / volSum : rawSum / period;
+}
+
+function findSwingPivots(ohlc, left = 2, right = 2) {
+  const highs = [], lows = [];
+  const limit = ohlc.length - 1 - right;
+  for (let i = left; i <= limit; i++) {
+    let isHigh = true, isLow = true;
+    for (let j = i - left; j <= i + right; j++) {
+      if (j === i) continue;
+      if (ohlc[j].h > ohlc[i].h) isHigh = false;
+      if (ohlc[j].l < ohlc[i].l) isLow = false;
+    }
+    if (isHigh && (!highs.length || i - highs.at(-1).i >= 2)) highs.push({ i, h: ohlc[i].h, l: ohlc[i].l });
+    if (isLow && (!lows.length || i - lows.at(-1).i >= 2)) lows.push({ i, h: ohlc[i].h, l: ohlc[i].l });
+  }
+  return { highs, lows };
+}
+
+export function detectChartPatterns(bars) {
+  const emptyFlags = Object.fromEntries(chartIndicators.map(k => [k, 0]));
+  if (!Array.isArray(bars) || bars.length < 12) {
+    return { active: [], activeBullish: [], activeBearish: [], flags: emptyFlags, setupLow: null };
+  }
+  const w = bars.slice(-Math.min(60, bars.length));
+  const ohlc = w.map(b => ({ ...barOHLC(b), v: Number.isFinite(b.v) ? b.v : 0 }));
+  const n = ohlc.length;
+  const cur = ohlc[n - 1], prev = ohlc[n - 2];
+  const atr = computeATR(w, Math.min(14, n - 1)) ?? Math.max(cur.c * 0.004, cur.range || 0.01);
+  const flags = { ...emptyFlags };
+  let setupLow = null;
+
+  // 1. Price Gaps: Breakaway Gap & Exhaustion Gap (Slides 40-47)
+  const cong = ohlc.slice(-Math.min(16, n), -1);
+  const congHigh = Math.max(...cong.map(b => b.h));
+  const congLow = Math.min(...cong.map(b => b.l));
+  const vols = cong.map(b => b.v).filter(v => v > 0);
+  const avgVol = vols.length >= 4 ? vols.reduce((a, b) => a + b, 0) / vols.length : 0;
+  const rvol = avgVol > 0 ? cur.v / avgVol : 1;
+  if (cur.o > prev.h && cur.c > congHigh && cur.c >= cur.o && (congHigh - congLow) <= 5 * atr && (avgVol === 0 || rvol >= 1.4)) {
+    flags.breakaway_gap = 1;
+    setupLow = Math.max(prev.c, cur.l);
+  }
+  if ((cur.o - prev.c) >= 0.7 * atr && prev.c >= cong[0].c + 2.5 * atr && (avgVol === 0 || rvol >= 1.8) &&
+    (cur.c < cur.o || (cur.range > 0 && (cur.c - cur.l) / cur.range <= 0.4))) {
+    flags.exhaustion_gap = 1;
+  }
+
+  // 2. Bull Flag / Parallelogram Flag Continuation (Slides 58-59)
+  if (n >= 14) {
+    for (let fLen = 4; fLen <= Math.min(10, n - 7); fLen++) {
+      const flagStart = n - 1 - fLen;
+      const poleStart = Math.max(0, flagStart - 7);
+      const pole = ohlc.slice(poleStart, flagStart);
+      const flag = ohlc.slice(flagStart, n - 1);
+      const poleLow = Math.min(...pole.map(b => b.l));
+      const poleHigh = Math.max(...pole.map(b => b.h));
+      const poleGain = poleHigh - poleLow;
+      if (poleGain < 2.2 * atr || pole.at(-1).c <= pole[0].o) continue;
+      const flagHigh = Math.max(...flag.map(b => b.h));
+      const flagLow = Math.min(...flag.map(b => b.l));
+      if ((poleHigh - flagLow) <= 0.55 * poleGain && flagHigh <= poleHigh + 0.4 * atr && (flagHigh - flagLow) <= 0.65 * poleGain &&
+        prev.c <= flagHigh && cur.c > flagHigh && cur.c > cur.o) {
+        flags.bull_flag = 1;
+        setupLow = setupLow === null ? flagLow : Math.min(setupLow, flagLow);
+        break;
+      }
+    }
+  }
+
+  // 3. Ascending & Descending Triangles (Slides 54-57)
+  if (n >= 15) {
+    const tri = ohlc.slice(-Math.min(24, n), -1);
+    const mid = Math.floor(tri.length / 2);
+    const h1 = tri.slice(0, mid), h2 = tri.slice(mid);
+    const top1 = Math.max(...h1.map(b => b.h)), top2 = Math.max(...h2.map(b => b.h));
+    const bot1 = Math.min(...h1.map(b => b.l)), bot2 = Math.min(...h2.map(b => b.l));
+    const res = Math.max(top1, top2), sup = Math.min(bot1, bot2);
+    if (Math.abs(top1 - top2) <= 0.85 * atr && bot2 > bot1 + 0.35 * atr && prev.c <= res && cur.c > res && cur.c > cur.o) {
+      flags.ascending_triangle = 1;
+      setupLow = setupLow === null ? bot2 : Math.min(setupLow, bot2);
+    }
+    if (Math.abs(bot1 - bot2) <= 0.85 * atr && top2 < top1 - 0.35 * atr && prev.c >= sup && cur.c < sup && cur.c < cur.o) {
+      flags.descending_triangle = 1;
+    }
+  }
+
+  // 4. Cup and Handle Lip Breakout (Slides 50-51)
+  if (n >= 20) {
+    const cupWin = ohlc.slice(-Math.min(36, n), -1);
+    const m = cupWin.length;
+    const q1 = Math.max(3, Math.floor(m * 0.25));
+    const hLen = Math.max(3, Math.min(6, Math.floor(m * 0.2)));
+    const leftRim = cupWin.slice(0, q1);
+    const belly = cupWin.slice(q1, m - hLen);
+    const handle = cupWin.slice(m - hLen);
+    if (belly.length >= 5) {
+      const leftLip = Math.max(...leftRim.map(b => b.h));
+      const cupBottom = Math.min(...belly.map(b => b.l));
+      const rightPeak = Math.max(...cupWin.slice(Math.floor(m * 0.6)).map(b => b.h));
+      const cupDepth = leftLip - cupBottom;
+      const handleLow = Math.min(...handle.map(b => b.l));
+      const handleHigh = Math.max(...handle.map(b => b.h));
+      const lip = Math.max(leftLip, rightPeak);
+      if (cupDepth >= 2 * atr && Math.abs(leftLip - rightPeak) <= 0.9 * atr &&
+        handleLow >= cupBottom + 0.55 * cupDepth && handleHigh <= lip + 0.25 * atr &&
+        prev.c <= lip && cur.c > lip && cur.c > cur.o) {
+        flags.cup_and_handle = 1;
+        setupLow = setupLow === null ? handleLow : Math.min(setupLow, handleLow);
+      }
+    }
+  }
+
+  // 5. Swing Pivot Reversals: Double Bottom/Top ("W"/"M") & Inverted H&S / H&S Top (Slides 28-39)
+  if (n >= 16) {
+    const { highs, lows } = findSwingPivots(ohlc, 2, 2);
+    if (lows.length >= 2) {
+      const l1 = lows.at(-2), l2 = lows.at(-1);
+      if (l2.i - l1.i >= 4 && (n - 1 - l2.i) <= 12 && Math.abs(l2.l - l1.l) <= Math.max(1.2 * atr, l1.l * 0.015)) {
+        const neck = Math.max(...ohlc.slice(l1.i + 1, l2.i).map(b => b.h));
+        const minSinceL2 = Math.min(...ohlc.slice(l2.i, n).map(b => b.l));
+        if ((neck - Math.min(l1.l, l2.l)) >= 1.5 * atr && minSinceL2 >= Math.min(l1.l, l2.l) - 0.3 * atr &&
+          prev.c <= neck && cur.c > neck && cur.c > cur.o) {
+          flags.double_bottom = 1;
+          setupLow = setupLow === null ? l2.l : Math.min(setupLow, l2.l);
+        }
+      }
+    }
+    if (highs.length >= 2) {
+      const p1 = highs.at(-2), p2 = highs.at(-1);
+      if (p2.i - p1.i >= 4 && (n - 1 - p2.i) <= 12 && Math.abs(p2.h - p1.h) <= Math.max(1.2 * atr, p1.h * 0.015)) {
+        const neck = Math.min(...ohlc.slice(p1.i + 1, p2.i).map(b => b.l));
+        if ((Math.max(p1.h, p2.h) - neck) >= 1.5 * atr && prev.c >= neck && cur.c < neck && cur.c < cur.o) {
+          flags.double_top = 1;
+        }
+      }
+    }
+    if (lows.length >= 3) {
+      const ls = lows.at(-3), head = lows.at(-2), rs = lows.at(-1);
+      if (head.i - ls.i >= 3 && rs.i - head.i >= 3 && (n - 1 - rs.i) <= 12 &&
+        head.l <= Math.min(ls.l, rs.l) - 0.5 * atr && Math.abs(ls.l - rs.l) <= Math.max(1.8 * atr, head.l * 0.025)) {
+        const n1 = Math.max(...ohlc.slice(ls.i + 1, head.i).map(b => b.h));
+        const n2 = Math.max(...ohlc.slice(head.i + 1, rs.i).map(b => b.h));
+        const neck = Math.max(n1, n2);
+        if (prev.c <= neck && cur.c > neck && cur.c > cur.o) {
+          flags.inv_head_shoulders = 1;
+          setupLow = setupLow === null ? rs.l : Math.min(setupLow, rs.l);
+        }
+      }
+    }
+    if (highs.length >= 3) {
+      const ls = highs.at(-3), head = highs.at(-2), rs = highs.at(-1);
+      if (head.i - ls.i >= 3 && rs.i - head.i >= 3 && (n - 1 - rs.i) <= 12 &&
+        head.h >= Math.max(ls.h, rs.h) + 0.5 * atr && Math.abs(ls.h - rs.h) <= Math.max(1.8 * atr, head.h * 0.025)) {
+        const n1 = Math.min(...ohlc.slice(ls.i + 1, head.i).map(b => b.l));
+        const n2 = Math.min(...ohlc.slice(head.i + 1, rs.i).map(b => b.l));
+        const neck = Math.min(n1, n2);
+        if (prev.c >= neck && cur.c < neck && cur.c < cur.o) {
+          flags.head_shoulders = 1;
+        }
+      }
+    }
+  }
+
+  const bullishKeys = ['double_bottom', 'inv_head_shoulders', 'bull_flag', 'ascending_triangle', 'cup_and_handle', 'breakaway_gap'];
+  const bearishKeys = ['double_top', 'head_shoulders', 'descending_triangle', 'exhaustion_gap'];
+  const activeBullish = bullishKeys.filter(k => flags[k] === 1);
+  const activeBearish = bearishKeys.filter(k => flags[k] === 1);
+  return { active: chartIndicators.filter(k => flags[k] === 1), activeBullish, activeBearish, flags, setupLow };
+}
+
+export function isOverextendedBuy(bars) {
+  if (!Array.isArray(bars) || bars.length < 15) return false;
+  if (detectChartPatterns(bars).flags.exhaustion_gap === 1) return true;
+  const closes = bars.map(b => b.c);
+  const rsi = computeRSI(closes, 14);
+  if (rsi !== null && rsi > 78) return true;
+  if (closes.length >= 20) {
+    const ema20 = computeEMA(closes, 20);
+    const atr = computeATR(bars, 14);
+    if (ema20 !== null && atr !== null && atr > 0 && closes.at(-1) > ema20 + 3 * atr) return true;
+  }
+  return false;
+}
+
 export function indicatorValue(bars, spec, offset = 0) {
   if (!spec || !bars?.length) return null;
   if (spec.indicator === 'number') return Number.isFinite(spec.value) ? spec.value : null;
@@ -290,6 +496,9 @@ export function indicatorValue(bars, spec, offset = 0) {
   const slice = bars.slice(0, end);
   if (candleIndicators.includes(spec.indicator)) {
     return detectCandlestickPatterns(slice).flags[spec.indicator] ?? 0;
+  }
+  if (chartIndicators.includes(spec.indicator)) {
+    return detectChartPatterns(slice).flags[spec.indicator] ?? 0;
   }
   const closes = slice.map(b => b.c);
   const period = Math.max(1, Math.min(200, Math.round(spec.period ?? 14)));
@@ -306,6 +515,7 @@ export function indicatorValue(bars, spec, offset = 0) {
     case 'rsi': return closes.length > period ? computeRSI(closes, period) : null;
     case 'adx': return slice.length > period ? computeADX(slice, period) : null;
     case 'vwap': return computeVWAP(slice);
+    case 'cmf': return computeCMF(slice, period);
     case 'bb_upper':
     case 'bb_lower':
     case 'bb_width': {
@@ -415,11 +625,13 @@ export function ruleWarmupBars(s) {
   if (s.mode === 'breakout') max++;
   if (s.atrStop > 0 || s.candleStop) max = Math.max(max, Math.min(14, s.period ?? 14) + 1);
   if (s.minAdx > 0) max = Math.max(max, 16);
+  if (s.antiChase) max = Math.max(max, 20);
   for (const r of all) {
     for (const side of [r.left, r.right]) {
       if (!side) continue;
       if (side.indicator === 'macd' || side.indicator === 'macd_signal') max = Math.max(max, 36);
       else if (candleIndicators.includes(side.indicator)) max = Math.max(max, 15);
+      else if (chartIndicators.includes(side.indicator)) max = Math.max(max, 25);
       else if (side.indicator === 'adx') max = Math.max(max, (side.period ?? 14) + 2);
       else if (!['number', 'close', 'volume', 'vwap'].includes(side.indicator)) {
         max = Math.max(max, (side.period ?? 14) + 2);
@@ -487,7 +699,7 @@ function remainingBudget(budget, realized, invested = 0) {
   return Math.max(0, budget + Math.min(0, realized) - invested);
 }
 
-const periodFreeIndicators = new Set(['close', 'volume', 'macd', 'macd_signal', 'vwap', ...candleIndicators]);
+const periodFreeIndicators = new Set(['close', 'volume', 'macd', 'macd_signal', 'vwap', ...candleIndicators, ...chartIndicators]);
 
 function sanitizeRuleSpec(spec) {
   if (!spec || typeof spec !== 'object' || !ruleIndicators.includes(spec.indicator)) throw Error('Invalid rule indicator.');
@@ -565,6 +777,7 @@ export function strategy(input, supportsSymbol = symbol => Object.hasOwn(instrum
   if (!Number.isFinite(riskPct) || riskPct < 0.1 || riskPct > 10) throw Error('Invalid value for riskPct');
   result.riskPct = riskPct;
   result.candleStop = input.candleStop === true;
+  result.antiChase = input.antiChase === true;
   result.aiPrompt = typeof input.aiPrompt === 'string' ? input.aiPrompt.trim().slice(0, 300) : '';
   result.aiNotes = typeof input.aiNotes === 'string' ? input.aiNotes.trim().slice(0, 4000) : '';
   result.aiWakeMode = input.aiWakeMode === 'fixed' ? 'fixed' : 'smart';
@@ -637,6 +850,8 @@ export function shouldWakeAutonomousAI(bars, lastWakeAt = 0, now = Date.now()) {
   if (reg.regime === 'SQUEEZE_BREAKOUT') return { wake: true, trigger: 'Volatility squeeze breakout' };
   const patterns = detectCandlestickPatterns(bars);
   if (patterns.active.length) return { wake: true, trigger: `Candlestick pattern: ${patterns.active[0]}` };
+  const chartPats = detectChartPatterns(bars);
+  if (chartPats.active.length) return { wake: true, trigger: `Chart pattern: ${chartPats.active[0]}` };
   const last = bars.at(-1), prev = bars.at(-2);
   const moveOpen = last.o > 0 ? Math.abs(100 * (last.c / last.o - 1)) : 0;
   const movePrev = prev.c > 0 ? Math.abs(100 * (last.c / prev.c - 1)) : 0;
@@ -659,10 +874,14 @@ export function shouldWakeAutonomousAI(bars, lastWakeAt = 0, now = Date.now()) {
 
 export function computeCandleStopPct(s, evalBars, entryPrice, atrOpt = null) {
   if (!Number.isFinite(entryPrice) || entryPrice <= 0 || !Array.isArray(evalBars) || !evalBars.length) return s.stop;
+  const chartPat = detectChartPatterns(evalBars);
   const pat = detectCandlestickPatterns(evalBars);
-  if (!Number.isFinite(pat.setupLow) || pat.setupLow <= 0) return s.stop;
+  const setupLow = chartPat.activeBullish.length && Number.isFinite(chartPat.setupLow) && chartPat.setupLow > 0
+    ? chartPat.setupLow
+    : pat.setupLow;
+  if (!Number.isFinite(setupLow) || setupLow <= 0) return s.stop;
   const atr = Number.isFinite(atrOpt) && atrOpt > 0 ? atrOpt : (pat.atr ?? 0);
-  const stopPrice = pat.setupLow - 0.15 * atr;
+  const stopPrice = setupLow - 0.15 * atr;
   const rawPct = 100 * (entryPrice - stopPrice) / entryPrice;
   if (!Number.isFinite(rawPct) || rawPct <= 0) return Math.min(s.stop, 0.5);
   return Math.max(0.25, Math.min(s.stop, rawPct));
@@ -767,6 +986,7 @@ export function decision(s, closes, account, position, price, rules = isCrypto(s
     const adxVal = computeADX(evalBars, 14);
     if (adxVal !== null && adxVal < s.minAdx) return null;
   }
+  if (s.antiChase && isOverextendedBuy(evalBars)) return null;
   if (mode === 'ai_notepad' || mode === 'ai_autonomous') {
     const sizeCap = computeSizeCap(s, account, price, evalBars, options);
     const budget = mode === 'ai_autonomous'
@@ -793,6 +1013,7 @@ export function entrySignal(s, evalBars) {
     const adxVal = computeADX(evalBars, 14);
     if (adxVal !== null && adxVal < s.minAdx) return null;
   }
+  if (s.antiChase && isOverextendedBuy(evalBars)) return null;
   const closes = evalBars.map(bar => bar.c);
   let rationale = null;
   if (s.rules?.entry?.length) {

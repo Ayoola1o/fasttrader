@@ -2,7 +2,7 @@ import { replayPortfolio, createPaperPortfolio, stepPaperPortfolio, paperPortfol
 import { createServer } from 'node:http';
 import { readFile, mkdir, writeFile, rename } from 'node:fs/promises';
 import { randomUUID, createHash, createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
-import { instruments, defaults, strategy, decision, replay, downsampleCurve, synthetic, botLedger, isCrypto, cryptoReplayRules, roundDown, strategyWindow, entrySignal, evaluateRuleSet, aggregateBars, closedStrategyBars, computeATR, computeRSI, computeADX, computeVWAP, classifyRegime, detectCandlestickPatterns, indicatorValue, timeframes, ruleWarmupBars, shouldWakeAutonomousAI } from './engine.mjs';
+import { instruments, defaults, strategy, decision, replay, downsampleCurve, synthetic, botLedger, isCrypto, cryptoReplayRules, roundDown, strategyWindow, entrySignal, evaluateRuleSet, aggregateBars, closedStrategyBars, computeATR, computeRSI, computeADX, computeVWAP, computeCMF, classifyRegime, detectCandlestickPatterns, detectChartPatterns, indicatorValue, timeframes, ruleWarmupBars, shouldWakeAutonomousAI } from './engine.mjs';
 import { assessSignal, signalProvider, testProviderKey, defaultGeminiModel } from './signal-ai.mjs';
 import { createAuth, sameSecret } from './auth.mjs';
 import { createStore } from './store.mjs';
@@ -705,6 +705,8 @@ async function completeAI(job) {
     const rich = s.mode === 'ai_notepad' || s.mode === 'ai_autonomous';
     const candle = detectCandlestickPatterns(bars);
     const patterns = { active: candle.active, anatomy: candle.anatomy, setupLow: candle.setupLow };
+    const chartStruct = detectChartPatterns(bars);
+    const chartPatterns = { active: chartStruct.active, setupLow: chartStruct.setupLow };
     const indicators = rich ? {
       sma12: indicatorValue(bars, { indicator: 'sma', period: 12 }),
       ema8: indicatorValue(bars, { indicator: 'ema', period: 8 }),
@@ -713,6 +715,7 @@ async function completeAI(job) {
       rsi14: computeRSI(bars.map(b => b.c), 14),
       adx14: computeADX(bars, 14),
       vwap: computeVWAP(bars),
+      cmf20: computeCMF(bars, 20),
       rvol20: indicatorValue(bars, { indicator: 'rvol', period: 20 }),
       fibRetracement50: indicatorValue(bars, { indicator: 'fib_retracement', period: 50 }),
       srRoomRatio40: indicatorValue(bars, { indicator: 'sr_room_ratio', period: 40 }),
@@ -731,7 +734,7 @@ async function completeAI(job) {
     const knowledge = proposal.aiAutonomous ? strategyKnowledge(s, proposal.side, proposal.aiFreeRoam) : [];
     model = await assessSignal(provider, s.symbol, proposal.side, bars, fetch, {
       price, rationale: proposal.rationale, period: s.period, mode: s.mode ?? 'momentum', timeframe: s.timeframe ?? '1Min',
-      patterns,
+      patterns, chartPatterns,
       ...(proposal.aiAutonomous ? { aiAutonomous: true, aiNotes: s.aiNotes, indicators, regime } : {}),
       ...(proposal.aiFreeRoam ? {
         aiFreeRoam: true, aiRiskProfile: s.aiRiskProfile ?? 'balanced', aiSizing: s.aiSizing ?? 'dynamic',
@@ -1619,9 +1622,25 @@ async function change(path, input) {
 ## Exit & Money Management Rules (Sell / Risk Control)
 - **Stop-Loss**: Place protective stop just below the **Pin Bar tail, Engulfing low, or Fakey sweep low** (with a small ATR buffer), risking strictly **1% to 2%** of capital per trade.
 - **Exit / Take-Profit**: Exit at major overhead resistance, opposite Bollinger Band, or when a **Bearish Pin Bar, Bearish Engulfing, or Evening Star** prints against the position.`;
-    const isPreset = input.preset === 'candlestick-bible';
-    const name = isPreset ? 'Candlestick-Trading-Bible-Rules.md' : (typeof input.name === 'string' ? input.name.trim() : '');
-    const text = isPreset ? bibleGuide : (typeof input.text === 'string' ? input.text.replace(/^\uFEFF/, '').trim() : '');
+    const classicalTaGuide = `# Classical Technical Analysis — Chart Patterns, Gaps, Dow Theory & Volume Flow
+
+## Dow Theory & Volume Confirmation
+- Align entries with the **Primary Trend** (50/200 MA) and confirm every structural breakout with **Volume Expansion (RVOL >= 1.3)** and positive **Chaikin Money Flow (CMF(20) > 0)**.
+- **Greater Fool & Exhaustion Warning**: Never buy parabolic tops, overextended candles (> 3 ATR above EMA 20 or RSI > 78), or high-volume **Exhaustion Gaps** that stall and reverse.
+
+## Classical Reversal Chart Setups (Buy on Neckline Breakout)
+1. **Double Bottom ("W")**: Two matching troughs separated by a middle peak (**Neckline**). Enter only when a candle closes decisively above the Neckline on expanding volume and rising CMF(20). Stop goes below the second trough.
+2. **Inverted Head & Shoulders**: Left Shoulder -> deeper Head -> balanced Right Shoulder -> closed **Confirmation Line (Neckline) break** on volume spike. Stop goes below the Right Shoulder.
+3. **Bearish Reversal Exits (Sell)**: Exit immediately when a **Double Top ("M")** or **Head & Shoulders Top** breaks below its neckline on rising volume.
+
+## Classical Continuation & Gap Setups (Buy Trend Pauses)
+1. **Bull Flag (Parallelogram)**: Sharp flagpole impulse followed by a tight, orderly pullback channel on declining volume. Buy when price closes above the upper flag boundary, targeting a measured move equal to the flagpole.
+2. **Ascending Triangle & Cup-and-Handle**: Buy when rising higher lows (or a shallow right-side handle) close above the flat resistance ceiling / cup lip with CMF(20) > 0.05. Sell on **Descending Triangle** support breakdowns.
+3. **Breakaway Gap & 20-SMA Pullback Reclaim**: Buy Breakaway Gaps out of multi-bar congestion on RVOL >= 1.4 (gap floor acts as support), or when an uptrend dips briefly below SMA(20) and closes back above SMA(20).`;
+    const isBible = input.preset === 'candlestick-bible';
+    const isClassical = input.preset === 'classical-ta';
+    const name = isBible ? 'Candlestick-Trading-Bible-Rules.md' : isClassical ? 'Classical-Chart-Patterns-TA-Guide.md' : (typeof input.name === 'string' ? input.name.trim() : '');
+    const text = isBible ? bibleGuide : isClassical ? classicalTaGuide : (typeof input.text === 'string' ? input.text.replace(/^\uFEFF/, '').trim() : '');
     if (name.length > 120 || /[\\/\x00-\x1f]/.test(name) || !/\.(txt|md|markdown)$/i.test(name)) {
       throw Error('Upload a .txt or .md strategy document with a filename up to 120 characters.');
     }

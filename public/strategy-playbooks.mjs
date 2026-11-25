@@ -330,5 +330,154 @@ export const strategyPlaybooks = {
         ]
       }
     }
+  },
+  'ta-double-bottom-cmf': {
+    name: 'Double Bottom "W" Neckline Breakout + CMF',
+    category: 'Structural reversal · Classical TA',
+    author: 'Classical Charting · Technical Analysis Deck (Slides 34, 37–39)',
+    source: 'Double Bottoms, Confirmation Line Break & Chaikin Money Flow',
+    url: 'https://www.investopedia.com/terms/d/doublebottom.asp',
+    evidence: 'Multi-bar W-reversal + volume flow',
+    setup: 'Identifies twin swing troughs forming a "W" base and waits for a confirmed closed breakout above the middle peak (neckline) backed by positive Chaikin Money Flow and above-average volume.',
+    entry: 'Buy on 1-hour bars when Double Bottom == 1, CMF(20) > 0, and RVOL(20) ≥ 1.2 (with Anti-Chase exhaustion guard).',
+    exit: 'Sell on a Double Top ("M"), Head & Shoulders Top, Exhaustion Gap, or via Right-Trough Pattern Stop and 9% target.',
+    caution: 'Never anticipate a Double Bottom before the neckline closes broken; premature bottom-picking catches falling knives.',
+    adaptation: 'Anchors protective stop below the second trough (Slide 39), sizes by 1.5% capital risk, and blocks overextended chases.',
+    draft: {
+      timeframe: '1Hour',
+      sizeMode: 'risk',
+      riskPct: 1.5,
+      candleStop: true,
+      antiChase: true,
+      stop: 3.5,
+      trailingStop: 0,
+      take: 9,
+      cooldown: 2,
+      rules: {
+        entryLogic: 'all', exitLogic: 'any',
+        entry: [
+          { left: { indicator: 'double_bottom' }, op: 'eq', right: { indicator: 'number', value: 1 } },
+          { left: { indicator: 'cmf', period: 20 }, op: 'gt', right: { indicator: 'number', value: 0 } },
+          { left: { indicator: 'rvol', period: 20 }, op: 'gte', right: { indicator: 'number', value: 1.2 } }
+        ],
+        exit: [
+          { left: { indicator: 'double_top' }, op: 'eq', right: { indicator: 'number', value: 1 } },
+          { left: { indicator: 'head_shoulders' }, op: 'eq', right: { indicator: 'number', value: 1 } },
+          { left: { indicator: 'exhaustion_gap' }, op: 'eq', right: { indicator: 'number', value: 1 } }
+        ]
+      }
+    }
+  },
+  'ta-bull-flag-triangle': {
+    name: 'Bull Flag & Ascending Triangle Breakout',
+    category: 'Continuation · Classical TA',
+    author: 'Classical Charting · Technical Analysis Deck (Slides 54–59)',
+    source: 'Continuation Patterns: Ascending Triangles & Parallelogram Flags',
+    url: 'https://www.investopedia.com/terms/f/flag.asp',
+    evidence: 'Consolidation breakout continuation',
+    setup: 'Trades mid-trend pauses (Parallelogram Bull Flags, Ascending Triangles, or Breakaway Gaps) inside an established uptrend (HTF EMA 50 + ADX ≥ 20).',
+    entry: 'Buy on 1-hour bars when ANY of Bull Flag, Ascending Triangle, or Breakaway Gap closes broken inside an ADX ≥ 20 uptrend.',
+    exit: 'Sell on a Descending Triangle breakdown, Exhaustion Gap, Close < SMA(20), or trailing stop.',
+    caution: 'Avoid trading continuation breakouts when RSI > 78 or price is > 3 ATR stretched above EMA(20) (Anti-Chase active).',
+    adaptation: 'Enforces HTF EMA(50), ADX(14) ≥ 20, Anti-Chase exhaustion protection, Pattern Stop below the flag/triangle low, and 1.5% risk sizing.',
+    draft: {
+      timeframe: '1Hour',
+      htfEma: 50,
+      minAdx: 20,
+      sizeMode: 'risk',
+      riskPct: 1.5,
+      candleStop: true,
+      antiChase: true,
+      stop: 3,
+      trailingStop: 2,
+      take: 9,
+      cooldown: 2,
+      rules: {
+        entryLogic: 'any', exitLogic: 'any',
+        entry: [
+          { left: { indicator: 'bull_flag' }, op: 'eq', right: { indicator: 'number', value: 1 } },
+          { left: { indicator: 'ascending_triangle' }, op: 'eq', right: { indicator: 'number', value: 1 } },
+          { left: { indicator: 'breakaway_gap' }, op: 'eq', right: { indicator: 'number', value: 1 } }
+        ],
+        exit: [
+          { left: { indicator: 'descending_triangle' }, op: 'eq', right: { indicator: 'number', value: 1 } },
+          { left: { indicator: 'exhaustion_gap' }, op: 'eq', right: { indicator: 'number', value: 1 } },
+          { left: { indicator: 'close' }, op: 'lt', right: { indicator: 'sma', period: 20 } }
+        ]
+      }
+    }
+  },
+  'ta-cup-and-handle': {
+    name: 'Cup & Handle Lip Breakout + CMF',
+    category: 'Bullish base · Classical TA',
+    author: 'William O’Neil · Technical Analysis Deck (Slides 50–51)',
+    source: 'The Cup and the Handle — Closed Lip Breakout',
+    url: 'https://www.investopedia.com/terms/c/cupandhandle.asp',
+    evidence: 'Rounded base + handle breakout',
+    setup: 'Waits for a rounded U-shaped consolidation ("cup") followed by a shallow upper-third "handle" drift, entering strictly after a bar closes above the lip on positive money flow.',
+    entry: 'Buy on 1-hour bars when Cup & Handle == 1, CMF(20) > 0.05, and RVOL(20) ≥ 1.2.',
+    exit: 'Sell if Close < EMA(21), a Double Top breakdown occurs, or via Handle-Low Pattern Stop.',
+    caution: 'Skip deep V-shaped handles that retrace more than half of the cup.',
+    adaptation: 'Uses closed-candle lip confirmation (Slide 51), Handle-Low Pattern Stop, and 1% risk-based sizing.',
+    draft: {
+      timeframe: '1Hour',
+      sizeMode: 'risk',
+      riskPct: 1,
+      candleStop: true,
+      antiChase: true,
+      stop: 3,
+      trailingStop: 2,
+      take: 9,
+      cooldown: 2,
+      rules: {
+        entryLogic: 'all', exitLogic: 'any',
+        entry: [
+          { left: { indicator: 'cup_and_handle' }, op: 'eq', right: { indicator: 'number', value: 1 } },
+          { left: { indicator: 'cmf', period: 20 }, op: 'gt', right: { indicator: 'number', value: 0.05 } },
+          { left: { indicator: 'rvol', period: 20 }, op: 'gte', right: { indicator: 'number', value: 1.2 } }
+        ],
+        exit: [
+          { left: { indicator: 'close' }, op: 'lt', right: { indicator: 'ema', period: 21 } },
+          { left: { indicator: 'double_top' }, op: 'eq', right: { indicator: 'number', value: 1 } }
+        ]
+      }
+    }
+  },
+  'ta-dow-sma20-reclaim': {
+    name: 'Dow Primary Trend + 20-SMA Pullback Reclaim',
+    category: 'Trend pullback · Dow Theory',
+    author: 'Charles H. Dow · Technical Analysis Deck (Slides 4–6, 62, 66)',
+    source: 'Dow Theory Primary/Secondary Trends & 20-SMA Reclaim',
+    url: 'https://www.investopedia.com/terms/d/dowtheory.asp',
+    evidence: 'Primary trend + secondary dip reclaim',
+    setup: 'Combines Dow Theory’s Primary vs. Secondary trend hierarchy (Slides 4–6, 66) with Slide 62’s exact 3-step Moving Average pullback rule.',
+    entry: 'Buy when Primary Trend is bullish (SMA 50 > SMA 150), Secondary pullback dips under SMA(20) then Close crosses back above SMA(20), and CMF(20) > 0.',
+    exit: 'Sell if SMA(50) crosses below SMA(150), an Exhaustion Gap / Double Top forms, or trailing stop hits.',
+    caution: 'Stays flat in primary bear markets when SMA(50) is below SMA(150).',
+    adaptation: 'Implements Slide 62’s exact SMA(20) dip-and-reclaim trigger with Anti-Chase protection and 1% risk sizing.',
+    draft: {
+      timeframe: '1Hour',
+      htfEma: 50,
+      sizeMode: 'risk',
+      riskPct: 1,
+      antiChase: true,
+      stop: 2.5,
+      trailingStop: 2,
+      take: 7.5,
+      cooldown: 2,
+      rules: {
+        entryLogic: 'all', exitLogic: 'any',
+        entry: [
+          { left: { indicator: 'sma', period: 50 }, op: 'gt', right: { indicator: 'sma', period: 150 } },
+          { left: { indicator: 'close' }, op: 'crosses_above', right: { indicator: 'sma', period: 20 } },
+          { left: { indicator: 'cmf', period: 20 }, op: 'gt', right: { indicator: 'number', value: 0 } }
+        ],
+        exit: [
+          { left: { indicator: 'sma', period: 50 }, op: 'crosses_below', right: { indicator: 'sma', period: 150 } },
+          { left: { indicator: 'exhaustion_gap' }, op: 'eq', right: { indicator: 'number', value: 1 } },
+          { left: { indicator: 'double_top' }, op: 'eq', right: { indicator: 'number', value: 1 } }
+        ]
+      }
+    }
   }
 };
