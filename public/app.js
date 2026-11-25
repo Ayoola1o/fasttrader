@@ -48,7 +48,7 @@ const screen={search:'',volume:0,volatility:0};
 const cryptoScreen={search:'',volume:0,volatility:0};
 let botFilter='all', launchVersion=null, launchInstrument=null, launchBudget='', fundBudget=null, deleteBotId=null, killSwitchModal=false, stateEtag='';
 let notifOpen=false, notifFilter='all', lastSeenNotif='', avatarDraft=null;
-let tvStyle='Candles', tvRange='1H', tvBotId='';
+let tvStyle='Candles', tvRange='1H', tvBotId='', sessionTab='orders';
 let historyTab='orders';
 const historyFilter={asset:'',strategy:'',side:'',status:'',start:'',end:''};
 let logsLive=true;
@@ -394,7 +394,7 @@ function trading(){
 }
 function session(){
  const bot=state.bots[params().get('id')];
- const back=link('Back to Live Trading','trading');
+ const back=link('← Live Trading','trading');
  if(!bot)return page('Automated execution','Bot Session','This bot could not be found.',back);
  const book=state.botSessions?.[bot.id]??{};
  const strategy=version(key(bot));
@@ -402,54 +402,131 @@ function session(){
  const botOrders=state.orders.filter(order=>order.owned&&order.strategyId===bot.id);
  const signals=state.signals.filter(signal=>signal.strategyId===bot.id);
  const open=botOrders.filter(order=>!['filled','canceled','expired','rejected','replaced','done_for_day'].includes(order.status));
+ const filled=botOrders.filter(order=>order.filled>0);
+ const exits=filled.filter(o=>o.side==='sell'&&Number.isFinite(o.pnl));
+ const wins=exits.filter(o=>o.pnl>0).length;
  const holding=book.qty>0;
  const positionStatus=open.some(order=>order.side==='sell')?'Sell pending':holding?'Holding':open.some(order=>order.side==='buy')?'Buy pending':book.sellFills?'Sold':'Flat';
  const realized=book.complete?book.realized:null;
+ const avgCost=holding&&book.complete&&book.qty>0?book.cost/book.qty:null;
+ const mktValue=holding&&Number.isFinite(book.mark)?book.qty*book.mark:null;
+ const unrealPct=holding&&book.complete&&book.cost>0&&Number.isFinite(book.unrealized)?100*book.unrealized/book.cost:null;
  const versions=state.strategies.filter(s=>s.id===bot.id).slice().reverse().map(s=>[s.version,s.symbol+' · v'+s.version]);
  const requestedVersion=params().get('version')??bot.version;
  const selectedVersion=versions.some(([v])=>String(v)===String(requestedVersion))?requestedVersion:'';
  const moneyChange=value=>`<span class="${color(value)}">${usd(value)}</span>`;
- const command=(label,action)=>btn(label,'bot-command',action,false,`data-bot="${esc(bot.id)}" data-version="${bot.version}" ${!online?'disabled':''}`);
- const controls=bot.desired==='running'?'<div class="form"><div class="actions">'+command('Pause','paused')+command('Stop','stopped')+'</div></div>':
-   bot.desired==='paused'?'<div class="form">'+command('Stop','stopped')+'</div>':'';
+ const dis=!online?'disabled':'';
+ const command=(label,action,primary=false)=>btn(label,'bot-command',action,primary,`data-bot="${esc(bot.id)}" data-version="${bot.version}" ${dis}`);
+ const quickStateBtns=bot.desired==='running'
+   ? command('Pause','paused')+command('Stop','stopped')
+   : bot.budget
+     ? command(bot.desired==='paused'?'Resume':'Restart','running',true)+(bot.desired==='paused'?command('Stop','stopped'):'')
+     : '';
+ const modeLabel=strategy?.mode==='ai_autonomous'?'Autonomous AI':strategy?.mode==='ai_notepad'?'AI Notepad':(modeLabels[strategy?.mode]??'Rule strategy');
+ const tfLabel=strategy?.timeframe??'1Min';
+ const aiCallsBadge=strategy?.mode==='ai_autonomous'?badge(`AI calls: ${bot.aiCallsToday??0}${strategy.aiDailyCap?'/'+strategy.aiDailyCap:''}`):'';
  const hasOpenPos=holding||state.positions.some(p=>p.symbol===bot.symbol&&p.qty>0);
  const needsResync=bot.status==='Position differs from strategy fills'||!book.complete;
- const resyncControl=needsResync?`<div class="notice" style="margin-bottom:8px;border-color:#6e5726;background:#2a2418;color:#ffd68a"><div style="margin-bottom:6px"><b>Ledger out of sync:</b> This bot’s fill ledger differs from your live broker position (e.g. from fee rounding or partial/external fills).</div>${btn('Re-sync ledger to broker','resync-bot',bot.id,true,!online?'disabled':'')}</div>`:'';
- const liquidateControls=hasOpenPos&&!open.some(o=>o.side==='sell')
-   ?`<div class="form"><div class="actions">${btn('Close position','liquidate-bot',bot.id,false,`data-symbol="${esc(bot.symbol)}" data-pause="false" style="background:#39212e;color:#ff8191;border-color:#592e42" ${!online?'disabled':''}`)}${bot.desired==='running'?btn('Close &amp; Pause','liquidate-bot',bot.id,false,`data-symbol="${esc(bot.symbol)}" data-pause="true" style="background:#39212e;color:#ff8191;border-color:#592e42" ${!online?'disabled':''}`):''}</div></div>`:'';
- const topUpForm=form('topup-bot',numeric('Add additional funds (USD)','addFunds','',1,1e9),submit('Add funds to bot',!online));
- const risk=bot.desired==='running'&&bot.budget?topUpForm:form('fund-bot',select('Strategy version','version',[['','Choose a strategy version'],...versions],selectedVersion,true)+numeric('Bot budget (USD)','budget',fundBudget??bot.budget??'',1,1e9),
-       submit(bot.desired==='running'?'Set budget':bot.desired==='paused'?'Resume bot':'Restart bot',!online))+topUpForm;
- const aiCallsBadge=strategy?.mode==='ai_autonomous'?badge(`AI calls today: ${bot.aiCallsToday??0}${strategy.aiDailyCap?' / '+strategy.aiDailyCap:''}`):'';
+ const resyncAlert=needsResync?`<div class="notice session-alert warn"><div><b>Ledger out of sync:</b> Fill history differs from your live broker position (e.g. fee rounding or external fills).</div>${btn('Re-sync ledger to broker','resync-bot',bot.id,true,dis)}</div>`:'';
+ const aiErr=bot.lastAiError;
+ const aiErrorAlert=aiErr?`<div class="notice session-alert danger"><div><b>AI error (${esc(aiErr.provider??'AI')} · ${esc(aiErr.keySource??'key')}):</b> ${esc(aiErr.detail||aiErr.message)} <small>${stamp(aiErr.t)}</small></div>${link('AI Settings','settings')}</div>`:'';
+ const liquidateBtns=hasOpenPos&&!open.some(o=>o.side==='sell')
+   ?`<div class="actions">${btn('Close position','liquidate-bot',bot.id,false,`data-symbol="${esc(bot.symbol)}" data-pause="false" class="danger-btn" style="background:#39212e;color:#ff8191;border-color:#592e42" ${dis}`)}${bot.desired==='running'?btn('Close &amp; Pause','liquidate-bot',bot.id,false,`data-symbol="${esc(bot.symbol)}" data-pause="true" style="background:#39212e;color:#ff8191;border-color:#592e42" ${dis}`):''}</div>`:'';
+ const hero=`<header class="panel session-hero">
+   <div class="session-hero-main">
+     ${mark(bot.symbol,1)}
+     <div class="session-hero-copy">
+       <div class="eyebrow">${esc(state.mode==='demo'?'Demo paper session':'Alpaca Paper session')}</div>
+       <h1>${esc(bot.name)}</h1>
+       <div class="session-pills">
+         ${badge(bot.symbol)}
+         ${badge('v'+bot.version)}
+         ${badge(modeLabel)}
+         ${badge(tfLabel)}
+         ${badge(botStatus(bot),bot.desired==='running'&&bot.status==='Running'?'good':aiErr?'bad':'')}
+         ${aiCallsBadge}
+       </div>
+     </div>
+   </div>
+   <div class="session-hero-actions">
+     ${back}
+     ${strategy?btn('Edit strategy','open-bot-strategy',key(bot)):''}
+     ${btn('Activity logs','open-bot-logs',bot.id)}
+     ${quickStateBtns}
+   </div>
+ </header>`;
+ const kpis=`<div class="metrics dashboard-metrics session-metrics">
+   ${metric('Allocated budget',usd(bot.budget),`${usd(book.available)} available${book.reserved?` · ${usd(book.reserved)} reserved`:''}`,'wallet')}
+   ${metric('Open position',holding?`${qtyText(book.qty)} ${esc(bot.symbol)}`:'Flat',holding?`Cost ${usd(book.invested)} · Mark ${usd(mktValue)}`:`${open.length} open orders · ${positionStatus}`,'portfolio')}
+   ${metric('Realized P&L',moneyChange(realized),exits.length?`${wins}W / ${exits.length-wins}L (${(100*wins/exits.length).toFixed(0)}% win) · ${filled.length} fills`:`${num(book.sellFills)} sell fills · before fees`,'equity',true)}
+   ${metric('Unrealized P&L',moneyChange(book.unrealized),unrealPct!==null?`${pct(unrealPct)} vs avg cost ${usd(avgCost)}`:positionStatus,'trading',true)}
+ </div>`;
+ const positionCard=panel('Position & exposure',holding?`Active ${esc(bot.symbol)} holding`:`${positionStatus} · Ready for next entry signal`,
+   holding?`<div class="session-stat-grid">
+     <div><span>Asset</span><b>${esc(bot.symbol)}</b></div>
+     <div><span>Units held</span><b class="mono">${qtyText(book.qty)}</b></div>
+     <div><span>Average entry</span><b class="mono">${usd(avgCost)}</b></div>
+     <div><span>Live mark</span><b class="mono">${usd(book.mark)}</b></div>
+     <div><span>Market value</span><b class="mono">${usd(mktValue)}</b></div>
+     <div><span>Open P&amp;L</span><b class="mono ${color(book.unrealized)}">${usd(book.unrealized)}${unrealPct!==null?` (${pct(unrealPct)})`:''}</b></div>
+   </div>`:empty('No open position held by this bot.'),liquidateBtns,'session-position-panel');
+ const evalCard=panel('Latest bar evaluation',bot.lastEvaluation?`${stamp(bot.lastEvaluation.t)} · Mark ${usd(bot.lastEvaluation.price)}`:'Waiting for next closed '+esc(tfLabel)+' bar',
+   bot.lastEvaluation?`<div class="session-eval-body"><p>${esc(bot.lastEvaluation.rationale)}</p>${badge(bot.lastEvaluation.direction)}</div>`:empty(botStatus(bot)),'','session-eval-panel');
+ const topUpForm=form('topup-bot',numeric('Top-up additional funds (USD)','addFunds','',1,1e9),submit('Add funds',!online));
+ const fundForm=bot.desired==='running'&&bot.budget
+   ? topUpForm
+   : form('fund-bot',select('Strategy version','version',[['','Choose a strategy version'],...versions],selectedVersion,true)+numeric('Bot budget (USD)','budget',fundBudget??bot.budget??'',1,1e9),
+       submit(bot.desired==='running'?'Set budget':bot.desired==='paused'?'Resume with budget':'Start bot',!online))+(bot.budget?topUpForm:'');
+ const sizingDesc=!strategy?'—':strategy.sizeMode==='risk'?`Risk ${strategy.riskPct??1}% / trade`:strategy.sizeMode==='usd'?`Fixed ${usd(strategy.sizeUsd)}`:`${strategy.size}% equity (max ${strategy.exposure}%)`;
+ const stopDesc=!strategy?'—':`-${strategy.stop}% max${strategy.candleStop?' · Pattern-tail':''}${strategy.trailingStop?` · Trail ${strategy.trailingStop}%`:''}`;
+ const guardrails=strategy?panel('Strategy guardrails',`${esc(modeLabel)} · ${esc(tfLabel)} candles`,
+   `<dl class="session-facts">
+     <div><dt>Sizing</dt><dd>${esc(sizingDesc)}</dd></div>
+     <div><dt>Protective stop</dt><dd>${esc(stopDesc)}</dd></div>
+     <div><dt>Take-profit / Daily cap</dt><dd>+${num(strategy.take)}% · -${num(strategy.dailyLoss)}% day</dd></div>
+     <div><dt>Filters</dt><dd>${[strategy.htfEma?`HTF EMA(${strategy.htfEma})`:'',strategy.minAdx?`ADX ≥ ${strategy.minAdx}`:'',strategy.antiChase?'Anti-Chase':'',strategy.ai?'AI active':''].filter(Boolean).join(' · ')||'Standard'}</dd></div>
+     <div><dt>Started / Last bar</dt><dd>${stamp(bot.started)} · ${stamp(bot.lastBar)}</dd></div>
+   </dl>`+
+   (!['ai_notepad','ai_autonomous'].includes(strategy.mode)?`<div class="session-card-foot">${link('Backtest v'+bot.version,'backtesting?version='+encodeURIComponent(key(bot)))}</div>`:''),'','session-guardrails'):'';
  const personalKey=state.botAiKeys?.[bot.id];
- const advKeyBox=`<details class="form" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--line)"><summary style="cursor:pointer;font-weight:600;font-size:.88rem;color:var(--text);display:flex;align-items:center;justify-content:space-between;gap:8px"><span>Advanced: Personal Bot API Key</span>${badge(personalKey?personalKey.provider+' · '+personalKey.masked:'Fallback to main key',personalKey?'good':'')}</summary><div style="margin-top:10px"><small style="display:block;margin-bottom:8px;color:var(--muted)">Assign this bot its own dedicated Gemini or OpenAI key so it never shares rate limits with other bots. Leave empty to fall back to your main key.</small><form id="per-bot-ai-key" data-bot="${esc(bot.id)}" class="form"><div class="fields">${select('Provider','provider',[['Gemini','Google Gemini'],['OpenAI','OpenAI']],personalKey?.provider??'Gemini',true)}${field('Model (optional)','model',personalKey?.model??'','maxlength="80" placeholder="e.g. gemini-3.5-flash"')}${field('Personal API Key','key','','type="password" autocomplete="off" maxlength="300" placeholder="'+(personalKey?'Enter new key to replace':'Paste dedicated API key')+'"')}</div><div class="actions">${submit('Save bot key',!online)}${btn('Test key','test-per-bot-ai-key',bot.id,false,!online?'disabled':'')}${personalKey?btn('Use main key','remove-per-bot-ai-key',bot.id,false,`style="color:#ff8191;border-color:#592e42" ${!online?'disabled':''}`):''}</div></form></div></details>`;
- const deleteControl=`<div class="form" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--line)"><div class="actions">${btn('Delete bot','open-delete-bot',bot.id,false,`style="background:#39212e;color:#ff8191;border-color:#592e42" ${!online?'disabled':''}`)}</div><small style="color:var(--muted)">Choose whether to liquidate any open position or leave it open when deleting.</small></div>`;
- const positionRows=holding?[[esc(bot.symbol),qtyText(book.qty),book.complete?usd(book.cost/book.qty):'—',usd(book.mark),
-   Number.isFinite(book.mark)?usd(book.qty*book.mark):'—',moneyChange(book.unrealized)]]:[];
- const filled=botOrders.filter(order=>order.filled>0);
- return page('Paper bot session',esc(bot.name),esc(bot.symbol)+' · Strategy v'+bot.version+' · '+esc(state.mode==='demo'?'Demo paper trading':'Alpaca Paper'),back)+
-   (source?'<div class="notice">Rules copied from '+esc(version(source.id+'@'+source.version)?.name??'saved strategy')+' · '+esc(source.symbol)+' · v'+source.version+'</div>':'')+
-   (!online?'<div class="notice">Showing cached bot activity · '+syncLabel()+'</div>':'')+
-   '<div class="metrics">'+metric('Allocated budget',usd(bot.budget),usd(book.available)+' available for new buys','wallet')+
-   metric('Amount invested',book.complete?usd(book.invested):'—','Cost basis of the open position','portfolio')+
-   metric('Realized P&L',moneyChange(realized),num(book.sellFills)+' sell fills · before fees','equity',true)+
-   metric('Unrealized P&L',moneyChange(book.unrealized),positionStatus,'equity',true)+'</div>'+
-   '<div class="stack">'+tradingView(bot.symbol,botOrders,holding?{qty:book.qty,entry:book.complete?book.cost/book.qty:null}:null,'Bot Trading View · Buy & Sell Markers')+'</div>'+
-   '<div class="grid equal">'+panel('Position',positionStatus,table(['Asset','Units held','Average cost','Mark','Market value','Open P&L'],positionRows,'No open position held by this bot.'))+
-   panel('Bot controls','Last evaluated '+stamp(bot.lastBar)+' · '+open.length+' open orders',
-     '<div class="form"><div class="actions">'+badge(botStatus(bot))+aiCallsBadge+'<small>Started '+stamp(bot.started)+'</small></div>'+
-     '<small>'+usd(book.reserved)+' reserved for pending buys</small></div>'+resyncControl+controls+liquidateControls+risk+advKeyBox+deleteControl)+'</div>'+
-   '<div class="stack">'+panel('Latest evaluation',bot.lastEvaluation?stamp(bot.lastEvaluation.t)+' · '+usd(bot.lastEvaluation.price):'Waiting for an evaluated bar',
-     bot.lastEvaluation?'<div class="bot-row"><span>'+esc(bot.lastEvaluation.rationale)+'</span>'+badge(bot.lastEvaluation.direction)+'</div>':empty(botStatus(bot)))+
-   panel('Orders and executions',`${filled.length} filled or partially filled orders · ${usd(book.bought)} bought · ${usd(book.sold)} sold`,
-     table(['Submitted','Asset','Side','Filled / requested','Average fill','Filled value','Status'],botOrders.map(o=>[
-       stamp(o.t),esc(o.symbol),badge(o.side),qtyText(o.filled)+' / '+qtyText(o.qty),usd(o.price),o.filled>0&&Number.isFinite(o.price)?usd(o.filled*o.price):'—',badge(o.status)
-     ]),'No orders yet.'))+
-   panel('Signal history','Trade decisions and AI holds for this bot.',
-     table(['Time','Direction','Rationale','Source'],signals.map(signal=>[
-       stamp(signal.t),badge(signal.direction),esc(signal.rationale)+(signal.knowledgeSources?.length?
-         '<small>References supplied to AI: '+esc(signal.knowledgeSources.join(', '))+'</small>':''),esc(signal.source)
-     ]),'No signals recorded for this bot yet.'))+'</div>';
+ const advKeyBox=`<details class="session-details"><summary><span>Personal Bot API Key</span>${badge(personalKey?personalKey.provider+' · '+personalKey.masked:'Main key',personalKey?'good':'')}</summary><div class="session-details-body"><small class="muted">Optional dedicated Gemini or OpenAI key so this bot never shares rate limits.</small><form id="per-bot-ai-key" data-bot="${esc(bot.id)}" class="form session-compact-form"><div class="fields session-key-fields">${select('Provider','provider',[['Gemini','Google Gemini'],['OpenAI','OpenAI']],personalKey?.provider??'Gemini',true)}${field('Model (optional)','model',personalKey?.model??'','maxlength="80" placeholder="e.g. gemini-3.5-flash"')}${field('Personal API Key','key','','type="password" autocomplete="off" maxlength="300" placeholder="'+(personalKey?'Enter new key to replace':'Paste dedicated API key')+'"')}</div><div class="actions">${submit('Save key',!online)}${btn('Test','test-per-bot-ai-key',bot.id,false,dis)}${personalKey?btn('Remove','remove-per-bot-ai-key',bot.id,false,`style="color:#ff8191;border-color:#592e42" ${dis}`):''}</div></form></div></details>`;
+ const deleteControl=`<div class="session-danger-zone"><div><b>Remove bot</b><small>Liquidate open ${esc(bot.symbol)} or leave it at the broker.</small></div>${btn('Delete bot','open-delete-bot',bot.id,false,`style="background:#39212e;color:#ff8191;border-color:#592e42" ${dis}`)}</div>`;
+ const controlsPanel=panel('Budget & controls',`${open.length} open order${open.length===1?'':'s'} · Started ${stamp(bot.started)}`,
+   fundForm+advKeyBox+deleteControl,'','session-controls-panel');
+ const tabBtns=`<div class="segmented" role="tablist" aria-label="Bot activity">${[['orders',`Orders & fills (${botOrders.length})`],['signals',`Signals (${signals.length})`]].map(([k,l])=>`<button type="button" class="${sessionTab===k?'selected':''}" data-action="session-tab" data-value="${k}" role="tab" aria-selected="${sessionTab===k}">${l}</button>`).join('')}</div>`;
+ const ordersTable=table(['Submitted','Side','Filled / req','Avg fill','Value','P&L','Status'],botOrders.map(o=>[
+   stamp(o.t),badge(o.side),`<span class="mono">${qtyText(o.filled)} / ${qtyText(o.qty)}</span>`,usd(o.price),
+   o.filled>0&&Number.isFinite(o.price)?usd(o.filled*o.price):'—',
+   Number.isFinite(o.pnl)?`<span class="mono ${color(o.pnl)}">${usd(o.pnl)}</span>`:'—',
+   badge(o.status)
+ ]),'No orders submitted by this bot yet.');
+ const signalsTable=table(['Time','Decision','Rationale','Source'],signals.map(signal=>[
+   stamp(signal.t),badge(signal.direction),
+   `<div class="session-rationale">${esc(signal.rationale)}${signal.knowledgeSources?.length?'<small>Refs: '+esc(signal.knowledgeSources.join(', '))+'</small>':''}</div>`,
+   esc(signal.source)
+ ]),'No signals recorded for this bot yet.');
+ const activityPanel=panel(sessionTab==='orders'?'Orders & executions':'Signal & AI decision log',
+   sessionTab==='orders'?`${filled.length} filled · ${usd(book.bought)} bought · ${usd(book.sold)} sold`:'Closed-candle rule evaluations and AI rationale history',
+   sessionTab==='orders'?ordersTable:signalsTable,tabBtns,'session-activity-panel');
+ return `<div class="session-page">
+   ${hero}
+   ${source?`<div class="notice">Rules copied from ${esc(version(source.id+'@'+source.version)?.name??'saved strategy')} · ${esc(source.symbol)} · v${source.version}</div>`:''}
+   ${!online?`<div class="notice">Showing cached bot activity · ${syncLabel()}</div>`:''}
+   ${resyncAlert}${aiErrorAlert}
+   ${kpis}
+   <div class="session-workbench">
+     <div class="session-main">
+       ${tradingView(bot.symbol,botOrders,holding?{qty:book.qty,entry:avgCost}:null,'Bot Trading View · Buy & Sell Markers')}
+       ${evalCard}
+       ${positionCard}
+     </div>
+     <aside class="session-rail">
+       ${controlsPanel}
+       ${guardrails}
+     </aside>
+   </div>
+   ${activityPanel}
+ </div>`;
 }
 const catalogTypes={us_equity:'US equities & ETFs',crypto:'Spot crypto',us_option:'US options',crypto_perp:'Crypto perpetuals',treasury:'Treasuries',corporate:'Corporate bonds',global_equity:'Global equities',us_index:'US indices',us_equity_chain:'US equity chains',ipo:'IPOs'};
 let catalogSearch={query:'',assetClass:'',offset:0},catalogResults=null,catalogLoading=false,catalogError='';
@@ -1583,6 +1660,9 @@ document.addEventListener('click',async event=>{
  if(action==='tv-style')tvStyle=value;
  if(action==='tv-range')tvRange=value;
  if(action==='tv-bot')tvBotId=value;
+ if(action==='session-tab'){sessionTab=value;render(true);return}
+ if(action==='open-bot-strategy'){const s=version(value);if(s){editor=structuredClone(s);playbookLibraryOpen=false;location.hash='strategies'}return}
+ if(action==='open-bot-logs'){logFilter.bot=value;logFilter.category='all';location.hash='logs';return}
  if(action==='log-cat'){logFilter.category=value;render(true);return}
  if(action==='log-bot'){logFilter.bot=value;logFilter.category='all';render(true);return}
  if(action==='toggle-logs-live'){logsLive=!logsLive;toast(logsLive?'Live log stream resumed.':'Live log stream paused.');render(true);return}
