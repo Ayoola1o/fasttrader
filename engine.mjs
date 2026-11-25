@@ -31,13 +31,13 @@ function entryQty(budget, price, rules) {
 
 export const timeframes = { '1Min': 60000, '5Min': 300000, '15Min': 900000, '1Hour': 3600000 };
 export const strategyModes = ['momentum', 'mean_reversion', 'breakout', 'custom', 'ai_notepad', 'ai_autonomous'];
-export const ruleIndicators = ['close', 'sma', 'ema', 'rsi', 'bb_upper', 'bb_lower', 'macd', 'macd_signal', 'donchian_high', 'donchian_low', 'atr', 'volume', 'avg_volume', 'pct_change', 'number'];
+export const ruleIndicators = ['close', 'sma', 'ema', 'rsi', 'adx', 'vwap', 'bb_upper', 'bb_lower', 'bb_width', 'keltner_upper', 'keltner_lower', 'macd', 'macd_signal', 'donchian_high', 'donchian_low', 'atr', 'volume', 'avg_volume', 'rvol', 'pct_change', 'number'];
 export const ruleOperators = ['gt', 'lt', 'gte', 'lte', 'crosses_above', 'crosses_below'];
 
 export const defaults = {
   name: 'Momentum Alpha', symbol: 'SPY', mode: 'momentum', timeframe: '1Min', period: 12, entry: 0.1, exit: -0.1,
   sizeMode: 'percent', size: 10, sizeUsd: 500, exposure: 20, dailyLoss: 3, stop: 2, take: 4, trailingStop: 0,
-  atrStop: 0, cooldown: 5, maxHoldBars: 0, htfEma: 0, ai: false, aiPrompt: '', aiNotes: '',
+  atrStop: 0, cooldown: 5, maxHoldBars: 0, htfEma: 0, minAdx: 0, ai: false, aiPrompt: '', aiNotes: '',
   aiWakeMode: 'smart', aiRiskProfile: 'balanced', aiSizing: 'dynamic', aiDailyCap: 100, rules: null
 };
 
@@ -90,17 +90,82 @@ export function computeATR(bars, period = 14) {
 
 export function computeRSI(closes, period = 14) {
   if (!Array.isArray(closes) || closes.length < 2) return null;
-  const slice = closes.slice(-(period + 1));
+  const slice = closes.slice(-Math.max(period + 1, period * 6 + 1));
+  const seedLen = Math.min(period, slice.length - 1);
   let gains = 0, losses = 0;
-  for (let i = 1; i < slice.length; i++) {
+  for (let i = 1; i <= seedLen; i++) {
     const diff = slice[i] - slice[i - 1];
     if (diff > 0) gains += diff;
     else losses -= diff;
   }
-  const n = slice.length - 1;
-  const avgGain = gains / n, avgLoss = losses / n;
+  let avgGain = gains / seedLen, avgLoss = losses / seedLen;
+  for (let i = seedLen + 1; i < slice.length; i++) {
+    const diff = slice[i] - slice[i - 1];
+    const g = diff > 0 ? diff : 0;
+    const l = diff < 0 ? -diff : 0;
+    avgGain = (avgGain * (period - 1) + g) / period;
+    avgLoss = (avgLoss * (period - 1) + l) / period;
+  }
   if (avgLoss === 0) return avgGain === 0 ? 50 : 100;
   return 100 - 100 / (1 + avgGain / avgLoss);
+}
+
+export function computeADX(bars, period = 14) {
+  if (!Array.isArray(bars) || bars.length <= period) return null;
+  const slice = bars.slice(-Math.max(period * 3 + 1, period + 2));
+  const tr = [], pdm = [], mdm = [];
+  for (let i = 1; i < slice.length; i++) {
+    const cur = slice[i], prev = slice[i - 1];
+    const h = Number.isFinite(cur.h) ? cur.h : Math.max(cur.o, cur.c);
+    const l = Number.isFinite(cur.l) ? cur.l : Math.min(cur.o, cur.c);
+    const ph = Number.isFinite(prev.h) ? prev.h : Math.max(prev.o, prev.c);
+    const pl = Number.isFinite(prev.l) ? prev.l : Math.min(prev.o, prev.c);
+    const up = h - ph, down = pl - l;
+    pdm.push(up > down && up > 0 ? up : 0);
+    mdm.push(down > up && down > 0 ? down : 0);
+    tr.push(Math.max(h - l, Math.abs(h - prev.c), Math.abs(l - prev.c)));
+  }
+  if (tr.length < period) return null;
+  let sTr = tr.slice(0, period).reduce((a, b) => a + b, 0);
+  let sPdm = pdm.slice(0, period).reduce((a, b) => a + b, 0);
+  let sMdm = mdm.slice(0, period).reduce((a, b) => a + b, 0);
+  const dxList = [];
+  const pushDx = () => {
+    if (sTr <= 0) { dxList.push(0); return; }
+    const pdi = 100 * (sPdm / sTr), mdi = 100 * (sMdm / sTr);
+    const denom = pdi + mdi;
+    dxList.push(denom > 0 ? 100 * Math.abs(pdi - mdi) / denom : 0);
+  };
+  pushDx();
+  for (let i = period; i < tr.length; i++) {
+    sTr = sTr - sTr / period + tr[i];
+    sPdm = sPdm - sPdm / period + pdm[i];
+    sMdm = sMdm - sMdm / period + mdm[i];
+    pushDx();
+  }
+  if (dxList.length < period) return dxList.reduce((a, b) => a + b, 0) / dxList.length;
+  let adx = dxList.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < dxList.length; i++) adx = (adx * (period - 1) + dxList[i]) / period;
+  return adx;
+}
+
+export function computeVWAP(bars) {
+  if (!Array.isArray(bars) || !bars.length) return null;
+  const sessionDay = String(bars.at(-1).t ?? '').slice(0, 10);
+  let pv = 0, vol = 0, sumPrice = 0, count = 0;
+  for (let i = bars.length - 1; i >= 0; i--) {
+    const b = bars[i];
+    if (sessionDay && String(b.t ?? '').slice(0, 10) !== sessionDay && count >= 5) break;
+    const h = Number.isFinite(b.h) ? b.h : Math.max(b.o, b.c);
+    const l = Number.isFinite(b.l) ? b.l : Math.min(b.o, b.c);
+    const typical = Number.isFinite(b.vw) && b.vw > 0 ? b.vw : (h + l + b.c) / 3;
+    const v = Number.isFinite(b.v) && b.v > 0 ? b.v : 0;
+    pv += typical * v;
+    vol += v;
+    sumPrice += typical;
+    count++;
+  }
+  return vol > 0 ? pv / vol : (count > 0 ? sumPrice / count : null);
 }
 
 export function computeEMA(values, period) {
@@ -145,14 +210,27 @@ export function indicatorValue(bars, spec, offset = 0) {
     }
     case 'ema': return computeEMA(closes, period);
     case 'rsi': return closes.length > period ? computeRSI(closes, period) : null;
+    case 'adx': return slice.length > period ? computeADX(slice, period) : null;
+    case 'vwap': return computeVWAP(slice);
     case 'bb_upper':
-    case 'bb_lower': {
+    case 'bb_lower':
+    case 'bb_width': {
       if (closes.length < period) return null;
       const w = closes.slice(-period);
       const mean = w.reduce((s, v) => s + v, 0) / period;
       const std = Math.sqrt(w.reduce((s, v) => s + (v - mean) ** 2, 0) / period);
       const mult = Number.isFinite(spec.mult) && spec.mult > 0 ? spec.mult : 2;
+      if (spec.indicator === 'bb_width') return mean > 0 ? 100 * (2 * mult * std) / mean : null;
       return spec.indicator === 'bb_upper' ? mean + mult * std : mean - mult * std;
+    }
+    case 'keltner_upper':
+    case 'keltner_lower': {
+      if (slice.length <= period) return null;
+      const mid = computeEMA(closes, period);
+      const atr = computeATR(slice, period);
+      if (mid === null || atr === null) return null;
+      const mult = Number.isFinite(spec.mult) && spec.mult > 0 ? spec.mult : 1.5;
+      return spec.indicator === 'keltner_upper' ? mid + mult * atr : mid - mult * atr;
     }
     case 'macd': return computeMACD(closes)?.macd ?? null;
     case 'macd_signal': return computeMACD(closes)?.signal ?? null;
@@ -165,10 +243,13 @@ export function indicatorValue(bars, spec, offset = 0) {
         : Math.min(...prior.map(b => Number.isFinite(b.l) ? b.l : Math.min(b.o, b.c)));
     }
     case 'atr': return slice.length > period ? computeATR(slice, period) : null;
-    case 'avg_volume': {
+    case 'avg_volume':
+    case 'rvol': {
       if (slice.length < period) return null;
       const w = slice.slice(-period).map(b => b.v ?? 0);
-      return w.reduce((s, v) => s + v, 0) / period;
+      const avg = w.reduce((s, v) => s + v, 0) / period;
+      if (spec.indicator === 'rvol') return avg > 0 ? (last.v ?? 0) / avg : 1;
+      return avg;
     }
     case 'pct_change': {
       if (closes.length <= period) return null;
@@ -209,11 +290,13 @@ export function ruleWarmupBars(s) {
   let max = s.mode === 'custom' && all.length ? 2 : (s.period ?? 12);
   if (s.mode === 'breakout') max++;
   if (s.atrStop > 0) max = Math.max(max, Math.min(14, s.period) + 1);
+  if (s.minAdx > 0) max = Math.max(max, 16);
   for (const r of all) {
     for (const side of [r.left, r.right]) {
       if (!side) continue;
       if (side.indicator === 'macd' || side.indicator === 'macd_signal') max = Math.max(max, 36);
-      else if (side.indicator !== 'number' && side.indicator !== 'close' && side.indicator !== 'volume') {
+      else if (side.indicator === 'adx') max = Math.max(max, (side.period ?? 14) + 2);
+      else if (!['number', 'close', 'volume', 'vwap'].includes(side.indicator)) {
         max = Math.max(max, (side.period ?? 14) + 2);
       }
     }
@@ -285,7 +368,7 @@ function sanitizeRuleSpec(spec) {
     return { indicator: 'number', value: spec.value };
   }
   const out = { indicator: spec.indicator };
-  if (!['close', 'volume', 'macd', 'macd_signal'].includes(spec.indicator)) {
+  if (!['close', 'volume', 'macd', 'macd_signal', 'vwap'].includes(spec.indicator)) {
     const p = spec.period ?? 14;
     if (!Number.isInteger(p) || p < 1 || p > 200) throw Error('Rule indicator period must be between 1 and 200.');
     out.period = p;
@@ -342,6 +425,9 @@ export function strategy(input, supportsSymbol = symbol => Object.hasOwn(instrum
   const htfEma = input.htfEma === undefined ? 0 : input.htfEma;
   if (!Number.isInteger(htfEma) || htfEma < 0 || htfEma > 200) throw Error('Invalid value for htfEma');
   result.htfEma = htfEma;
+  const minAdx = input.minAdx === undefined ? 0 : input.minAdx;
+  if (!Number.isInteger(minAdx) || minAdx < 0 || minAdx > 60) throw Error('Invalid value for minAdx');
+  result.minAdx = minAdx;
   const sizeMode = input.sizeMode === 'usd' ? 'usd' : 'percent';
   result.sizeMode = sizeMode;
   const sizeUsd = input.sizeUsd === undefined ? 500 : input.sizeUsd;
@@ -375,22 +461,66 @@ export function strategy(input, supportsSymbol = symbol => Object.hasOwn(instrum
   return result;
 }
 
+export function classifyRegime(bars) {
+  if (!Array.isArray(bars) || bars.length < 5) {
+    return { regime: 'NEUTRAL', adx: null, rsi: null, rvol: null, vwap: null, squeeze: false };
+  }
+  const closes = bars.map(b => b.c);
+  const last = closes.at(-1);
+  const adx = computeADX(bars, 14);
+  const rsi = computeRSI(closes, 14);
+  const vwap = computeVWAP(bars);
+  const rvol = indicatorValue(bars, { indicator: 'rvol', period: Math.min(20, bars.length) });
+  const ema20 = computeEMA(closes, Math.min(20, closes.length));
+  const ema50 = closes.length >= 50 ? computeEMA(closes, 50) : ema20;
+  const bbu = indicatorValue(bars, { indicator: 'bb_upper', period: 20 });
+  const bbl = indicatorValue(bars, { indicator: 'bb_lower', period: 20 });
+  const kcu = indicatorValue(bars, { indicator: 'keltner_upper', period: 20 });
+  const kcl = indicatorValue(bars, { indicator: 'keltner_lower', period: 20 });
+  const squeezeNow = bbu !== null && kcu !== null && bbu < kcu && bbl > kcl;
+  const prevBbu = indicatorValue(bars, { indicator: 'bb_upper', period: 20 }, 1);
+  const prevBbl = indicatorValue(bars, { indicator: 'bb_lower', period: 20 }, 1);
+  const prevKcu = indicatorValue(bars, { indicator: 'keltner_upper', period: 20 }, 1);
+  const prevKcl = indicatorValue(bars, { indicator: 'keltner_lower', period: 20 }, 1);
+  const squeezePrev = prevBbu !== null && prevKcu !== null && prevBbu < prevKcu && prevBbl > prevKcl;
+  let regime = 'NEUTRAL';
+  if (squeezePrev && !squeezeNow && bbu !== null && last > bbu) regime = 'SQUEEZE_BREAKOUT';
+  else if (squeezeNow) regime = 'VOLATILITY_SQUEEZE';
+  else if (adx !== null && adx < 20) regime = 'RANGE_CHOP';
+  else if (adx !== null && adx >= 22) regime = last >= (ema50 ?? ema20 ?? last) ? 'TRENDING_BULL' : 'TRENDING_BEAR';
+  return {
+    regime,
+    adx: adx !== null ? Number(adx.toFixed(1)) : null,
+    rsi: rsi !== null ? Number(rsi.toFixed(1)) : null,
+    rvol: rvol !== null ? Number(rvol.toFixed(2)) : null,
+    vwap: vwap !== null ? Number(vwap.toFixed(4)) : null,
+    squeeze: squeezeNow
+  };
+}
+
 export function shouldWakeAutonomousAI(bars, lastWakeAt = 0, now = Date.now()) {
   if (!lastWakeAt) return { wake: true, trigger: 'Initial market scan' };
-  if (now - lastWakeAt >= 30 * 60000) return { wake: true, trigger: '30m periodic check-in' };
   if (!Array.isArray(bars) || bars.length < 2) return { wake: false, trigger: 'Waiting for bars' };
+  const reg = classifyRegime(bars);
+  if (reg.regime === 'SQUEEZE_BREAKOUT') return { wake: true, trigger: 'Volatility squeeze breakout' };
   const last = bars.at(-1), prev = bars.at(-2);
   const moveOpen = last.o > 0 ? Math.abs(100 * (last.c / last.o - 1)) : 0;
   const movePrev = prev.c > 0 ? Math.abs(100 * (last.c / prev.c - 1)) : 0;
-  if (Math.max(moveOpen, movePrev) >= 0.5) return { wake: true, trigger: `Price move ${Math.max(moveOpen, movePrev).toFixed(2)}%` };
-  const rsi = computeRSI(bars.map(b => b.c), 14);
-  if (rsi !== null && (rsi <= 35 || rsi >= 65)) return { wake: true, trigger: `RSI(14) at ${rsi.toFixed(1)}` };
+  const maxMove = Math.max(moveOpen, movePrev);
+  const lowAdxChop = reg.adx !== null && reg.adx < 18;
+  const moveThreshold = lowAdxChop ? 0.8 : 0.5;
+  if (maxMove >= moveThreshold) return { wake: true, trigger: `Price move ${maxMove.toFixed(2)}%` };
+  if (reg.rsi !== null && (reg.rsi <= 32 || reg.rsi >= 68 || (!lowAdxChop && (reg.rsi <= 35 || reg.rsi >= 65)))) {
+    return { wake: true, trigger: `RSI(14) at ${reg.rsi.toFixed(1)}` };
+  }
   const vols = bars.slice(-21, -1).map(b => b.v ?? 0).filter(v => v > 0);
   if (vols.length >= 5 && (last.v ?? 0) > 0) {
     const avgVol = vols.reduce((a, b) => a + b, 0) / vols.length;
     if (avgVol > 0 && last.v >= avgVol * 1.8) return { wake: true, trigger: `Volume spike ${(last.v / avgVol).toFixed(1)}x` };
   }
-  return { wake: false, trigger: 'Quiet market (Smart Wake-Up)' };
+  const periodicMs = lowAdxChop ? 60 * 60000 : 30 * 60000;
+  if (now - lastWakeAt >= periodicMs) return { wake: true, trigger: lowAdxChop ? '60m chop check-in' : '30m periodic check-in' };
+  return { wake: false, trigger: lowAdxChop ? `Skipping low-ADX chop (ADX ${reg.adx})` : 'Quiet market (Smart Wake-Up)' };
 }
 
 export function decision(s, closes, account, position, price, rules = isCrypto(s.symbol) ? cryptoReplayRules : null, options = {}) {
@@ -461,6 +591,10 @@ export function decision(s, closes, account, position, price, rules = isCrypto(s
     const htfClose = options.htfBars.at(-1)?.c;
     if (Number.isFinite(htfEmaVal) && Number.isFinite(htfClose) && htfClose < htfEmaVal) return null;
   }
+  if (s.minAdx > 0) {
+    const adxVal = computeADX(evalBars, 14);
+    if (adxVal !== null && adxVal < s.minAdx) return null;
+  }
   if (mode === 'ai_notepad' || mode === 'ai_autonomous') {
     const sizeCap = s.sizeMode === 'usd' && Number.isFinite(s.sizeUsd) ? s.sizeUsd : account.equity * s.size / 100;
     const budget = mode === 'ai_autonomous'
@@ -481,6 +615,10 @@ export function decision(s, closes, account, position, price, rules = isCrypto(s
 
 export function entrySignal(s, evalBars) {
   if (evalBars.length < ruleWarmupBars(s)) return null;
+  if (s.minAdx > 0) {
+    const adxVal = computeADX(evalBars, 14);
+    if (adxVal !== null && adxVal < s.minAdx) return null;
+  }
   const closes = evalBars.map(bar => bar.c);
   let rationale = null;
   if (s.rules?.entry?.length) {

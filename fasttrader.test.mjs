@@ -9,7 +9,7 @@ import { runInNewContext } from 'node:vm';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { defaults, decision, replay, downsampleCurve, botLedger, contiguousBars, aggregateBars, closedStrategyBars, computeATR, strategy, strategyWindow, evaluateRuleSet, shouldWakeAutonomousAI } from './engine.mjs';
+import { defaults, decision, replay, downsampleCurve, botLedger, contiguousBars, aggregateBars, closedStrategyBars, computeATR, computeADX, computeVWAP, classifyRegime, indicatorValue, strategy, strategyWindow, evaluateRuleSet, shouldWakeAutonomousAI } from './engine.mjs';
 import { signalProvider, assessSignal } from './signal-ai.mjs';
 import { createTelegram } from './telegram.mjs';
 import { handleBridge } from './api/bridge.js';
@@ -139,6 +139,18 @@ test('replay avoids same-bar trailing-stop look-ahead bias, computes quant metri
   const wfRes = replay({ ...defaults, period: 2, entry: 0 }, wfBars, { capital: 10000, fees: 0, slippage: 0 });
   assert.ok(wfRes.metrics.walkForward?.inSample);
   assert.ok(wfRes.metrics.walkForward?.outOfSample);
+  // Wilder ADX, Session VWAP, Keltner, RVOL, classifyRegime, and minAdx chop guard
+  assert.ok(computeADX(wfBars, 14) > 25);
+  assert.ok(computeVWAP(wfBars) > 100);
+  assert.ok(indicatorValue(wfBars, { indicator: 'keltner_upper', period: 20 }) > wfBars[10].c);
+  assert.equal(indicatorValue(wfBars, { indicator: 'rvol', period: 20 }), 1);
+  assert.equal(classifyRegime(wfBars).regime, 'TRENDING_BULL');
+  const flatChop = Array.from({ length: 25 }, (_, i) => ({
+    t: new Date(Date.parse('2026-10-01T12:00:00Z') + i * 60000).toISOString(),
+    o: 100, h: 100.2, l: 99.8, c: i % 2 === 0 ? 100.1 : 99.9, v: 500
+  }));
+  const chopProtected = strategy({ ...defaults, period: 2, entry: 0, minAdx: 22 });
+  assert.equal(decision(chopProtected, flatChop.map(b => b.c), { equity: 10000, cash: 10000, dayStart: 10000, exposure: 0 }, null, 100.1, null, { warmedUp: true, bars: flatChop }), null);
 });
 
 test('contiguous candle warmup blocks gapped entries while allowing protective exits and stop-loss cooldown', () => {

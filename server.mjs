@@ -2,7 +2,7 @@ import { replayPortfolio, createPaperPortfolio, stepPaperPortfolio, paperPortfol
 import { createServer } from 'node:http';
 import { readFile, mkdir, writeFile, rename } from 'node:fs/promises';
 import { randomUUID, createHash, createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
-import { instruments, defaults, strategy, decision, replay, downsampleCurve, synthetic, botLedger, isCrypto, cryptoReplayRules, roundDown, strategyWindow, entrySignal, evaluateRuleSet, aggregateBars, closedStrategyBars, computeATR, computeRSI, indicatorValue, timeframes, ruleWarmupBars, shouldWakeAutonomousAI } from './engine.mjs';
+import { instruments, defaults, strategy, decision, replay, downsampleCurve, synthetic, botLedger, isCrypto, cryptoReplayRules, roundDown, strategyWindow, entrySignal, evaluateRuleSet, aggregateBars, closedStrategyBars, computeATR, computeRSI, computeADX, computeVWAP, classifyRegime, indicatorValue, timeframes, ruleWarmupBars, shouldWakeAutonomousAI } from './engine.mjs';
 import { assessSignal, signalProvider, testProviderKey, defaultGeminiModel } from './signal-ai.mjs';
 import { createAuth, sameSecret } from './auth.mjs';
 import { createStore } from './store.mjs';
@@ -140,6 +140,31 @@ for (const signal of state.signals.filter(item => !item.strategyId)) {
   const matches = state.strategies.filter(item => item.name === signal.strategy && item.symbol === signal.symbol && item.version === signal.version);
   if (matches.length === 1) signal.strategyId = matches[0].id;
 }
+function backfillOrderPnl() {
+  const chronological = state.orders
+    .filter(o => o.filled > 0 && Number.isFinite(o.price) && o.price > 0)
+    .toSorted((a, b) => Date.parse(a.filledAt ?? a.t ?? 0) - Date.parse(b.filledAt ?? b.t ?? 0));
+  const books = new Map();
+  for (const o of chronological) {
+    const k = (o.strategyId ?? 'ext') + ':' + o.symbol;
+    const book = books.get(k) ?? { qty: 0, cost: 0 };
+    books.set(k, book);
+    if (o.side === 'buy') {
+      book.qty += o.filled;
+      book.cost += o.filled * o.price;
+    } else if (o.side === 'sell') {
+      if (!Number.isFinite(o.pnl) && book.qty > 1e-9) {
+        const avgEntry = book.cost / book.qty;
+        const matched = Math.min(o.filled, book.qty);
+        o.pnl = Number((matched * (o.price - avgEntry)).toFixed(4));
+      }
+      const used = book.qty > 0 ? book.cost * Math.min(1, o.filled / book.qty) : 0;
+      book.qty = Math.max(0, book.qty - o.filled);
+      book.cost = Math.max(0, book.cost - used);
+    }
+  }
+}
+backfillOrderPnl();
 state.logs = Array.isArray(state.logs) ? state.logs.slice(0, 300) : [];
 state.feed = state.cryptoFeed = state.broker = 'connecting';
 state.cryptoSessionOpen = false;
@@ -368,18 +393,23 @@ function normalize(order) {
 }
 function updateOrder(order) {
   const prior = state.orders.find(item => item.client === order.client);
-  if (order.status === 'filled' && prior?.status !== 'filled') {
-    const botName = order.strategy ?? prior?.strategy;
-    const val = Number.isFinite(order.price) && order.filled > 0 ? `$${(order.filled * order.price).toFixed(2)}` : '';
-    const details = [
-      botName ? `Bot: ${botName}` : null,
-      Number.isFinite(order.price) ? `Filled: ${order.filled} @ $${order.price.toFixed(4)} ${val ? '(' + val + ')' : ''}` : null,
-      Number.isFinite(order.pnl) ? `Realized P&L: ${order.pnl >= 0 ? '+' : ''}$${order.pnl.toFixed(2)}` : null
-    ];
-    event('fills', `${order.side.toUpperCase()} filled · ${order.symbol}`, details);
-  }
+  const newlyFilled = order.status === 'filled' && prior?.status !== 'filled';
   if (prior) Object.assign(prior, order);
   else state.orders.unshift(order);
+  const target = prior ?? order;
+  if (target.side === 'sell' && target.filled > 0 && Number.isFinite(target.price) && !Number.isFinite(target.pnl)) {
+    backfillOrderPnl();
+  }
+  if (newlyFilled) {
+    const botName = target.strategy;
+    const val = Number.isFinite(target.price) && target.filled > 0 ? `$${(target.filled * target.price).toFixed(2)}` : '';
+    const details = [
+      botName ? `Bot: ${botName}` : null,
+      Number.isFinite(target.price) ? `Filled: ${target.filled} @ $${target.price.toFixed(4)} ${val ? '(' + val + ')' : ''}` : null,
+      Number.isFinite(target.pnl) ? `Realized P&L: ${target.pnl >= 0 ? '+' : ''}$${target.pnl.toFixed(2)}` : null
+    ];
+    event('fills', `${target.side.toUpperCase()} filled · ${target.symbol}`, details);
+  }
   if (state.orders.length > 1000) {
     const keep = state.orders.filter(item => !terminal.has(item.status) || (item.strategyId && Object.hasOwn(state.bots, item.strategyId)));
     const other = state.orders.filter(item => terminal.has(item.status) && !(item.strategyId && Object.hasOwn(state.bots, item.strategyId)));
@@ -675,12 +705,17 @@ async function completeAI(job) {
       ema20: indicatorValue(bars, { indicator: 'ema', period: 20 }),
       ema50: indicatorValue(bars, { indicator: 'ema', period: 50 }),
       rsi14: computeRSI(bars.map(b => b.c), 14),
+      adx14: computeADX(bars, 14),
+      vwap: computeVWAP(bars),
+      rvol20: indicatorValue(bars, { indicator: 'rvol', period: 20 }),
       macd: indicatorValue(bars, { indicator: 'macd' }),
       macdSignal: indicatorValue(bars, { indicator: 'macd_signal' }),
       bbUpper: indicatorValue(bars, { indicator: 'bb_upper', period: 20 }),
       bbLower: indicatorValue(bars, { indicator: 'bb_lower', period: 20 }),
+      keltnerUpper: indicatorValue(bars, { indicator: 'keltner_upper', period: 20 }),
       atr14: computeATR(bars, 14)
     } : undefined;
+    const regime = rich ? classifyRegime(bars) : undefined;
     const ledger = s.mode === 'ai_autonomous' ? botLedger(botOrders(bot.id), s.symbol, bot.budget) : null;
     const recentDecisions = s.mode === 'ai_autonomous'
       ? state.signals.filter(sig => sig.strategyId === bot.id).slice(0, 5).map(sig => ({ t: sig.t, side: sig.direction, rationale: sig.rationale }))
@@ -688,7 +723,7 @@ async function completeAI(job) {
     const knowledge = proposal.aiAutonomous ? strategyKnowledge(s, proposal.side, proposal.aiFreeRoam) : [];
     model = await assessSignal(provider, s.symbol, proposal.side, bars, fetch, {
       price, rationale: proposal.rationale, period: s.period, mode: s.mode ?? 'momentum', timeframe: s.timeframe ?? '1Min',
-      ...(proposal.aiAutonomous ? { aiAutonomous: true, aiNotes: s.aiNotes, indicators } : {}),
+      ...(proposal.aiAutonomous ? { aiAutonomous: true, aiNotes: s.aiNotes, indicators, regime } : {}),
       ...(proposal.aiFreeRoam ? {
         aiFreeRoam: true, aiRiskProfile: s.aiRiskProfile ?? 'balanced', aiSizing: s.aiSizing ?? 'dynamic',
         roundTripFeeBps: isCrypto(s.symbol) ? 50 : 2,
@@ -1049,7 +1084,7 @@ if (demo) {
   setInterval(refreshAdditionalAssets, 60000);
   connect('feed');
   connect('cryptoFeed');
-  for (const symbol of symbols) void seedHistory(symbol).catch(() => {});
+  for (const symbol of symbols) void seedHistory(symbol).catch(() => { });
 }
 async function cycle() {
   if (busy) return;
@@ -1111,7 +1146,7 @@ async function cycle() {
       if (telegram.configured && state.alerts.telegram !== false && state.alerts.digest !== false &&
         nowUtc.getUTCHours() >= 21 && state.lastDigestDay !== utcDay) {
         state.lastDigestDay = utcDay;
-        void telegram.post(buildDailyDigest()).catch(() => {});
+        void telegram.post(buildDailyDigest()).catch(() => { });
       }
       await persist(false);
     });
@@ -1540,8 +1575,10 @@ async function change(path, input) {
     if (input.action !== 'start' || current) throw Error('This workspace already has a paper portfolio, or the action is invalid.');
     const { strategies, config } = portfolioSettings(input);
     const [first] = strategies;
-    state.paperPortfolio = { ...createPaperPortfolio(strategies, config), running: true,
-      symbol: first.symbol, timeframe: first.timeframe ?? '1Min', started: Date.now(), lastBar: null };
+    state.paperPortfolio = {
+      ...createPaperPortfolio(strategies, config), running: true,
+      symbol: first.symbol, timeframe: first.timeframe ?? '1Min', started: Date.now(), lastBar: null
+    };
     return { running: true };
   }
   if (path === '/api/knowledge') {
@@ -1700,6 +1737,32 @@ async function change(path, input) {
       if (pause) { bot.desired = 'paused'; bot.status = 'paused'; }
       bot.lastEvaluation = { t: time(), price: latest, direction: 'sell', rationale: reason };
       return { order, qty, symbol };
+    }
+    if (input.resync === true) {
+      const bot = state.bots[input.id];
+      if (!bot) throw Error('Bot not found.');
+      const symbol = bot.symbol;
+      if (unresolvedFor(symbol)) throw Error('Wait for the pending ' + symbol + ' order to reconcile first.');
+      if (!demo) await reconcile();
+      const position = state.positions.find(p => p.symbol === symbol && p.qty > 0);
+      const brokerQty = position?.qty ?? 0;
+      const ledger = botLedger(botOrders(bot.id), symbol, bot.budget);
+      const diff = Number((brokerQty - ledger.qty).toFixed(9));
+      const tol = isCrypto(symbol) ? 1e-8 : 1e-6;
+      if (Math.abs(diff) > tol) {
+        const refPrice = position?.entry ?? position?.price ?? quotePrice(symbol, state.bars[symbol]?.at(-1)) ?? (ledger.qty > 0 && ledger.cost > 0 ? ledger.cost / ledger.qty : 1);
+        const nowIso = time();
+        state.orders.unshift({
+          client: 'ft-sync-' + randomUUID().slice(0, 12),
+          owned: true, reconciled: true, strategyId: bot.id, strategy: bot.name, version: bot.version,
+          symbol, side: diff > 0 ? 'buy' : 'sell', qty: Math.abs(diff), filled: Math.abs(diff),
+          status: 'filled', price: refPrice, limitPrice: null, filledAt: nowIso, t: nowIso, pnl: 0
+        });
+      }
+      bot.status = bot.desired === 'running' ? 'Running' : bot.desired;
+      bot.lastEvaluation = { t: time(), direction: 'hold', rationale: `Ledger re-synced to broker (${brokerQty} ${symbol})` };
+      logEntry('bot', 'good', `${bot.name} ledger re-synced (${brokerQty} ${symbol})`, { botId: bot.id, bot: bot.name, symbol });
+      return { bot, symbol, brokerQty };
     }
     if (input.killSwitch === true) {
       const liquidateAll = input.liquidateAll === true;
@@ -1995,8 +2058,10 @@ async function portfolioReplay(input) {
   const timeframe = first.timeframe ?? '1Min';
   const bars = closedStrategyBars(await history(first.symbol, end - 14 * 86400000, end, timeframe), timeframe, end);
   if (bars.length <= Math.max(...strategies.map(ruleWarmupBars))) throw Error('Insufficient closed candles for both strategies.');
-  return { symbol: first.symbol, timeframe, ...replayPortfolio(strategies, bars, config),
-    benchmarks: strategies.map(s => ({ name: s.name, ...replayPortfolio([s], bars, { ...config, split: 1 }) })) };
+  return {
+    symbol: first.symbol, timeframe, ...replayPortfolio(strategies, bars, config),
+    benchmarks: strategies.map(s => ({ name: s.name, ...replayPortfolio([s], bars, { ...config, split: 1 }) }))
+  };
 }
 
 async function backtest(input) {

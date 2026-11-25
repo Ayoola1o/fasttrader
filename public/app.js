@@ -413,6 +413,8 @@ function session(){
  const controls=bot.desired==='running'?'<div class="form"><div class="actions">'+command('Pause','paused')+command('Stop','stopped')+'</div></div>':
    bot.desired==='paused'?'<div class="form">'+command('Stop','stopped')+'</div>':'';
  const hasOpenPos=holding||state.positions.some(p=>p.symbol===bot.symbol&&p.qty>0);
+ const needsResync=bot.status==='Position differs from strategy fills'||!book.complete;
+ const resyncControl=needsResync?`<div class="notice" style="margin-bottom:8px;border-color:#6e5726;background:#2a2418;color:#ffd68a"><div style="margin-bottom:6px"><b>Ledger out of sync:</b> This bot’s fill ledger differs from your live broker position (e.g. from fee rounding or partial/external fills).</div>${btn('Re-sync ledger to broker','resync-bot',bot.id,true,!online?'disabled':'')}</div>`:'';
  const liquidateControls=hasOpenPos&&!open.some(o=>o.side==='sell')
    ?`<div class="form"><div class="actions">${btn('Close position','liquidate-bot',bot.id,false,`data-symbol="${esc(bot.symbol)}" data-pause="false" style="background:#39212e;color:#ff8191;border-color:#592e42" ${!online?'disabled':''}`)}${bot.desired==='running'?btn('Close &amp; Pause','liquidate-bot',bot.id,false,`data-symbol="${esc(bot.symbol)}" data-pause="true" style="background:#39212e;color:#ff8191;border-color:#592e42" ${!online?'disabled':''}`):''}</div></div>`:'';
  const topUpForm=form('topup-bot',numeric('Add additional funds (USD)','addFunds','',1,1e9),submit('Add funds to bot',!online));
@@ -436,7 +438,7 @@ function session(){
    '<div class="grid equal">'+panel('Position',positionStatus,table(['Asset','Units held','Average cost','Mark','Market value','Open P&L'],positionRows,'No open position held by this bot.'))+
    panel('Bot controls','Last evaluated '+stamp(bot.lastBar)+' · '+open.length+' open orders',
      '<div class="form"><div class="actions">'+badge(botStatus(bot))+aiCallsBadge+'<small>Started '+stamp(bot.started)+'</small></div>'+
-     '<small>'+usd(book.reserved)+' reserved for pending buys</small></div>'+controls+liquidateControls+risk+advKeyBox+deleteControl)+'</div>'+
+     '<small>'+usd(book.reserved)+' reserved for pending buys</small></div>'+resyncControl+controls+liquidateControls+risk+advKeyBox+deleteControl)+'</div>'+
    '<div class="stack">'+panel('Latest evaluation',bot.lastEvaluation?stamp(bot.lastEvaluation.t)+' · '+usd(bot.lastEvaluation.price):'Waiting for an evaluated bar',
      bot.lastEvaluation?'<div class="bot-row"><span>'+esc(bot.lastEvaluation.rationale)+'</span>'+badge(bot.lastEvaluation.direction)+'</div>':empty(botStatus(bot)))+
    panel('Orders and executions',`${filled.length} filled or partially filled orders · ${usd(book.bought)} bought · ${usd(book.sold)} sold`,
@@ -512,17 +514,17 @@ const notepadTemplates={
 };
 const tfOptions=[['1Min','1 Minute'],['5Min','5 Minutes'],['15Min','15 Minutes'],['1Hour','1 Hour']];
 const tfMsMap={'1Min':60000,'5Min':300000,'15Min':900000,'1Hour':3600000};
-const ruleIndLabels={close:'Close',sma:'SMA',ema:'EMA',rsi:'RSI',bb_upper:'BB Upper',bb_lower:'BB Lower',macd:'MACD',macd_signal:'MACD Signal',donchian_high:'Donchian High',donchian_low:'Donchian Low',atr:'ATR',volume:'Volume',avg_volume:'Avg Volume',pct_change:'% Change',number:'Number'};
-const leftIndicators=['close','sma','ema','rsi','bb_upper','bb_lower','macd','macd_signal','donchian_high','donchian_low','atr','volume','avg_volume','pct_change'];
-const rightIndicators=['number','close','sma','ema','rsi','bb_upper','bb_lower','macd','macd_signal','donchian_high','donchian_low','avg_volume'];
+const ruleIndLabels={close:'Close',sma:'SMA',ema:'EMA',rsi:'RSI',adx:'ADX',vwap:'Session VWAP',bb_upper:'BB Upper',bb_lower:'BB Lower',bb_width:'BB Width %',keltner_upper:'Keltner Upper',keltner_lower:'Keltner Lower',macd:'MACD',macd_signal:'MACD Signal',donchian_high:'Donchian High',donchian_low:'Donchian Low',atr:'ATR',volume:'Volume',avg_volume:'Avg Volume',rvol:'Rel Volume (RVOL)',pct_change:'% Change',number:'Number'};
+const leftIndicators=['close','sma','ema','rsi','adx','vwap','bb_upper','bb_lower','bb_width','keltner_upper','keltner_lower','macd','macd_signal','donchian_high','donchian_low','atr','volume','avg_volume','rvol','pct_change'];
+const rightIndicators=['number','close','sma','ema','vwap','rsi','adx','bb_upper','bb_lower','bb_width','keltner_upper','keltner_lower','macd','macd_signal','donchian_high','donchian_low','avg_volume'];
 const opLabels={gt:'>',lt:'<',gte:'≥',lte:'≤',crosses_above:'Crosses Above',crosses_below:'Crosses Below'};
-const noPeriodInd=new Set(['close','volume','macd','macd_signal','number']);
+const noPeriodInd=new Set(['close','volume','vwap','macd','macd_signal','number']);
 const strategyTemplates={
- ema_cross:{label:'EMA Crossover',name:'EMA 9/21 Crossover',mode:'custom',timeframe:'5Min',trailingStop:1.5,stop:2,take:5,rules:{entryLogic:'all',exitLogic:'any',entry:[{left:{indicator:'ema',period:9},op:'crosses_above',right:{indicator:'ema',period:21}}],exit:[{left:{indicator:'ema',period:9},op:'crosses_below',right:{indicator:'ema',period:21}}]}},
- trend_pullback:{label:'Trend Pullback',name:'Trend Pullback RSI',mode:'custom',timeframe:'5Min',trailingStop:1.5,stop:2,take:4.5,rules:{entryLogic:'all',exitLogic:'any',entry:[{left:{indicator:'close'},op:'gt',right:{indicator:'ema',period:50}},{left:{indicator:'rsi',period:14},op:'lt',right:{indicator:'number',value:38}}],exit:[{left:{indicator:'rsi',period:14},op:'gt',right:{indicator:'number',value:70}}]}},
- bb_reversion:{label:'Bollinger Reversion',name:'Bollinger RSI Dip',mode:'custom',timeframe:'5Min',trailingStop:0,stop:2.5,take:4,rules:{entryLogic:'all',exitLogic:'any',entry:[{left:{indicator:'close'},op:'lt',right:{indicator:'bb_lower',period:20}},{left:{indicator:'rsi',period:14},op:'lt',right:{indicator:'number',value:35}}],exit:[{left:{indicator:'close'},op:'gt',right:{indicator:'sma',period:20}}]}},
- donchian:{label:'Donchian Breakout',name:'Donchian 20 Breakout',mode:'custom',timeframe:'15Min',trailingStop:2,stop:2.5,take:6,rules:{entryLogic:'all',exitLogic:'any',entry:[{left:{indicator:'close'},op:'gt',right:{indicator:'donchian_high',period:20}}],exit:[{left:{indicator:'close'},op:'lt',right:{indicator:'donchian_low',period:10}}]}},
- crypto_swing:{label:'Crypto Swing 15m',name:'Crypto Fee-Safe Swing',mode:'custom',timeframe:'15Min',sizeMode:'usd',sizeUsd:500,trailingStop:1.8,stop:2.5,take:5.5,cooldown:4,rules:{entryLogic:'all',exitLogic:'any',entry:[{left:{indicator:'close'},op:'gt',right:{indicator:'ema',period:20}},{left:{indicator:'rsi',period:14},op:'gt',right:{indicator:'number',value:52}},{left:{indicator:'rsi',period:14},op:'lt',right:{indicator:'number',value:72}}],exit:[{left:{indicator:'close'},op:'crosses_below',right:{indicator:'ema',period:20}},{left:{indicator:'rsi',period:14},op:'gt',right:{indicator:'number',value:78}}]}}
+ squeeze_crypto:{label:'Crypto Squeeze 1H',name:'Crypto Volatility Squeeze',mode:'custom',timeframe:'1Hour',htfEma:50,minAdx:20,trailingStop:2.5,stop:3,take:10,cooldown:3,rules:{entryLogic:'all',exitLogic:'any',entry:[{left:{indicator:'close'},op:'gt',right:{indicator:'bb_upper',period:20}},{left:{indicator:'close'},op:'gt',right:{indicator:'keltner_upper',period:20}},{left:{indicator:'rvol',period:20},op:'gt',right:{indicator:'number',value:1.5}}],exit:[{left:{indicator:'close'},op:'lt',right:{indicator:'sma',period:20}}]}},
+ vwap_reclaim:{label:'Equity VWAP Reclaim',name:'Session VWAP Reclaim',mode:'custom',timeframe:'15Min',htfEma:50,minAdx:18,trailingStop:1.2,stop:1.5,take:4,cooldown:2,rules:{entryLogic:'all',exitLogic:'any',entry:[{left:{indicator:'close'},op:'crosses_above',right:{indicator:'vwap'}},{left:{indicator:'close'},op:'gt',right:{indicator:'ema',period:20}},{left:{indicator:'rsi',period:14},op:'gt',right:{indicator:'number',value:50}}],exit:[{left:{indicator:'close'},op:'crosses_below',right:{indicator:'vwap'}},{left:{indicator:'rsi',period:14},op:'gt',right:{indicator:'number',value:76}}]}},
+ rsi2_dip:{label:'Connors RSI(2) Dip',name:'Connors RSI(2) Pullback',mode:'custom',timeframe:'15Min',htfEma:50,minAdx:0,trailingStop:0,stop:2.5,take:4,cooldown:2,rules:{entryLogic:'all',exitLogic:'any',entry:[{left:{indicator:'close'},op:'gt',right:{indicator:'ema',period:200}},{left:{indicator:'rsi',period:2},op:'lt',right:{indicator:'number',value:12}}],exit:[{left:{indicator:'close'},op:'gt',right:{indicator:'sma',period:5}}]}},
+ donchian:{label:'Filtered Donchian',name:'Regime Donchian 20',mode:'custom',timeframe:'1Hour',htfEma:50,minAdx:22,trailingStop:2,stop:2.5,take:9,cooldown:2,rules:{entryLogic:'all',exitLogic:'any',entry:[{left:{indicator:'close'},op:'gt',right:{indicator:'donchian_high',period:20}},{left:{indicator:'rvol',period:20},op:'gt',right:{indicator:'number',value:1.3}}],exit:[{left:{indicator:'close'},op:'lt',right:{indicator:'donchian_low',period:10}}]}},
+ trend_pullback:{label:'Trend Pullback',name:'Trend Pullback RSI',mode:'custom',timeframe:'15Min',htfEma:50,minAdx:20,trailingStop:1.5,stop:2,take:4.5,rules:{entryLogic:'all',exitLogic:'any',entry:[{left:{indicator:'close'},op:'gt',right:{indicator:'ema',period:50}},{left:{indicator:'rsi',period:14},op:'lt',right:{indicator:'number',value:38}}],exit:[{left:{indicator:'rsi',period:14},op:'gt',right:{indicator:'number',value:70}}]}}
 };
 const specLabel=sp=>!sp?'—':sp.indicator==='number'?String(sp.value??0):noPeriodInd.has(sp.indicator)?(ruleIndLabels[sp.indicator]??sp.indicator):`${ruleIndLabels[sp.indicator]??sp.indicator}(${sp.period??14})`;
 function ensureRules(){editor.rules??={entryLogic:'all',exitLogic:'any',entry:[],exit:[]};return editor.rules}
@@ -565,7 +567,7 @@ function previewMarkup(result) {
 }
 
 function requestStrategyPreview(){
- const draft = Object.fromEntries(['name','symbol','mode','timeframe','sizeMode','rules',...fields.map(([,key])=>key)].map(key=>[key,editor[key]]));
+ const draft = Object.fromEntries(['name','symbol','mode','timeframe','sizeMode','htfEma','minAdx','rules',...fields.map(([,key])=>key)].map(key=>[key,editor[key]]));
  const key=JSON.stringify(draft);
  const unavailable=!online?'Connect to the worker to check closed candles.':!draft.symbol?'Select an instrument to preview closed candles.':'';
  if(unavailable){
@@ -715,7 +717,8 @@ function strategies(){
  const aiSection=check('Require AI confirmation for non-protective signals','ai',editor.ai)+
  field('Custom AI confirmation rule (optional)','aiPrompt',editor.aiPrompt??'','maxlength="300" placeholder="e.g. Veto buys if news is bearish or candle jumped >2%"')+
  '<small>'+(state.aiConfigured?esc(state.aiProvider ?? 'AI provider')+' configured (with live Alpaca News headlines). Historical replay uses deterministic rules.':'Configure a Gemini or OpenAI key in the server environment to enable AI confirmation.')+'</small>';
- const htfField=select('Higher-timeframe trend filter','htfEma',[['0','Off'],['20','1H Close > 1H EMA(20)'],['50','1H Close > 1H EMA(50)'],['100','1H Close > 1H EMA(100)']],String(editor.htfEma??0));
+ const htfField=select('Higher-timeframe trend filter','htfEma',[['0','Off'],['20','1H Close > 1H EMA(20)'],['50','1H Close > 1H EMA(50)'],['100','1H Close > 1H EMA(100)']],String(editor.htfEma??0))+
+   select('ADX chop guard (min trend strength)','minAdx',[['0','Off'],['18','ADX(14) ≥ 18 (Skip dead chop)'],['22','ADX(14) ≥ 22 (Recommended for breakouts)'],['25','ADX(14) ≥ 25 (Strong trends only)']],String(editor.minAdx??0));
  return workspace(group('Strategy setup',baseInputs+htfField)+group('Signal rules',templatesBar+'<div class="fields">'+indicators+'</div>'+ruleBuilder,'editor-flow')+
    group('AI confirmation',aiSection,'editor-flow')+group('Position sizing and risk',sizingMode+riskInputs),renderLiveDebugger());
 }
@@ -1266,6 +1269,7 @@ function capture(form){
  for(const [,k]of fields)if(data[k]!==undefined)data[k]=+data[k];
  if(data.aiDailyCap!==undefined)data.aiDailyCap=+data.aiDailyCap;
  if(data.htfEma!==undefined)data.htfEma=+data.htfEma;
+ if(data.minAdx!==undefined)data.minAdx=+data.minAdx;
  const changed=Object.entries({...data,ai:form.elements.ai.checked}).some(([k,v])=>editor[k]!==v);
  editor={...editor,...data,ai:form.elements.ai.checked,dirty:true,mutation:changed||!editor.dirty?crypto.randomUUID():editor.mutation};
  if(!authInfo?.required)write('ft-draft',editor);
@@ -1370,6 +1374,17 @@ document.addEventListener('click',async event=>{
  if(action==='close-notifs'){notifOpen=false;chrome();return}
  if(action==='notif-filter'){notifFilter=value;renderNotifDrawer();return}
  if(action==='mark-notifs-read'){if(state.events?.[0])lastSeenNotif=state.events[0].t;chrome();toast('Notifications marked read.');return}
+ if(action==='resync-bot'){
+   if(!online||pending){toast('The workspace is reconnecting.');return}
+   pending=true;el.disabled=true;
+   try{
+     const res=await api('bot',{resync:true,id:value});
+     toast(`Re-synced ledger to broker (${qtyText(res.brokerQty)} ${res.symbol}).`);
+     await refresh(true);
+   }catch(error){toast(error.message)}
+   finally{pending=false;el.disabled=false}
+   return;
+ }
  if(action==='open-kill-switch'){if(!online||pending){toast('The workspace is reconnecting.');return}killSwitchModal=true;render(true);return}
  if(action==='cancel-kill-switch'){killSwitchModal=false;render(true);return}
  if(action==='confirm-kill-switch'){
