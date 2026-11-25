@@ -43,7 +43,7 @@ export function stepPaperPortfolio(session, bar, history, fillPrice = bar.o) {
       const value = internal * fillPrice + external * externalPrice;
       if (qty > 0) {
         book.cash -= Math.sign(intent) * value + external * externalPrice * fees / 10000;
-        if (intent > 0) book.position = { qty, entry: value / qty, highWater: fillPrice, holdBars: 0 };
+        if (intent > 0) book.position = { qty, entry: value / qty, highWater: fillPrice, holdBars: 0, ...(book.pending?.stopPct ? { stopPct: book.pending.stopPct } : {}) };
         else {
           book.position.qty = Number((book.position.qty - qty).toFixed(9));
           if (book.position.qty <= 0) book.position = null;
@@ -67,7 +67,7 @@ export function stepPaperPortfolio(session, bar, history, fillPrice = bar.o) {
     const window = strategyWindow(s, history);
     book.pending = decision(s, window.map(candle => candle.c), { cash: book.cash, equity, dayStart: book.dayStart, exposure }, position,
       bar.c, rules, { bars: window, volume: bar.v, cooldown: book.cooldown, highWater: position?.highWater,
-        holdBars: position?.holdBars, atr: s.atrStop > 0 ? computeATR(window, Math.min(14, s.period)) : null });
+        holdBars: position?.holdBars, stopPct: position?.stopPct, atr: s.atrStop > 0 ? computeATR(window, Math.min(14, s.period)) : null });
     if (book.cooldown > 0) book.cooldown--;
   });
   const day = bar.t.slice(0, 10);

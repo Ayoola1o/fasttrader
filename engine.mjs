@@ -29,14 +29,26 @@ function entryQty(budget, price, rules) {
   return qty >= rules.minimum && qty * price >= rules.minValue ? qty : 0;
 }
 
-export const timeframes = { '1Min': 60000, '5Min': 300000, '15Min': 900000, '1Hour': 3600000 };
+export const timeframes = { '1Min': 60000, '5Min': 300000, '15Min': 900000, '1Hour': 3600000, '4Hour': 14400000, '1Day': 86400000 };
 export const strategyModes = ['momentum', 'mean_reversion', 'breakout', 'custom', 'ai_notepad', 'ai_autonomous'];
-export const ruleIndicators = ['close', 'sma', 'ema', 'rsi', 'adx', 'vwap', 'bb_upper', 'bb_lower', 'bb_width', 'keltner_upper', 'keltner_lower', 'macd', 'macd_signal', 'donchian_high', 'donchian_low', 'atr', 'volume', 'avg_volume', 'rvol', 'pct_change', 'number'];
-export const ruleOperators = ['gt', 'lt', 'gte', 'lte', 'crosses_above', 'crosses_below'];
+export const candleIndicators = [
+  'bullish_pin_bar', 'bearish_pin_bar',
+  'bullish_engulfing', 'bearish_engulfing',
+  'inside_bar_breakout', 'inside_bar_fakey',
+  'morning_star', 'evening_star',
+  'tweezer_bottom', 'tweezer_top'
+];
+export const ruleIndicators = [
+  'close', 'sma', 'ema', 'rsi', 'adx', 'vwap', 'bb_upper', 'bb_lower', 'bb_width',
+  'keltner_upper', 'keltner_lower', 'macd', 'macd_signal', 'donchian_high', 'donchian_low',
+  'fib_retracement', 'sr_room_ratio', ...candleIndicators,
+  'atr', 'volume', 'avg_volume', 'rvol', 'pct_change', 'number'
+];
+export const ruleOperators = ['gt', 'lt', 'gte', 'lte', 'eq', 'crosses_above', 'crosses_below'];
 
 export const defaults = {
   name: 'Momentum Alpha', symbol: 'SPY', mode: 'momentum', timeframe: '1Min', period: 12, entry: 0.1, exit: -0.1,
-  sizeMode: 'percent', size: 10, sizeUsd: 500, exposure: 20, dailyLoss: 3, stop: 2, take: 4, trailingStop: 0,
+  sizeMode: 'percent', size: 10, sizeUsd: 500, riskPct: 1, candleStop: false, exposure: 20, dailyLoss: 3, stop: 2, take: 4, trailingStop: 0,
   atrStop: 0, cooldown: 5, maxHoldBars: 0, htfEma: 0, minAdx: 0, ai: false, aiPrompt: '', aiNotes: '',
   aiWakeMode: 'smart', aiRiskProfile: 'balanced', aiSizing: 'dynamic', aiDailyCap: 100, rules: null
 };
@@ -191,12 +203,94 @@ export function computeMACD(closes) {
   return { macd, signal };
 }
 
+function barOHLC(b) {
+  const o = b.o, c = b.c;
+  const h = Number.isFinite(b.h) ? b.h : Math.max(o, c);
+  const l = Number.isFinite(b.l) ? b.l : Math.min(o, c);
+  return { o, h, l, c, range: Math.max(0, h - l), body: Math.abs(c - o) };
+}
+
+export function detectCandlestickPatterns(bars) {
+  const emptyFlags = Object.fromEntries(candleIndicators.map(k => [k, 0]));
+  if (!Array.isArray(bars) || !bars.length) {
+    return { active: [], flags: emptyFlags, setupLow: null, atr: null, anatomy: null };
+  }
+  const cur = barOHLC(bars.at(-1));
+  const prev = bars.length >= 2 ? barOHLC(bars.at(-2)) : null;
+  const prev2 = bars.length >= 3 ? barOHLC(bars.at(-3)) : null;
+  const atr = computeATR(bars, 14) ?? (cur.range > 0 ? cur.range : cur.c * 0.002);
+  const minRange = atr > 0 ? 0.5 * atr : 0;
+  const lowerTail = Math.min(cur.o, cur.c) - cur.l;
+  const upperTail = cur.h - Math.max(cur.o, cur.c);
+
+  const flags = { ...emptyFlags };
+  if (cur.range > 0 && cur.range >= minRange) {
+    if (lowerTail >= 0.6 * cur.range && lowerTail >= 2 * Math.max(cur.body, cur.range * 0.05) && upperTail <= 0.25 * cur.range) {
+      flags.bullish_pin_bar = 1;
+    }
+    if (upperTail >= 0.6 * cur.range && upperTail >= 2 * Math.max(cur.body, cur.range * 0.05) && lowerTail <= 0.25 * cur.range) {
+      flags.bearish_pin_bar = 1;
+    }
+  }
+  if (prev) {
+    const minBody = atr > 0 ? 0.35 * atr : 0;
+    if (prev.c < prev.o && cur.c > cur.o && cur.body > prev.body && cur.body >= minBody && cur.c >= prev.o && cur.o <= prev.c) {
+      flags.bullish_engulfing = 1;
+    }
+    if (prev.c > prev.o && cur.c < cur.o && cur.body > prev.body && cur.body >= minBody && cur.o >= prev.c && cur.c <= prev.o) {
+      flags.bearish_engulfing = 1;
+    }
+    const tol = Math.max(0.15 * atr, cur.c * 0.0005);
+    if (prev.c < prev.o && cur.c > cur.o && Math.abs(cur.l - prev.l) <= tol && cur.c >= (prev.o + prev.c) / 2) {
+      flags.tweezer_bottom = 1;
+    }
+    if (prev.c > prev.o && cur.c < cur.o && Math.abs(cur.h - prev.h) <= tol && cur.c <= (prev.o + prev.c) / 2) {
+      flags.tweezer_top = 1;
+    }
+  }
+  if (prev && prev2 && prev2.range > 0) {
+    const isInside = prev.h <= prev2.h && prev.l >= prev2.l;
+    if (isInside && cur.c > prev2.h && cur.c > cur.o) {
+      flags.inside_bar_breakout = 1;
+    }
+    if (isInside && cur.l < prev.l && cur.c > prev.l && (cur.c >= cur.o || lowerTail >= 0.5 * cur.range)) {
+      flags.inside_bar_fakey = 1;
+    }
+    if (prev2.c < prev2.o && prev2.body >= 0.5 * prev2.range && prev.body <= 0.45 * prev2.body &&
+      Math.max(prev.o, prev.c) <= prev2.o && cur.c > cur.o && cur.c >= (prev2.o + prev2.c) / 2) {
+      flags.morning_star = 1;
+    }
+    if (prev2.c > prev2.o && prev2.body >= 0.5 * prev2.range && prev.body <= 0.45 * prev2.body &&
+      Math.min(prev.o, prev.c) >= prev2.o && cur.c < cur.o && cur.c <= (prev2.o + prev2.c) / 2) {
+      flags.evening_star = 1;
+    }
+  }
+
+  let setupLow = cur.l;
+  if (flags.inside_bar_breakout || flags.inside_bar_fakey || flags.morning_star) {
+    setupLow = Math.min(cur.l, prev.l, prev2.l);
+  } else if (flags.bullish_engulfing || flags.tweezer_bottom) {
+    setupLow = Math.min(cur.l, prev.l);
+  }
+  const active = candleIndicators.filter(k => flags[k] === 1);
+  const anatomy = cur.range > 0 ? {
+    direction: cur.c > cur.o ? 'bullish' : cur.c < cur.o ? 'bearish' : 'doji',
+    bodyPct: Number((100 * cur.body / cur.range).toFixed(1)),
+    upperWickPct: Number((100 * upperTail / cur.range).toFixed(1)),
+    lowerWickPct: Number((100 * lowerTail / cur.range).toFixed(1))
+  } : { direction: 'doji', bodyPct: 0, upperWickPct: 0, lowerWickPct: 0 };
+  return { active, flags, setupLow, atr, anatomy };
+}
+
 export function indicatorValue(bars, spec, offset = 0) {
   if (!spec || !bars?.length) return null;
   if (spec.indicator === 'number') return Number.isFinite(spec.value) ? spec.value : null;
   const end = bars.length - offset;
   if (end <= 0) return null;
   const slice = bars.slice(0, end);
+  if (candleIndicators.includes(spec.indicator)) {
+    return detectCandlestickPatterns(slice).flags[spec.indicator] ?? 0;
+  }
   const closes = slice.map(b => b.c);
   const period = Math.max(1, Math.min(200, Math.round(spec.period ?? 14)));
   const last = slice.at(-1);
@@ -242,6 +336,34 @@ export function indicatorValue(bars, spec, offset = 0) {
         ? Math.max(...prior.map(b => Number.isFinite(b.h) ? b.h : Math.max(b.o, b.c)))
         : Math.min(...prior.map(b => Number.isFinite(b.l) ? b.l : Math.min(b.o, b.c)));
     }
+    case 'fib_retracement': {
+      if (slice.length < period) return null;
+      const w = slice.slice(-period);
+      let swingLow = Infinity, swingHigh = -Infinity, lowIdx = 0, highIdx = 0;
+      for (let i = 0; i < w.length; i++) {
+        const { h, l } = barOHLC(w[i]);
+        if (l < swingLow) { swingLow = l; lowIdx = i; }
+        if (h >= swingHigh) { swingHigh = h; highIdx = i; }
+      }
+      const span = swingHigh - swingLow;
+      if (span <= 0) return 50;
+      if (highIdx <= lowIdx) return -1;
+      return 100 * (swingHigh - last.c) / span;
+    }
+    case 'sr_room_ratio': {
+      if (slice.length < period) return null;
+      const w = slice.slice(-period);
+      let resHigh = -Infinity, supLow = Infinity;
+      for (const b of w) {
+        const { h, l } = barOHLC(b);
+        if (h > resHigh) resHigh = h;
+        if (l < supLow) supLow = l;
+      }
+      const atr = computeATR(slice, Math.min(14, Math.max(2, slice.length - 1))) ?? Math.max(1e-6, (resHigh - supLow) / 10);
+      const upside = Math.max(0, resHigh - last.c);
+      const downside = Math.max(0.25 * (atr || 1e-6), last.c - supLow);
+      return upside / downside;
+    }
     case 'atr': return slice.length > period ? computeATR(slice, period) : null;
     case 'avg_volume':
     case 'rvol': {
@@ -271,7 +393,9 @@ export function evaluateRule(bars, rule) {
     const pass = rule.op === 'crosses_above' ? prevLeft <= prevRight && leftVal > rightVal : prevLeft >= prevRight && leftVal < rightVal;
     return { ready: true, pass, leftVal, rightVal };
   }
-  const pass = rule.op === 'gt' ? leftVal > rightVal : rule.op === 'lt' ? leftVal < rightVal : rule.op === 'gte' ? leftVal >= rightVal : leftVal <= rightVal;
+  const pass = rule.op === 'eq'
+    ? Math.abs(leftVal - rightVal) < 1e-9
+    : rule.op === 'gt' ? leftVal > rightVal : rule.op === 'lt' ? leftVal < rightVal : rule.op === 'gte' ? leftVal >= rightVal : leftVal <= rightVal;
   return { ready: true, pass, leftVal, rightVal };
 }
 
@@ -289,12 +413,13 @@ export function ruleWarmupBars(s) {
   const all = [...(s.rules?.entry ?? []), ...(s.rules?.exit ?? [])];
   let max = s.mode === 'custom' && all.length ? 2 : (s.period ?? 12);
   if (s.mode === 'breakout') max++;
-  if (s.atrStop > 0) max = Math.max(max, Math.min(14, s.period) + 1);
+  if (s.atrStop > 0 || s.candleStop) max = Math.max(max, Math.min(14, s.period ?? 14) + 1);
   if (s.minAdx > 0) max = Math.max(max, 16);
   for (const r of all) {
     for (const side of [r.left, r.right]) {
       if (!side) continue;
       if (side.indicator === 'macd' || side.indicator === 'macd_signal') max = Math.max(max, 36);
+      else if (candleIndicators.includes(side.indicator)) max = Math.max(max, 15);
       else if (side.indicator === 'adx') max = Math.max(max, (side.period ?? 14) + 2);
       else if (!['number', 'close', 'volume', 'vwap'].includes(side.indicator)) {
         max = Math.max(max, (side.period ?? 14) + 2);
@@ -319,8 +444,9 @@ const equitySessionDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/
 
 export function strategyWindow(s, bars, length = ruleWarmupBars(s), maxGapMs) {
   const duration = timeframes[s.timeframe ?? '1Min'];
+  const maxClosureDays = duration >= 14400000 ? 5 : 4;
   const allowEquityClosure = (previous, next, gap) => !isCrypto(s.symbol) &&
-    gap >= 8 * 3600000 && gap <= 4 * 86400000 &&
+    gap >= 8 * 3600000 && gap <= maxClosureDays * 86400000 &&
     equitySessionDate.format(new Date(previous.t)) !== equitySessionDate.format(new Date(next.t));
   return contiguousBars(bars, length, maxGapMs ?? Math.max(180000, duration * 3), allowEquityClosure);
 }
@@ -361,6 +487,8 @@ function remainingBudget(budget, realized, invested = 0) {
   return Math.max(0, budget + Math.min(0, realized) - invested);
 }
 
+const periodFreeIndicators = new Set(['close', 'volume', 'macd', 'macd_signal', 'vwap', ...candleIndicators]);
+
 function sanitizeRuleSpec(spec) {
   if (!spec || typeof spec !== 'object' || !ruleIndicators.includes(spec.indicator)) throw Error('Invalid rule indicator.');
   if (spec.indicator === 'number') {
@@ -368,7 +496,7 @@ function sanitizeRuleSpec(spec) {
     return { indicator: 'number', value: spec.value };
   }
   const out = { indicator: spec.indicator };
-  if (!['close', 'volume', 'macd', 'macd_signal', 'vwap'].includes(spec.indicator)) {
+  if (!periodFreeIndicators.has(spec.indicator)) {
     const p = spec.period ?? 14;
     if (!Number.isInteger(p) || p < 1 || p > 200) throw Error('Rule indicator period must be between 1 and 200.');
     out.period = p;
@@ -428,11 +556,15 @@ export function strategy(input, supportsSymbol = symbol => Object.hasOwn(instrum
   const minAdx = input.minAdx === undefined ? 0 : input.minAdx;
   if (!Number.isInteger(minAdx) || minAdx < 0 || minAdx > 60) throw Error('Invalid value for minAdx');
   result.minAdx = minAdx;
-  const sizeMode = input.sizeMode === 'usd' ? 'usd' : 'percent';
+  const sizeMode = ['percent', 'usd', 'risk'].includes(input.sizeMode) ? input.sizeMode : 'percent';
   result.sizeMode = sizeMode;
   const sizeUsd = input.sizeUsd === undefined ? 500 : input.sizeUsd;
   if (!Number.isFinite(sizeUsd) || sizeUsd < 1 || sizeUsd > 1e9) throw Error('Invalid value for sizeUsd');
   result.sizeUsd = sizeUsd;
+  const riskPct = input.riskPct === undefined ? 1 : input.riskPct;
+  if (!Number.isFinite(riskPct) || riskPct < 0.1 || riskPct > 10) throw Error('Invalid value for riskPct');
+  result.riskPct = riskPct;
+  result.candleStop = input.candleStop === true;
   result.aiPrompt = typeof input.aiPrompt === 'string' ? input.aiPrompt.trim().slice(0, 300) : '';
   result.aiNotes = typeof input.aiNotes === 'string' ? input.aiNotes.trim().slice(0, 4000) : '';
   result.aiWakeMode = input.aiWakeMode === 'fixed' ? 'fixed' : 'smart';
@@ -503,6 +635,8 @@ export function shouldWakeAutonomousAI(bars, lastWakeAt = 0, now = Date.now()) {
   if (!Array.isArray(bars) || bars.length < 2) return { wake: false, trigger: 'Waiting for bars' };
   const reg = classifyRegime(bars);
   if (reg.regime === 'SQUEEZE_BREAKOUT') return { wake: true, trigger: 'Volatility squeeze breakout' };
+  const patterns = detectCandlestickPatterns(bars);
+  if (patterns.active.length) return { wake: true, trigger: `Candlestick pattern: ${patterns.active[0]}` };
   const last = bars.at(-1), prev = bars.at(-2);
   const moveOpen = last.o > 0 ? Math.abs(100 * (last.c / last.o - 1)) : 0;
   const movePrev = prev.c > 0 ? Math.abs(100 * (last.c / prev.c - 1)) : 0;
@@ -523,6 +657,35 @@ export function shouldWakeAutonomousAI(bars, lastWakeAt = 0, now = Date.now()) {
   return { wake: false, trigger: lowAdxChop ? `Skipping low-ADX chop (ADX ${reg.adx})` : 'Quiet market (Smart Wake-Up)' };
 }
 
+export function computeCandleStopPct(s, evalBars, entryPrice, atrOpt = null) {
+  if (!Number.isFinite(entryPrice) || entryPrice <= 0 || !Array.isArray(evalBars) || !evalBars.length) return s.stop;
+  const pat = detectCandlestickPatterns(evalBars);
+  if (!Number.isFinite(pat.setupLow) || pat.setupLow <= 0) return s.stop;
+  const atr = Number.isFinite(atrOpt) && atrOpt > 0 ? atrOpt : (pat.atr ?? 0);
+  const stopPrice = pat.setupLow - 0.15 * atr;
+  const rawPct = 100 * (entryPrice - stopPrice) / entryPrice;
+  if (!Number.isFinite(rawPct) || rawPct <= 0) return Math.min(s.stop, 0.5);
+  return Math.max(0.25, Math.min(s.stop, rawPct));
+}
+
+function computeSizeCap(s, account, entryPrice, evalBars, options = {}) {
+  if (s.sizeMode === 'usd' && Number.isFinite(s.sizeUsd)) return s.sizeUsd;
+  if (s.sizeMode === 'risk') {
+    const riskPct = Number.isFinite(s.riskPct) && s.riskPct > 0 ? s.riskPct : 1;
+    const riskBase = Number.isFinite(options.budget) && options.budget > 0 ? Math.min(account.equity, options.budget) : account.equity;
+    let stopDistPct = s.stop;
+    if (s.atrStop > 0 && Number.isFinite(options.atr) && options.atr > 0 && entryPrice > 0) {
+      stopDistPct = Math.min(stopDistPct, 100 * (s.atrStop * options.atr) / entryPrice);
+    }
+    if (s.candleStop) {
+      stopDistPct = Math.min(stopDistPct, computeCandleStopPct(s, evalBars, entryPrice, options.atr));
+    }
+    stopDistPct = Math.max(0.25, stopDistPct);
+    return (riskBase * (riskPct / 100)) / (stopDistPct / 100);
+  }
+  return account.equity * s.size / 100;
+}
+
 export function decision(s, closes, account, position, price, rules = isCrypto(s.symbol) ? cryptoReplayRules : null, options = {}) {
   if (!Number.isFinite(price) || price <= 0) return null;
   const mode = s.mode ?? 'momentum';
@@ -531,17 +694,26 @@ export function decision(s, closes, account, position, price, rules = isCrypto(s
   const warmedUp = options.warmedUp !== false && (hasCustomRules ? evalBars.length >= ruleWarmupBars(s) : closes.length >= s.period);
   const pnl = position?.qty > 0 ? 100 * (price / position.entry - 1) : 0;
   const limit = account.equity <= account.dayStart * (1 - s.dailyLoss / 100);
-  const effectiveStop = position?.qty > 0 && s.atrStop > 0 && Number.isFinite(options.atr) && options.atr > 0
-    ? Math.min(s.stop, 100 * (s.atrStop * options.atr) / position.entry)
-    : s.stop;
+  const atrStopPct = position?.qty > 0 && s.atrStop > 0 && Number.isFinite(options.atr) && options.atr > 0
+    ? 100 * (s.atrStop * options.atr) / position.entry
+    : Infinity;
+  const savedStopPct = position?.qty > 0 && s.candleStop && Number.isFinite(options.stopPct ?? position?.stopPct) && (options.stopPct ?? position?.stopPct) > 0
+    ? (options.stopPct ?? position.stopPct)
+    : Infinity;
+  const effectiveStop = Math.min(s.stop, atrStopPct, savedStopPct);
   const trailHit = position?.qty > 0 && s.trailingStop > 0 && Number.isFinite(options.highWater) && options.highWater > 0 &&
     price <= options.highWater * (1 - s.trailingStop / 100);
   const holdExpired = position?.qty > 0 && s.maxHoldBars > 0 && (options.holdBars ?? 0) >= s.maxHoldBars;
   if (position?.qty > 0) {
     const protective = limit || pnl <= -effectiveStop || pnl >= s.take || trailHit;
     if (protective) {
+      const stopReason = savedStopPct <= atrStopPct && savedStopPct < s.stop
+        ? `Pattern-tail stop-loss reached (-${effectiveStop.toFixed(2)}%)`
+        : atrStopPct < s.stop
+          ? `ATR stop-loss reached (-${effectiveStop.toFixed(2)}%)`
+          : 'Stop-loss reached';
       return { side: 'sell', qty: position.qty, protective: true, stopLoss: !limit && (pnl <= -effectiveStop || trailHit),
-        rationale: limit ? 'Maximum daily loss reached' : trailHit ? `Trailing stop reached (-${s.trailingStop}% from peak)` : pnl <= -effectiveStop ? (s.atrStop > 0 ? `ATR stop-loss reached (-${effectiveStop.toFixed(2)}%)` : 'Stop-loss reached') : 'Take-profit reached' };
+        rationale: limit ? 'Maximum daily loss reached' : trailHit ? `Trailing stop reached (-${s.trailingStop}% from peak)` : pnl <= -effectiveStop ? stopReason : 'Take-profit reached' };
     }
     if (holdExpired) {
       return { side: 'sell', qty: position.qty, protective: true, rationale: `Max hold time reached (${s.maxHoldBars} bars)` };
@@ -551,7 +723,7 @@ export function decision(s, closes, account, position, price, rules = isCrypto(s
       return { side: 'sell', qty: position.qty, protective: false, aiAutonomous: true, rationale: 'Evaluating AI Notepad exit strategy' };
     }
     if (mode === 'ai_autonomous') {
-      const addCap = s.sizeMode === 'usd' && Number.isFinite(s.sizeUsd) ? s.sizeUsd : account.equity * s.size / 100;
+      const addCap = computeSizeCap(s, account, price, evalBars, options);
       const addBudget = Math.min(addCap, account.equity * s.exposure / 100 - account.exposure, account.cash);
       const buyQty = s.aiSizing === 'dynamic' && !limit && (options.cooldown ?? 0) <= 0 ? entryQty(addBudget, price, rules) : 0;
       return { side: 'sell', qty: position.qty, buyQty, protective: false, aiAutonomous: true, aiFreeRoam: true, rationale: 'Autonomous AI managing open position' };
@@ -596,21 +768,23 @@ export function decision(s, closes, account, position, price, rules = isCrypto(s
     if (adxVal !== null && adxVal < s.minAdx) return null;
   }
   if (mode === 'ai_notepad' || mode === 'ai_autonomous') {
-    const sizeCap = s.sizeMode === 'usd' && Number.isFinite(s.sizeUsd) ? s.sizeUsd : account.equity * s.size / 100;
+    const sizeCap = computeSizeCap(s, account, price, evalBars, options);
     const budget = mode === 'ai_autonomous'
       ? Math.min(account.equity * s.exposure / 100 - account.exposure, account.cash)
       : Math.min(sizeCap, account.equity * s.exposure / 100 - account.exposure, account.cash);
     const qty = entryQty(budget, price, rules);
+    const stopPct = s.candleStop ? computeCandleStopPct(s, evalBars, price, options.atr) : undefined;
     return qty > 0
-      ? { side: 'buy', qty, protective: false, aiAutonomous: true, ...(mode === 'ai_autonomous' ? { aiFreeRoam: true } : {}), rationale: mode === 'ai_autonomous' ? 'Autonomous AI scanning market' : 'Evaluating AI Notepad entry strategy' }
+      ? { side: 'buy', qty, protective: false, aiAutonomous: true, ...(stopPct ? { stopPct } : {}), ...(mode === 'ai_autonomous' ? { aiFreeRoam: true } : {}), rationale: mode === 'ai_autonomous' ? 'Autonomous AI scanning market' : 'Evaluating AI Notepad entry strategy' }
       : null;
   }
   const rationale = entrySignal(s, evalBars);
   if (!rationale) return null;
-  const sizeCap = s.sizeMode === 'usd' && Number.isFinite(s.sizeUsd) ? s.sizeUsd : account.equity * s.size / 100;
+  const sizeCap = computeSizeCap(s, account, price, evalBars, options);
   const budget = Math.min(sizeCap, account.equity * s.exposure / 100 - account.exposure, account.cash);
   const qty = entryQty(budget, price, rules);
-  return qty > 0 ? { side: 'buy', qty, rationale } : null;
+  const stopPct = s.candleStop ? computeCandleStopPct(s, evalBars, price, options.atr) : undefined;
+  return qty > 0 ? { side: 'buy', qty, rationale, ...(stopPct ? { stopPct } : {}) } : null;
 }
 
 export function entrySignal(s, evalBars) {
@@ -686,7 +860,8 @@ export function replay(s, bars, options) {
       const price = bar.o * (1 + (buy ? 1 : -1) * options.slippage / 10000);
       const unitCost = price * (1 + options.fees / 10000);
       const equity = cash + (position?.qty ?? 0) * bar.o;
-      const sizeCap = s.sizeMode === 'usd' && Number.isFinite(s.sizeUsd) ? s.sizeUsd : equity * s.size / 100;
+      const entryStopPct = buy && s.candleStop ? computeCandleStopPct(s, historyBars, price) : pending.stopPct;
+      const sizeCap = computeSizeCap(s, { equity }, price, historyBars, { budget: Number.isFinite(budgetCap) ? budgetCap : undefined });
       const qty = buy ? equity <= dayStart * (1 - s.dailyLoss / 100) ? 0 :
         Math.min(pending.qty, entryQty(Math.min(cash, remainingBudget(budgetCap, realized), equity * s.exposure / 100, sizeCap), unitCost, rules)) : position.qty;
       if (qty > 0 && (!buy || !rules || qty * price >= rules.minValue)) {
@@ -694,7 +869,7 @@ export function replay(s, bars, options) {
         const pnl = buy ? null : qty * (price - position.entry) - fee - position.fee;
         if (!buy) realized += pnl;
         cash += (buy ? -1 : 1) * qty * price - fee;
-        position = buy ? { qty, entry: price, fee, highWater: price, holdBars: 0 } : null;
+        position = buy ? { qty, entry: price, fee, highWater: price, holdBars: 0, ...(entryStopPct ? { stopPct: entryStopPct } : {}) } : null;
         if (!buy && pending.stopLoss) cooldown = s.cooldown ?? 0;
         trades.push({ t: bar.t, side: pending.side, qty, price, fee, pnl, reason: pending.rationale || (buy ? 'Entry signal' : 'Exit signal') });
       }
@@ -706,8 +881,9 @@ export function replay(s, bars, options) {
     if (position && Number.isFinite(bar.l) && Number.isFinite(bar.h) && bar.l > 0 && bar.h >= bar.l) {
       const atrWindow = s.atrStop > 0 ? strategyWindow(s, historyBars, Math.min(14, s.period) + 1, options.maxGapMs) : [];
       const atr = s.atrStop > 0 ? computeATR(atrWindow, Math.min(14, s.period)) : null;
-      const atrTighter = s.atrStop > 0 && atr > 0 && 100 * (s.atrStop * atr) / position.entry < s.stop;
-      const stopPct = atrTighter ? 100 * (s.atrStop * atr) / position.entry : s.stop;
+      const atrPct = s.atrStop > 0 && atr > 0 ? 100 * (s.atrStop * atr) / position.entry : Infinity;
+      const candlePct = s.candleStop && Number.isFinite(position.stopPct) && position.stopPct > 0 ? position.stopPct : Infinity;
+      const stopPct = Math.min(s.stop, atrPct, candlePct);
       const fixedStopPrice = position.entry * (1 - stopPct / 100);
       // Evaluate trailing stop against prior high-water mark before raising it with this bar's high (avoids same-bar look-ahead bias)
       const trailStopPrice = s.trailingStop > 0 ? (position.highWater ?? position.entry) * (1 - s.trailingStop / 100) : 0;
@@ -725,7 +901,7 @@ export function replay(s, bars, options) {
         position = null;
         if (stopped) cooldown = s.cooldown ?? 0;
         const reason = stopped
-          ? (trailStopPrice > fixedStopPrice ? 'Trailing stop' : atrTighter ? 'ATR stop' : 'Stop loss')
+          ? (trailStopPrice > fixedStopPrice ? 'Trailing stop' : candlePct <= atrPct && candlePct < s.stop ? 'Pattern-tail stop' : atrPct < s.stop ? 'ATR stop' : 'Stop loss')
           : 'Take profit';
         trades.push({ t: bar.t, side: 'sell', qty, price, fee, pnl, reason });
       }
@@ -739,7 +915,8 @@ export function replay(s, bars, options) {
     curve.push({ t: bar.t, value: equity, drawdown: 100 * (equity / peak - 1) });
     historyBars.push(bar);
     const window = strategyWindow(s, historyBars, warmupNeeded, options.maxGapMs);
-    const htfBars = s.htfEma > 0 ? aggregateBars(historyBars, '1Hour') : undefined;
+    const htfTf = ['4Hour', '1Day'].includes(s.timeframe) ? s.timeframe : '1Hour';
+    const htfBars = s.htfEma > 0 ? aggregateBars(historyBars, htfTf) : undefined;
     const atr = s.atrStop > 0 ? computeATR(window, Math.min(14, s.period)) : null;
     pending = decision(s, window.map(b => b.c), { equity, cash: Math.min(cash, remainingBudget(budgetCap, realized)), dayStart, exposure }, position, bar.c, rules, {
       warmedUp: window.length >= warmupNeeded,
@@ -749,6 +926,8 @@ export function replay(s, bars, options) {
       htfBars,
       highWater: position?.highWater,
       holdBars: position?.holdBars ?? 0,
+      stopPct: position?.stopPct,
+      budget: Number.isFinite(budgetCap) ? budgetCap : undefined,
       volume: Number.isFinite(bar.v) ? bar.v : undefined
     });
     if (cooldown > 0) cooldown--;

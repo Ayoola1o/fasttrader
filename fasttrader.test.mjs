@@ -9,7 +9,7 @@ import { runInNewContext } from 'node:vm';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { defaults, decision, replay, downsampleCurve, botLedger, contiguousBars, aggregateBars, closedStrategyBars, computeATR, computeADX, computeVWAP, classifyRegime, indicatorValue, strategy, strategyWindow, evaluateRuleSet, shouldWakeAutonomousAI } from './engine.mjs';
+import { defaults, decision, replay, downsampleCurve, botLedger, contiguousBars, aggregateBars, closedStrategyBars, computeATR, computeADX, computeVWAP, classifyRegime, detectCandlestickPatterns, computeCandleStopPct, indicatorValue, strategy, strategyWindow, evaluateRuleSet, shouldWakeAutonomousAI } from './engine.mjs';
 import { signalProvider, assessSignal } from './signal-ai.mjs';
 import { createTelegram } from './telegram.mjs';
 import { handleBridge } from './api/bridge.js';
@@ -44,6 +44,73 @@ test('strategy waits for the timeframe to close and treats max hold as a protect
   );
   assert.equal(proposal.side, 'sell');
   assert.equal(proposal.protective, true);
+});
+
+test('Candlestick Trading Bible patterns, 4H/1D timeframes, Fib/SR confluence, and 1-2% risk sizing work end-to-end', () => {
+  const hourly = Array.from({ length: 8 }, (_, i) => ({
+    t: new Date(Date.UTC(2026, 5, 1, i, 0)).toISOString(),
+    o: 100 + i, h: 102 + i, l: 99 + i, c: 101 + i, v: 10
+  }));
+  const fourHour = aggregateBars(hourly, '4Hour');
+  assert.equal(fourHour.length, 2);
+  assert.equal(fourHour[0].o, 100);
+  assert.equal(fourHour[0].c, 104);
+  assert.equal(fourHour[0].v, 40);
+
+  const swingBars = Array.from({ length: 18 }, (_, i) => {
+    const base = i <= 2 ? 102 - i : i <= 12 ? 100 + (i - 2) * 2 : 120 - (i - 12) * 2.2;
+    return {
+      t: new Date(Date.UTC(2026, 5, 2, i, 0)).toISOString(),
+      o: base + 0.3, h: i === 12 ? 120 : base + 0.8, l: i === 2 ? 100 : base - 0.8, c: base, v: 100
+    };
+  });
+  swingBars.push({
+    t: new Date(Date.UTC(2026, 5, 2, 18, 0)).toISOString(),
+    o: 109.2, h: 109.8, l: 106.0, c: 109.5, v: 180
+  });
+  const pinCheck = detectCandlestickPatterns(swingBars);
+  assert.equal(pinCheck.flags.bullish_pin_bar, 1);
+  assert.ok(pinCheck.active.includes('bullish_pin_bar'));
+  const fib = indicatorValue(swingBars, { indicator: 'fib_retracement', period: 19 });
+  assert.ok(fib >= 45 && fib <= 62, `Expected Fib retracement in Golden Zone, got ${fib}`);
+  const srRoom = indicatorValue(swingBars, { indicator: 'sr_room_ratio', period: 19 });
+  assert.ok(srRoom >= 1, `Expected positive S/R room ratio, got ${srRoom}`);
+
+  const fakeyBars = [
+    ...swingBars.slice(0, 15),
+    { t: '2026-06-03T00:00:00Z', o: 112, h: 115, l: 108, c: 110, v: 120 },
+    { t: '2026-06-03T04:00:00Z', o: 111, h: 113, l: 109.5, c: 110.5, v: 90 },
+    { t: '2026-06-03T08:00:00Z', o: 110, h: 112.5, l: 107.5, c: 112.0, v: 220 }
+  ];
+  const fakeyPat = detectCandlestickPatterns(fakeyBars);
+  assert.equal(fakeyPat.flags.inside_bar_fakey, 1);
+  assert.equal(fakeyPat.setupLow, 107.5);
+
+  const bibleStrat = strategy({
+    ...defaults, name: 'Bible Pin Bar', symbol: 'SPY', mode: 'custom', timeframe: '1Hour',
+    sizeMode: 'risk', riskPct: 1.5, candleStop: true, exposure: 100, stop: 5, take: 12,
+    rules: {
+      entryLogic: 'all', exitLogic: 'any',
+      entry: [
+        { left: { indicator: 'bullish_pin_bar' }, op: 'eq', right: { indicator: 'number', value: 1 } },
+        { left: { indicator: 'fib_retracement', period: 17 }, op: 'gte', right: { indicator: 'number', value: 45 } }
+      ],
+      exit: [{ left: { indicator: 'bearish_pin_bar' }, op: 'eq', right: { indicator: 'number', value: 1 } }]
+    }
+  });
+  const tailStopPct = computeCandleStopPct(bibleStrat, swingBars, 109.5);
+  assert.ok(tailStopPct > 3 && tailStopPct < 5, `Expected ~3.4% pattern-tail stop, got ${tailStopPct}`);
+  const account = { equity: 10000, cash: 10000, dayStart: 10000, exposure: 0 };
+  const buyProp = decision(bibleStrat, swingBars.map(b => b.c), account, null, 109.5, null, { bars: swingBars, warmedUp: true });
+  assert.equal(buyProp?.side, 'buy');
+  assert.ok(Number.isFinite(buyProp.stopPct));
+  const dollarRisk = buyProp.qty * 109.5 * (buyProp.stopPct / 100);
+  assert.ok(dollarRisk <= 155 && dollarRisk >= 120, `Expected ~$150 risk, got $${dollarRisk}`);
+
+  const stopExit = decision(bibleStrat, swingBars.map(b => b.c), account, { qty: buyProp.qty, entry: 109.5, stopPct: buyProp.stopPct }, 105.2, null, { bars: swingBars, warmedUp: true, stopPct: buyProp.stopPct });
+  assert.equal(stopExit?.side, 'sell');
+  assert.equal(stopExit?.protective, true);
+  assert.match(stopExit?.rationale, /Pattern-tail stop-loss/);
 });
 
 test('replay decides at the close and fills at the next open with costs and sizing limits', () => {

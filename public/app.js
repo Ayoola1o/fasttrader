@@ -498,8 +498,8 @@ function screener(){
  form('screen',field('Search','search',filter.search,'type="search" placeholder="Search symbols or names"')+numeric(crypto?'Minimum turnover (USD)':'Minimum volume','volume',filter.volume,0,1e12,1)+numeric('Minimum volatility (%)','volatility',filter.volatility,0,100),submit('Apply filters'))+
  table(['Asset','Price','Change','Volatility',crypto?'USD turnover':'Volume','Source / freshness',''],rows,'No instruments match these filters.'));
 }
-const fields=[['Lookback (bars)','period',2,60,1],['Entry threshold (%)','entry',0,25],['Exit threshold (%)','exit',-25,0],['Position size (% equity)','size',.1,100],['Fixed size (USD)','sizeUsd',1,1e9,1],['Maximum exposure (% equity)','exposure',.1,100],['Maximum daily loss (%)','dailyLoss',.1,50],['Stop-loss (%)','stop',.1,50],['Trailing stop (%, 0=off)','trailingStop',0,50,.1],['Take-profit (%)','take',.1,100],['ATR stop multiplier (0=off)','atrStop',0,10,.1],['Stop-loss cooldown (bars)','cooldown',0,60,1],['Max hold (bars, 0=off)','maxHoldBars',0,1440,1]];
-const defaultParams={mode:'momentum',timeframe:'1Min',period:12,entry:0.1,exit:-0.1,sizeMode:'percent',size:10,sizeUsd:500,exposure:20,dailyLoss:3,stop:2,trailingStop:0,take:4,atrStop:0,cooldown:5,maxHoldBars:0,ai:false,aiPrompt:'',aiNotes:'',aiWakeMode:'smart',aiRiskProfile:'balanced',aiSizing:'dynamic',aiDailyCap:100,rules:null};
+const fields=[['Lookback (bars)','period',2,60,1],['Entry threshold (%)','entry',0,25],['Exit threshold (%)','exit',-25,0],['Position size (% equity)','size',.1,100],['Fixed size (USD)','sizeUsd',1,1e9,1],['Risk per trade (% capital)','riskPct',.1,10,.1],['Maximum exposure (% equity)','exposure',.1,100],['Maximum daily loss (%)','dailyLoss',.1,50],['Stop-loss (%)','stop',.1,50],['Trailing stop (%, 0=off)','trailingStop',0,50,.1],['Take-profit (%)','take',.1,100],['ATR stop multiplier (0=off)','atrStop',0,10,.1],['Stop-loss cooldown (bars)','cooldown',0,60,1],['Max hold (bars, 0=off)','maxHoldBars',0,1440,1]];
+const defaultParams={mode:'momentum',timeframe:'1Min',period:12,entry:0.1,exit:-0.1,sizeMode:'percent',size:10,sizeUsd:500,riskPct:1,candleStop:false,htfEma:0,minAdx:0,exposure:20,dailyLoss:3,stop:2,trailingStop:0,take:4,atrStop:0,cooldown:5,maxHoldBars:0,ai:false,aiPrompt:'',aiNotes:'',aiWakeMode:'smart',aiRiskProfile:'balanced',aiSizing:'dynamic',aiDailyCap:100,rules:null};
 const fresh=(symbol='',mode='momentum')=>({...defaultParams,mode,ai:mode==='ai_notepad'||mode==='ai_autonomous',id:'',version:0,name:'',symbol,rules:null});
 const modeLabels={momentum:'Momentum (SMA)',mean_reversion:'Mean Reversion (Bollinger + RSI)',breakout:'Breakout (Donchian Channel)',custom:'Custom Rule Builder',ai_notepad:'AI Notepad Strategy',ai_autonomous:'Autonomous AI Agent'};
 const autoRiskPresets={
@@ -508,18 +508,23 @@ const autoRiskPresets={
  aggressive:{label:'Aggressive',stop:8,trailingStop:4,take:20,dailyLoss:10,cooldown:1}
 };
 const notepadTemplates={
+ candlestick_bible:{label:'Candlestick Bible (1H/4H)',name:'AI Candlestick Bible Confluence',timeframe:'1Hour',sizeMode:'risk',riskPct:1.5,candleStop:true,stop:3,trailingStop:0,take:9,aiNotes:'Strategy: The Candlestick Trading Bible Confluence (Long-Only)\n\nCORE CONFLUENCE (never trade a single candle in isolation):\n- Require Trend (EMA 8 > EMA 21 or Close > EMA 50) OR a clear horizontal range floor.\n- Require overhead S/R room ratio >= 2.0 (at least 2:1 room before resistance).\n\nENTRY (BUY when flat):\n- Enter when price pulls back to EMA 21 or the 50%–61.8% Fibonacci Golden Zone AND prints a closed Bullish Pin Bar, Bullish Engulfing, Inside Bar Fakey stop-hunt, or Morning Star.\n- Skip choppy low-range candles or bearish breaking news.\n\nEXIT (SELL when holding):\n- Exit when a Bearish Pin Bar, Bearish Engulfing, or Evening Star prints at resistance, or let the Pattern-Tail Stop and 3:1 Take-Profit manage the trade.\n\nOtherwise return HOLD.'},
  smart_dip:{label:'Smart Dip Buyer',name:'AI Smart Dip Buyer',timeframe:'15Min',sizeMode:'usd',sizeUsd:500,stop:2.5,trailingStop:1.5,take:5,aiNotes:'Strategy: Smart Dip Buyer (Long-Only)\n\nENTRY (BUY when flat):\n- Buy only if price is pulling back in an overall uptrend (near or above EMA 50) OR RSI(14) is oversold (< 38) with a stabilizing green candle.\n- Avoid buying vertical green spikes (>1.5% in a single candle) or negative breaking news.\n\nEXIT (SELL when holding):\n- Sell if RSI(14) becomes overbought (> 72) and momentum stalls.\n- Sell if bearish news breaks or price closes decisively below EMA 20.\n\nOtherwise return HOLD.'},
  breakout_rider:{label:'Breakout & Trend Rider',name:'AI Breakout Rider',timeframe:'15Min',sizeMode:'usd',sizeUsd:500,stop:2,trailingStop:1.8,take:6,aiNotes:'Strategy: Momentum Breakout Rider\n\nENTRY (BUY when flat):\n- Enter when price breaks cleanly above recent 10-bar highs with expanding candle bodies and EMA 20 sloping up.\n- Confirm RSI(14) is between 52 and 72 (strong trend, not exhausted).\n\nEXIT (SELL when holding):\n- Take profit if trend loses steam with 2 consecutive red candles below EMA 20.\n- Hold through normal minor pullbacks while above EMA 20.\n\nOtherwise return HOLD.'},
  news_swing:{label:'News + Price Action',name:'AI News Catalyst Swing',timeframe:'5Min',sizeMode:'usd',sizeUsd:500,stop:2,trailingStop:1.5,take:4.5,aiNotes:'Strategy: News & Price Action Swing\n\nENTRY (BUY when flat):\n- Buy when recent headlines are bullish or neutral AND price is making higher lows above SMA 12.\n- Never buy into clearly bearish headlines or sharp sell-offs.\n\nEXIT (SELL when holding):\n- Exit immediately if bearish news appears or price drops sharply below recent support.\n- Otherwise let take-profit or trailing stop manage the winner.\n\nReturn HOLD when no clear edge exists.'}
 };
-const tfOptions=[['1Min','1 Minute'],['5Min','5 Minutes'],['15Min','15 Minutes'],['1Hour','1 Hour']];
-const tfMsMap={'1Min':60000,'5Min':300000,'15Min':900000,'1Hour':3600000};
-const ruleIndLabels={close:'Close',sma:'SMA',ema:'EMA',rsi:'RSI',adx:'ADX',vwap:'Session VWAP',bb_upper:'BB Upper',bb_lower:'BB Lower',bb_width:'BB Width %',keltner_upper:'Keltner Upper',keltner_lower:'Keltner Lower',macd:'MACD',macd_signal:'MACD Signal',donchian_high:'Donchian High',donchian_low:'Donchian Low',atr:'ATR',volume:'Volume',avg_volume:'Avg Volume',rvol:'Rel Volume (RVOL)',pct_change:'% Change',number:'Number'};
-const leftIndicators=['close','sma','ema','rsi','adx','vwap','bb_upper','bb_lower','bb_width','keltner_upper','keltner_lower','macd','macd_signal','donchian_high','donchian_low','atr','volume','avg_volume','rvol','pct_change'];
-const rightIndicators=['number','close','sma','ema','vwap','rsi','adx','bb_upper','bb_lower','bb_width','keltner_upper','keltner_lower','macd','macd_signal','donchian_high','donchian_low','avg_volume'];
-const opLabels={gt:'>',lt:'<',gte:'≥',lte:'≤',crosses_above:'Crosses Above',crosses_below:'Crosses Below'};
-const noPeriodInd=new Set(['close','volume','vwap','macd','macd_signal','number']);
+const tfOptions=[['1Min','1 Minute'],['5Min','5 Minutes'],['15Min','15 Minutes'],['1Hour','1 Hour'],['4Hour','4 Hours'],['1Day','1 Day']];
+const tfMsMap={'1Min':60000,'5Min':300000,'15Min':900000,'1Hour':3600000,'4Hour':14400000,'1Day':86400000};
+const candleIndSet=new Set(['bullish_pin_bar','bearish_pin_bar','bullish_engulfing','bearish_engulfing','inside_bar_breakout','inside_bar_fakey','morning_star','evening_star','tweezer_bottom','tweezer_top']);
+const ruleIndLabels={close:'Close',sma:'SMA',ema:'EMA',rsi:'RSI',adx:'ADX',vwap:'Session VWAP',bb_upper:'BB Upper',bb_lower:'BB Lower',bb_width:'BB Width %',keltner_upper:'Keltner Upper',keltner_lower:'Keltner Lower',macd:'MACD',macd_signal:'MACD Signal',donchian_high:'Donchian High',donchian_low:'Donchian Low',fib_retracement:'Fib Retracement %',sr_room_ratio:'S/R Room Ratio',bullish_pin_bar:'Candle: Bullish Pin Bar',bearish_pin_bar:'Candle: Bearish Pin Bar',bullish_engulfing:'Candle: Bullish Engulfing',bearish_engulfing:'Candle: Bearish Engulfing',inside_bar_breakout:'Candle: Inside Bar Breakout',inside_bar_fakey:'Candle: Inside Bar Fakey',morning_star:'Candle: Morning Star',evening_star:'Candle: Evening Star',tweezer_bottom:'Candle: Tweezer Bottom',tweezer_top:'Candle: Tweezer Top',atr:'ATR',volume:'Volume',avg_volume:'Avg Volume',rvol:'Rel Volume (RVOL)',pct_change:'% Change',number:'Number'};
+const leftIndicators=['close','sma','ema','rsi','adx','vwap','fib_retracement','sr_room_ratio','bullish_pin_bar','bearish_pin_bar','bullish_engulfing','bearish_engulfing','inside_bar_breakout','inside_bar_fakey','morning_star','evening_star','tweezer_bottom','tweezer_top','bb_upper','bb_lower','bb_width','keltner_upper','keltner_lower','macd','macd_signal','donchian_high','donchian_low','atr','volume','avg_volume','rvol','pct_change'];
+const rightIndicators=['number','close','sma','ema','vwap','rsi','adx','fib_retracement','sr_room_ratio','bb_upper','bb_lower','bb_width','keltner_upper','keltner_lower','macd','macd_signal','donchian_high','donchian_low','avg_volume'];
+const opLabels={gt:'>',lt:'<',gte:'≥',lte:'≤',eq:'=',crosses_above:'Crosses Above',crosses_below:'Crosses Below'};
+const noPeriodInd=new Set(['close','volume','vwap','macd','macd_signal','number',...candleIndSet]);
 const strategyTemplates={
+ bible_pinbar:{label:'Bible: Fib Pin Bar (1H)',name:'Trend Pullback + Fib Pin Bar',mode:'custom',timeframe:'1Hour',htfEma:50,minAdx:0,sizeMode:'risk',riskPct:1.5,candleStop:true,trailingStop:0,stop:3,take:9,cooldown:2,rules:{entryLogic:'all',exitLogic:'any',entry:[{left:{indicator:'close'},op:'gt',right:{indicator:'sma',period:100}},{left:{indicator:'fib_retracement',period:40},op:'gte',right:{indicator:'number',value:38}},{left:{indicator:'bullish_pin_bar'},op:'eq',right:{indicator:'number',value:1}}],exit:[{left:{indicator:'bearish_pin_bar'},op:'eq',right:{indicator:'number',value:1}},{left:{indicator:'bearish_engulfing'},op:'eq',right:{indicator:'number',value:1}}]}},
+ bible_fakey:{label:'Bible: Inside Fakey (4H)',name:'Inside Bar Fakey Stop-Hunt',mode:'custom',timeframe:'4Hour',htfEma:0,minAdx:0,sizeMode:'risk',riskPct:1,candleStop:true,trailingStop:0,stop:3.5,take:10.5,cooldown:1,rules:{entryLogic:'all',exitLogic:'any',entry:[{left:{indicator:'inside_bar_fakey'},op:'eq',right:{indicator:'number',value:1}},{left:{indicator:'close'},op:'gt',right:{indicator:'ema',period:21}},{left:{indicator:'sr_room_ratio',period:24},op:'gte',right:{indicator:'number',value:2}}],exit:[{left:{indicator:'bearish_pin_bar'},op:'eq',right:{indicator:'number',value:1}},{left:{indicator:'close'},op:'lt',right:{indicator:'ema',period:21}}]}},
+ bible_engulfing:{label:'Bible: 8/21 EMA Engulfing (4H)',name:'8/21 EMA Bullish Engulfing',mode:'custom',timeframe:'4Hour',htfEma:0,minAdx:20,sizeMode:'risk',riskPct:1.5,candleStop:true,trailingStop:2.5,stop:4,take:12,cooldown:1,rules:{entryLogic:'all',exitLogic:'any',entry:[{left:{indicator:'ema',period:8},op:'gt',right:{indicator:'ema',period:21}},{left:{indicator:'bullish_engulfing'},op:'eq',right:{indicator:'number',value:1}},{left:{indicator:'sr_room_ratio',period:24},op:'gte',right:{indicator:'number',value:1.5}}],exit:[{left:{indicator:'bearish_engulfing'},op:'eq',right:{indicator:'number',value:1}},{left:{indicator:'close'},op:'lt',right:{indicator:'ema',period:21}}]}},
  squeeze_crypto:{label:'Crypto Squeeze 1H',name:'Crypto Volatility Squeeze',mode:'custom',timeframe:'1Hour',htfEma:50,minAdx:20,trailingStop:2.5,stop:3,take:10,cooldown:3,rules:{entryLogic:'all',exitLogic:'any',entry:[{left:{indicator:'close'},op:'gt',right:{indicator:'bb_upper',period:20}},{left:{indicator:'close'},op:'gt',right:{indicator:'keltner_upper',period:20}},{left:{indicator:'rvol',period:20},op:'gt',right:{indicator:'number',value:1.5}}],exit:[{left:{indicator:'close'},op:'lt',right:{indicator:'sma',period:20}}]}},
  vwap_reclaim:{label:'Equity VWAP Reclaim',name:'Session VWAP Reclaim',mode:'custom',timeframe:'15Min',htfEma:50,minAdx:18,trailingStop:1.2,stop:1.5,take:4,cooldown:2,rules:{entryLogic:'all',exitLogic:'any',entry:[{left:{indicator:'close'},op:'crosses_above',right:{indicator:'vwap'}},{left:{indicator:'close'},op:'gt',right:{indicator:'ema',period:20}},{left:{indicator:'rsi',period:14},op:'gt',right:{indicator:'number',value:50}}],exit:[{left:{indicator:'close'},op:'crosses_below',right:{indicator:'vwap'}},{left:{indicator:'rsi',period:14},op:'gt',right:{indicator:'number',value:76}}]}},
  rsi2_dip:{label:'Connors RSI(2) Dip',name:'Connors RSI(2) Pullback',mode:'custom',timeframe:'15Min',htfEma:50,minAdx:0,trailingStop:0,stop:2.5,take:4,cooldown:2,rules:{entryLogic:'all',exitLogic:'any',entry:[{left:{indicator:'close'},op:'gt',right:{indicator:'ema',period:200}},{left:{indicator:'rsi',period:2},op:'lt',right:{indicator:'number',value:12}}],exit:[{left:{indicator:'close'},op:'gt',right:{indicator:'sma',period:5}}]}},
@@ -567,7 +572,7 @@ function previewMarkup(result) {
 }
 
 function requestStrategyPreview(){
- const draft = Object.fromEntries(['name','symbol','mode','timeframe','sizeMode','htfEma','minAdx','rules',...fields.map(([,key])=>key)].map(key=>[key,editor[key]]));
+ const draft = Object.fromEntries(['name','symbol','mode','timeframe','sizeMode','candleStop','htfEma','minAdx','rules',...fields.map(([,key])=>key)].map(key=>[key,editor[key]]));
  const key=JSON.stringify(draft);
  const unavailable=!online?'Connect to the worker to check closed candles.':!draft.symbol?'Select an instrument to preview closed candles.':'';
  if(unavailable){
@@ -612,11 +617,13 @@ function renderPlaybooks(){
 
 function renderKnowledgeLibrary(){
  const documents=state.knowledge??[];
+ const hasBible=documents.some(file=>file.name==='Candlestick-Trading-Bible-Rules.md');
  const files=documents.map(file=>'<div class="library-item"><div><b>'+esc(file.name)+'</b><small>'+num(file.bytes/1024)+' KB · '+stamp(file.uploadedAt)+'</small></div></div>').join('');
+ const presetBtn=hasBible?'':btn('Load Candlestick Trading Bible Guide (.md)','load-bible-guide','',false,online?'':'disabled');
  const upload='<form id="knowledge-upload" class="form"><label class="field"><span>Strategy document</span>'+
    '<input type="file" name="document" accept=".txt,.md,.markdown" required'+(online?'':' disabled')+'></label>'+
    '<small>UTF-8 text or Markdown, up to 32 KB per file. To use a document, select it in an AI strategy and save a version.</small>'+
-   '<div class="actions">'+submit('Upload document',!online)+'</div></form>';
+   '<div class="actions"><button class="button primary" '+(online?'':'disabled')+'>Upload document</button>'+presetBtn+'</div></form>';
  return panel('Trading knowledge base','Upload your own strategy notes, rules, or playbooks.',upload+(files||empty('No documents uploaded yet.')));
 }
 
@@ -667,20 +674,21 @@ function strategies(){
       `<form class="editor-form" id="strategy">${hidden}${playbook?'<div class="playbook-origin"><small>Based on '+esc(playbook.name)+'</small>'+btn('View playbooks','open-playbook-library')+'</div>':''}${sections}<div class="editor-save">${submit(online?'Save version':'Queue draft sync')}<small id="draft-status">${editor.queued?'Queued for sync':editor.dirty?'Local draft':''}</small></div></form>`)}
      </div><aside class="editor-rail">${library}${execution}${diagnostics}</aside></div></div>`;
  };
- const sizingMode=select('Position sizing mode','sizeMode',[['percent','% of Equity'],['usd','Fixed USD per trade']],editor.sizeMode??(isNotepad?'usd':'percent'),true);
+ const sizingMode=select('Position sizing mode','sizeMode',[['percent','% of Equity'],['usd','Fixed USD per trade'],['risk','Risk % per trade (1–2% rule)']],editor.sizeMode??(isNotepad?'usd':'percent'),true);
+ const candleStopField=check('Place protective stop below candlestick pattern tail (clamped by max stop-loss %)','candleStop',editor.candleStop);
  if(isAutonomous){
    const riskButtons=`<div class="template-bar"><span class="section-label">Risk Guardrail Presets</span><div class="actions">${Object.entries(autoRiskPresets).map(([k,p])=>btn(p.label,'apply-risk-preset',k,(editor.aiRiskProfile??'balanced')===k)).join('')}</div></div>`;
-   const autoTf=[['5Min','5 Minutes'],['15Min','15 Minutes (Recommended)'],['1Hour','1 Hour']];
+   const autoTf=[['5Min','5 Minutes'],['15Min','15 Minutes (Recommended)'],['1Hour','1 Hour'],['4Hour','4 Hours (Swing)'],['1Day','1 Day (Daily)']];
    const autoBase=field('Bot strategy name','name',editor.name,'required maxlength="60" placeholder="e.g. BTC Autonomous Agent"')+
      assetPicker('Asset / Token to trade','symbol',editor.symbol)+
      select('Saved version','version',[['','New draft'],...options],saved?key(saved):'')+
-     select('Candle timeframe','timeframe',autoTf,['5Min','15Min','1Hour'].includes(editor.timeframe)?editor.timeframe:'15Min',true)+
+     select('Candle timeframe','timeframe',autoTf,['5Min','15Min','1Hour','4Hour','1Day'].includes(editor.timeframe)?editor.timeframe:'15Min',true)+
      select('AI wake-up mode','aiWakeMode',[['smart','Smart Wake-Up (saves ~80% AI calls)'],['fixed','Fixed Candle (every closed bar)']],editor.aiWakeMode??'smart',true)+
      select('Position sizing','aiSizing',[['dynamic','Dynamic (AI picks 25% / 50% / 100%)'],['simple','Simple (100% in / 100% out)']],editor.aiSizing??'dynamic',true)+
      numeric('Max AI calls / day (0=unlimited)','aiDailyCap',editor.aiDailyCap??100,0,500,1);
    const autoRisk=[['Hard stop-loss (%)','stop',.1,50],['Trailing stop (%, 0=off)','trailingStop',0,50,.1],['Hard take-profit (%)','take',.1,100],['Daily loss circuit breaker (%)','dailyLoss',.1,50],['Post-stop cooldown (bars)','cooldown',0,60,1]].map(([label,k,min,max,step])=>numeric(label,k,editor[k]??defaultParams[k],min,max,step)).join('');
-   const hiddenAuto=`<input type="hidden" name="mode" value="ai_autonomous"><input type="hidden" name="aiRiskProfile" value="${esc(editor.aiRiskProfile??'balanced')}"><input type="hidden" name="sizeMode" value="percent"><input type="hidden" name="size" value="100"><input type="hidden" name="sizeUsd" value="${editor.sizeUsd??500}"><input type="hidden" name="exposure" value="100"><input type="hidden" name="period" value="12"><input type="hidden" name="entry" value="0.1"><input type="hidden" name="exit" value="-0.1"><input type="hidden" name="atrStop" value="0"><input type="hidden" name="maxHoldBars" value="0"><input type="checkbox" name="ai" checked hidden>`;
-   const guidanceBox=`<label class="field notepad-field"><span>Optional guidance for the AI (leave blank for full autonomy)</span><textarea name="aiNotes" class="ai-notepad" rows="4" maxlength="1000" placeholder="Optional: e.g. Prefer swing dips, avoid chasing green spikes, hold winners patiently.">${esc(editor.aiNotes??'')}</textarea><small>Set the USD budget when launching on Live Trading. The AI sees live candles, EMA/RSI/MACD/Bollinger/ATR, Alpaca News, round-trip fee costs, and its own last 5 decisions.</small></label>`;
+   const hiddenAuto=`<input type="hidden" name="mode" value="ai_autonomous"><input type="hidden" name="aiRiskProfile" value="${esc(editor.aiRiskProfile??'balanced')}"><input type="hidden" name="sizeMode" value="percent"><input type="hidden" name="size" value="100"><input type="hidden" name="sizeUsd" value="${editor.sizeUsd??500}"><input type="hidden" name="riskPct" value="${editor.riskPct??1}"><input type="hidden" name="exposure" value="100"><input type="hidden" name="period" value="12"><input type="hidden" name="entry" value="0.1"><input type="hidden" name="exit" value="-0.1"><input type="hidden" name="atrStop" value="0"><input type="hidden" name="maxHoldBars" value="0"><input type="checkbox" name="ai" checked hidden>`;
+   const guidanceBox=`<label class="field notepad-field"><span>Optional guidance for the AI (leave blank for full autonomy)</span><textarea name="aiNotes" class="ai-notepad" rows="4" maxlength="1000" placeholder="Optional: e.g. Prefer swing dips, avoid chasing green spikes, hold winners patiently.">${esc(editor.aiNotes??'')}</textarea><small>Set the USD budget when launching on Live Trading. The AI sees live candles, Candlestick Bible patterns, Fib/S&amp;R confluence, EMA/RSI/MACD/Bollinger/ATR, Alpaca News, round-trip fee costs, and its own last 5 decisions.</small></label>`;
    const keySource=state.botAiConfigured?`Dedicated Bot Key (${state.botAiInfo.provider} · ${state.botAiInfo.masked})`:state.aiConfigured?`Fallback server key (${state.aiProvider})`:'No AI key configured';
    const feeInfo=editor.symbol?.includes('/')?'50 bps round-trip (Crypto)':'~2 bps round-trip (Stock)';
    const autoCard=panel('Autonomous AI guardrails','Hard safety limits stay enforced even if AI is offline',
@@ -689,7 +697,7 @@ function strategies(){
      `<div class="bot-row"><span><b>Fee-aware prompting</b><small>${feeInfo} · Cooldown ${editor.cooldown??2} bars</small></span>${badge(editor.aiWakeMode==='fixed'?'Fixed':'Smart Wake')}</div>`+
      `<div class="form" style="padding-top:4px">${link('Manage Dedicated AI Bot Key in Settings','settings')}</div>`);
    return workspace(group('Strategy setup',autoBase)+group('AI guidance',guidanceBox,'editor-flow')+group('Knowledge sources',knowledgePicker(),'editor-flow')+
-     group('Risk limits',riskButtons+'<div class="fields">'+autoRisk+'</div>','editor-flow'),autoCard,hiddenAuto);
+     group('Risk limits',riskButtons+'<div class="fields">'+autoRisk+'</div>'+candleStopField,'editor-flow'),autoCard,hiddenAuto);
  }
  if(isNotepad){
    const noteTemplates=`<div class="template-bar"><span class="section-label">AI Notepad Starters</span><div class="actions">${Object.entries(notepadTemplates).map(([k,t])=>btn(t.label,'apply-note-template',k)).join('')}</div></div>`;
@@ -697,12 +705,12 @@ function strategies(){
      assetPicker('Instrument or pair','symbol',editor.symbol)+
      select('Saved version','version',[['','New draft'],...options],saved?key(saved):'')+
      select('Candle timeframe','timeframe',tfOptions,editor.timeframe??'15Min',true);
-   const noteRisk=[['Position size (% equity)','size',.1,100],['Maximum exposure (% equity)','exposure',.1,100],['Stop-loss (%)','stop',.1,50],['Trailing stop (%, 0=off)','trailingStop',0,50,.1],['Take-profit (%)','take',.1,100],['Maximum daily loss (%)','dailyLoss',.1,50],['Stop-loss cooldown (bars)','cooldown',0,60,1],['Max hold (bars, 0=off)','maxHoldBars',0,1440,1]].map(([label,k,min,max,step])=>numeric(label,k,editor[k]??defaultParams[k],min,max,step)).join('');
+   const noteRisk=[['Risk per trade (% capital)','riskPct',.1,10,.1],['Position size (% equity)','size',.1,100],['Maximum exposure (% equity)','exposure',.1,100],['Stop-loss (%)','stop',.1,50],['Trailing stop (%, 0=off)','trailingStop',0,50,.1],['Take-profit (%)','take',.1,100],['Maximum daily loss (%)','dailyLoss',.1,50],['Stop-loss cooldown (bars)','cooldown',0,60,1],['Max hold (bars, 0=off)','maxHoldBars',0,1440,1]].map(([label,k,min,max,step])=>numeric(label,k,editor[k]??defaultParams[k],min,max,step)).join('');
    const hiddenDefaults=`<input type="hidden" name="mode" value="ai_notepad"><input type="hidden" name="period" value="${editor.period??12}"><input type="hidden" name="entry" value="${editor.entry??0.1}"><input type="hidden" name="exit" value="${editor.exit??-0.1}"><input type="hidden" name="atrStop" value="${editor.atrStop??0}"><input type="checkbox" name="ai" checked hidden>`;
-   const notepadBox=`<label class="field notepad-field"><span>Trading instructions (optional when a document is selected)</span><textarea name="aiNotes" class="ai-notepad" rows="12" maxlength="4000" placeholder="Example:\nBUY when price is above EMA 20 and RSI(14) pulls back below 40 with no bearish news.\nSELL when RSI(14) > 72 or price drops below EMA 20.\nOtherwise HOLD.">${esc(editor.aiNotes??'')}</textarea><small>${(editor.aiNotes??'').length} / 4000 characters · ${state.aiConfigured?esc(state.aiProvider)+' will read these notes + live candles, EMA/SMA/RSI/ATR, position P&amp;L, and Alpaca News on every bar.':'Configure GEMINI_API_KEY or OPENAI_API_KEY in server env to run AI Notepad bots.'}</small></label>`;
-   const guardCard=panel('AI Notepad guardrails','Hard risk limits always stay enforced in code',`<div class="bot-row"><span><b>AI engine</b><small>${state.aiConfigured?esc(state.aiProvider)+' active':'API key required'}</small></span>${badge(state.aiConfigured?'Ready':'Unconfigured',state.aiConfigured?'good':'bad')}</div><div class="bot-row"><span><b>Protective exits</b><small>Stop-loss ${editor.stop??2}% · Trail ${editor.trailingStop??0}% · Take-profit ${editor.take??4}%</small></span>${badge('Hard-coded','good')}</div><div class="bot-row"><span><b>Live context sent to AI</b><small>OHLCV candles, SMA12, EMA20/50, RSI14, ATR14, open P&amp;L &amp; Alpaca News</small></span>${badge(editor.timeframe??'15Min')}</div>`);
+   const notepadBox=`<label class="field notepad-field"><span>Trading instructions (optional when a document is selected)</span><textarea name="aiNotes" class="ai-notepad" rows="12" maxlength="4000" placeholder="Example:\nBUY when price is above EMA 20 and RSI(14) pulls back below 40 with no bearish news.\nSELL when RSI(14) > 72 or price drops below EMA 20.\nOtherwise HOLD.">${esc(editor.aiNotes??'')}</textarea><small>${(editor.aiNotes??'').length} / 4000 characters · ${state.aiConfigured?esc(state.aiProvider)+' will read these notes + live candles, Candlestick Bible patterns, Fib/S&amp;R confluence, EMA/RSI/ATR, position P&amp;L, and Alpaca News on every bar.':'Configure GEMINI_API_KEY or OPENAI_API_KEY in server env to run AI Notepad bots.'}</small></label>`;
+   const guardCard=panel('AI Notepad guardrails','Hard risk limits always stay enforced in code',`<div class="bot-row"><span><b>AI engine</b><small>${state.aiConfigured?esc(state.aiProvider)+' active':'API key required'}</small></span>${badge(state.aiConfigured?'Ready':'Unconfigured',state.aiConfigured?'good':'bad')}</div><div class="bot-row"><span><b>Protective exits</b><small>Stop-loss ${editor.stop??2}% · Trail ${editor.trailingStop??0}% · Take-profit ${editor.take??4}%</small></span>${badge('Hard-coded','good')}</div><div class="bot-row"><span><b>Live context sent to AI</b><small>OHLCV, Pin/Engulfing/Fakey patterns, Fib50, S/R room, EMA8/21/50, RSI14, ATR14 &amp; News</small></span>${badge(editor.timeframe??'15Min')}</div>`);
    return workspace(group('Strategy setup',noteBase)+group('Trading instructions',noteTemplates+notepadBox,'editor-flow')+group('Knowledge sources',knowledgePicker(),'editor-flow')+
-     group('Position sizing and risk',sizingMode+numeric('Fixed size (USD)','sizeUsd',editor.sizeUsd??500,1,1e9,1)+noteRisk),guardCard,hiddenDefaults);
+     group('Position sizing and risk','<div class="fields">'+sizingMode+numeric('Fixed size (USD)','sizeUsd',editor.sizeUsd??500,1,1e9,1)+noteRisk+'</div>'+candleStopField,'editor-flow'),guardCard,hiddenDefaults);
  }
  const templatesBar=`<div class="template-bar"><span class="section-label">1-Click Templates</span><div class="actions">${Object.entries(strategyTemplates).map(([k,t])=>btn(t.label,'apply-template',k)).join('')}</div></div>`;
  const baseInputs=field('Strategy name','name',editor.name,'required maxlength="60"')+assetPicker('Instrument or pair','symbol',editor.symbol)+
@@ -717,10 +725,10 @@ function strategies(){
  const aiSection=check('Require AI confirmation for non-protective signals','ai',editor.ai)+
  field('Custom AI confirmation rule (optional)','aiPrompt',editor.aiPrompt??'','maxlength="300" placeholder="e.g. Veto buys if news is bearish or candle jumped >2%"')+
  '<small>'+(state.aiConfigured?esc(state.aiProvider ?? 'AI provider')+' configured (with live Alpaca News headlines). Historical replay uses deterministic rules.':'Configure a Gemini or OpenAI key in the server environment to enable AI confirmation.')+'</small>';
- const htfField=select('Higher-timeframe trend filter','htfEma',[['0','Off'],['20','1H Close > 1H EMA(20)'],['50','1H Close > 1H EMA(50)'],['100','1H Close > 1H EMA(100)']],String(editor.htfEma??0))+
+ const htfField=select('Higher-timeframe trend filter','htfEma',[['0','Off'],['20','HTF Close > HTF EMA(20)'],['50','HTF Close > HTF EMA(50)'],['100','HTF Close > HTF EMA(100)']],String(editor.htfEma??0))+
    select('ADX chop guard (min trend strength)','minAdx',[['0','Off'],['18','ADX(14) ≥ 18 (Skip dead chop)'],['22','ADX(14) ≥ 22 (Recommended for breakouts)'],['25','ADX(14) ≥ 25 (Strong trends only)']],String(editor.minAdx??0));
  return workspace(group('Strategy setup',baseInputs+htfField)+group('Signal rules',templatesBar+'<div class="fields">'+indicators+'</div>'+ruleBuilder,'editor-flow')+
-   group('AI confirmation',aiSection,'editor-flow')+group('Position sizing and risk',sizingMode+riskInputs),renderLiveDebugger());
+   group('AI confirmation',aiSection,'editor-flow')+group('Position sizing and risk','<div class="fields">'+sizingMode+riskInputs+'</div>'+candleStopField,'editor-flow'),renderLiveDebugger());
 }
 function backtesting(){
  const runs=state.runs;
@@ -738,16 +746,17 @@ function backtesting(){
  if(runB===null&&runs.length>1)runB=runs.find(run=>run.id!==runA)?.id??'';
  const a=runs.find(run=>run.id===runA);
  const b=runs.find(run=>run.id===runB&&run.id!==runA);
+ const defaultDays=chosen?.timeframe==='1Day'?120:chosen?.timeframe==='4Hour'?45:chosen?.timeframe==='1Hour'?21:7;
  const inputs=select('Saved strategy','version',[['','Choose a saved strategy'],...eligible.map(strategy=>
    [key(strategy),strategy.name+' v'+strategy.version+' · '+strategy.symbol+' ('+(strategy.timeframe??'1Min')+')'+(strategy.ai?' · rules only':'')])],chosen?key(chosen):'',true)+
-   field('Start date','start',draft.start??date(Date.now()-86400000*7),'type="date" required')+
+   field('Start date','start',draft.start??date(Date.now()-86400000*defaultDays),'type="date" required')+
    field('End date','end',draft.end??date(Date.now()),'type="date" required')+
    numeric('Starting capital (USD)','capital',draft.capital??100000,100,1e9,1)+
    field('Bot budget cap (USD)','budget',draft.budget??'','type="number" min="1" max="1000000000" step="0.01" placeholder="Optional"')+
    numeric('Fees (bps)','fees',draft.fees??(isCrypto?25:1),0,500)+
    numeric('Slippage (bps)','slippage',draft.slippage??(isCrypto?5:2),0,500);
  const configuration=panel('Run configuration','Choose a saved strategy and model execution costs.',
-   form('backtest',inputs,`<small>Orders fill at the next bar’s open. AI Notepad and Autonomous AI require live evaluation.</small>
+   form('backtest',inputs,`<small>Orders fill at the next bar’s open. Up to 180 days on 1H/4H/1D strategies (31 days on 1m–15m). AI Notepad and Autonomous AI require live evaluation.</small>
      ${!eligible.length?link('Create a rule-based strategy','strategies?new'):submit('Run backtest',!online)}`),'','backtest-config');
  const m=a?.metrics;
  const resultReturn=a?.capital>0?100*(a.final/a.capital-1):null;
@@ -1261,6 +1270,7 @@ function capture(form){
  const data=values(form);
  delete data.version;
  delete data.knowledgeId;
+ delete data.candleStop;
  if(['ai_notepad','ai_autonomous'].includes(data.mode)){
    const ids=[...form.querySelectorAll('[name="knowledgeId"]:checked')].map(input=>input.value);
    data.knowledgeIds=JSON.stringify(ids)===JSON.stringify(editor.knowledgeIds??[])?editor.knowledgeIds??[]:ids;
@@ -1270,8 +1280,9 @@ function capture(form){
  if(data.aiDailyCap!==undefined)data.aiDailyCap=+data.aiDailyCap;
  if(data.htfEma!==undefined)data.htfEma=+data.htfEma;
  if(data.minAdx!==undefined)data.minAdx=+data.minAdx;
- const changed=Object.entries({...data,ai:form.elements.ai.checked}).some(([k,v])=>editor[k]!==v);
- editor={...editor,...data,ai:form.elements.ai.checked,dirty:true,mutation:changed||!editor.dirty?crypto.randomUUID():editor.mutation};
+ const candleStop=form.elements.candleStop?form.elements.candleStop.checked:Boolean(editor.candleStop);
+ const changed=Object.entries({...data,ai:form.elements.ai.checked,candleStop}).some(([k,v])=>editor[k]!==v);
+ editor={...editor,...data,ai:form.elements.ai.checked,candleStop,dirty:true,mutation:changed||!editor.dirty?crypto.randomUUID():editor.mutation};
  if(!authInfo?.required)write('ft-draft',editor);
  $('#draft-status').textContent='Local draft';
 }
@@ -1599,6 +1610,14 @@ document.addEventListener('click',async event=>{
  if(action==='edit')editor=structuredClone(version(value));
  if(action==='new'){editor=fresh();playbookLibraryOpen=false}
  if(action==='open-playbook-library')playbookLibraryOpen=true;
+ if(action==='load-bible-guide'){
+   if(!online||pending)return;
+   pending=true;el.disabled=true;
+   try{await api('knowledge',{preset:'candlestick-bible'});await refresh(true);toast('Candlestick Trading Bible guide added to Knowledge Base.')}
+   catch(error){toast(error.message)}
+   finally{pending=false;el.disabled=false}
+   return;
+ }
  if(action==='portfolio-session'){
    if(!online||pending)return;
    pending=true;
@@ -1629,7 +1648,7 @@ document.addEventListener('click',async event=>{
      editor={...editor,mode:'ai_notepad',ai:true,timeframe:editor?.timeframe==='1Min'?'15Min':(editor?.timeframe??'15Min'),dirty:true,mutation:crypto.randomUUID()};
    }else if(value==='ai_autonomous'){
      const p=autoRiskPresets[editor?.aiRiskProfile??'balanced']??autoRiskPresets.balanced;
-     editor={...editor,mode:'ai_autonomous',ai:true,timeframe:['5Min','15Min','1Hour'].includes(editor?.timeframe)?editor.timeframe:'15Min',aiWakeMode:editor?.aiWakeMode??'smart',aiRiskProfile:editor?.aiRiskProfile??'balanced',aiSizing:editor?.aiSizing??'dynamic',aiDailyCap:editor?.aiDailyCap??100,size:100,exposure:100,stop:p.stop,trailingStop:p.trailingStop,take:p.take,dailyLoss:p.dailyLoss,cooldown:p.cooldown,dirty:true,mutation:crypto.randomUUID()};
+     editor={...editor,mode:'ai_autonomous',ai:true,timeframe:['5Min','15Min','1Hour','4Hour','1Day'].includes(editor?.timeframe)?editor.timeframe:'15Min',aiWakeMode:editor?.aiWakeMode??'smart',aiRiskProfile:editor?.aiRiskProfile??'balanced',aiSizing:editor?.aiSizing??'dynamic',aiDailyCap:editor?.aiDailyCap??100,size:100,exposure:100,stop:p.stop,trailingStop:p.trailingStop,take:p.take,dailyLoss:p.dailyLoss,cooldown:p.cooldown,dirty:true,mutation:crypto.randomUUID()};
    }else{
      editor={...editor,mode:['ai_notepad','ai_autonomous'].includes(editor?.mode)?'momentum':(editor?.mode??'momentum'),dirty:true,mutation:crypto.randomUUID()};
    }
@@ -1766,7 +1785,10 @@ document.addEventListener('change',event=>{
        row[p1][p2]=p2==='indicator'?t.value:+t.value;
        if(p2==='indicator'){
          if(t.value==='number')row[p1]={indicator:'number',value:row[p1].value??50};
-         else if(noPeriodInd.has(t.value))row[p1]={indicator:t.value};
+         else if(noPeriodInd.has(t.value)){
+           row[p1]={indicator:t.value};
+           if(p1==='left'&&candleIndSet.has(t.value)){row.op='eq';row.right={indicator:'number',value:1}}
+         }
          else row[p1]={indicator:t.value,period:row[p1].period??14};
        }
      } else row[p1]=t.value;
@@ -1795,6 +1817,8 @@ document.addEventListener('change',event=>{
    const strat=version(event.target.value);
    if(strat&&event.target.form){
      const isCryptoAsset=strat.symbol?.includes('/');
+     const defDays=strat.timeframe==='1Day'?120:strat.timeframe==='4Hour'?45:strat.timeframe==='1Hour'?21:7;
+     event.target.form.elements.start.value=date(Date.now()-86400000*defDays);
      event.target.form.elements.fees.value=isCryptoAsset?25:1;
      event.target.form.elements.slippage.value=isCryptoAsset?5:2;
      backtestDraft=values(event.target.form);

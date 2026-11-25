@@ -188,5 +188,147 @@ export const strategyPlaybooks = {
         exit: [{ left: { indicator: 'close' }, op: 'gt', right: { indicator: 'sma', period: 5 } }]
       }
     }
+  },
+  'bible-trend-pinbar': {
+    name: 'Trend Pullback + Fib Pin Bar',
+    category: 'Price action · Candlestick Bible',
+    author: 'Munehisa Homma · The Candlestick Trading Bible (pp. 39–42, 96, 111–116)',
+    source: 'The Candlestick Trading Bible — Pin Bar With Trend & Fibonacci Retracement',
+    url: 'https://www.investopedia.com/terms/p/pinbar.asp',
+    evidence: 'Price-action confluence playbook',
+    setup: 'Trades high-probability bullish Pin Bars (long lower rejection tail ≥ 60% of candle range) only when pulling back into a 38%–68% Fibonacci retracement inside an established uptrend.',
+    entry: 'Buy on 1-hour closed bars when Close > SMA(100), Fib Retracement(40) ≥ 38%, and a Bullish Pin Bar prints.',
+    exit: 'Sell on a Bearish Pin Bar / Bearish Engulfing reversal, or via Pattern-Tail Stop-Loss and 3:1 Take-Profit.',
+    caution: 'Never trade Pin Bars in isolation or in choppy 1m/5m noise; wait for higher-timeframe confluence.',
+    adaptation: 'Uses 1H bars, Pattern-Tail Stop placement below the Pin Bar wick, 1.5% risk-based position sizing, and a 3:1 reward-to-risk target.',
+    draft: {
+      timeframe: '1Hour',
+      htfEma: 50,
+      sizeMode: 'risk',
+      riskPct: 1.5,
+      candleStop: true,
+      stop: 3,
+      trailingStop: 0,
+      take: 9,
+      cooldown: 2,
+      rules: {
+        entryLogic: 'all', exitLogic: 'any',
+        entry: [
+          { left: { indicator: 'close' }, op: 'gt', right: { indicator: 'sma', period: 100 } },
+          { left: { indicator: 'fib_retracement', period: 40 }, op: 'gte', right: { indicator: 'number', value: 38 } },
+          { left: { indicator: 'bullish_pin_bar' }, op: 'eq', right: { indicator: 'number', value: 1 } }
+        ],
+        exit: [
+          { left: { indicator: 'bearish_pin_bar' }, op: 'eq', right: { indicator: 'number', value: 1 } },
+          { left: { indicator: 'bearish_engulfing' }, op: 'eq', right: { indicator: 'number', value: 1 } }
+        ]
+      }
+    }
+  },
+  'bible-ma-engulfing': {
+    name: 'Dynamic 8 & 21 EMA Bullish Engulfing (4H)',
+    category: 'Trend continuation · Candlestick Bible',
+    author: 'Munehisa Homma · The Candlestick Trading Bible (pp. 23–25, 117–124)',
+    source: 'The Candlestick Trading Bible — Trading the Engulfing Bar With Moving Averages',
+    url: 'https://www.investopedia.com/terms/b/bullishengulfingpattern.asp',
+    evidence: '4-hour swing price-action playbook',
+    setup: 'Captures institutional trend continuations on 4-hour charts when price pulls back to dynamic 8 & 21 moving average support and prints a full Bullish Engulfing candle.',
+    entry: 'Buy on 4-hour bars when EMA(8) > EMA(21), ADX(14) ≥ 20, S/R Overhead Room(24) ≥ 1.5×, and a Bullish Engulfing candle closes.',
+    exit: 'Sell on a Bearish Engulfing candle, Close < EMA(21), or when 3:1 R:R / Pattern-Tail Stop triggers.',
+    caution: 'Avoid trading engulfing bars when overhead resistance caps reward-to-risk below 1.5:1.',
+    adaptation: 'Runs natively on 4-hour candles with 1.5% risk-per-trade sizing, Pattern-Tail Stop below the engulfing low, and 3:1 R:R.',
+    draft: {
+      timeframe: '4Hour',
+      minAdx: 20,
+      sizeMode: 'risk',
+      riskPct: 1.5,
+      candleStop: true,
+      stop: 4,
+      trailingStop: 2.5,
+      take: 12,
+      cooldown: 1,
+      rules: {
+        entryLogic: 'all', exitLogic: 'any',
+        entry: [
+          { left: { indicator: 'ema', period: 8 }, op: 'gt', right: { indicator: 'ema', period: 21 } },
+          { left: { indicator: 'bullish_engulfing' }, op: 'eq', right: { indicator: 'number', value: 1 } },
+          { left: { indicator: 'sr_room_ratio', period: 24 }, op: 'gte', right: { indicator: 'number', value: 1.5 } }
+        ],
+        exit: [
+          { left: { indicator: 'bearish_engulfing' }, op: 'eq', right: { indicator: 'number', value: 1 } },
+          { left: { indicator: 'close' }, op: 'lt', right: { indicator: 'ema', period: 21 } }
+        ]
+      }
+    }
+  },
+  'bible-inside-fakey': {
+    name: 'Inside Bar "Fakey" Liquidity Stop-Hunt (4H)',
+    category: 'Institutional reversal · Candlestick Bible',
+    author: 'Munehisa Homma · The Candlestick Trading Bible (pp. 49–53, 148–157)',
+    source: 'The Candlestick Trading Bible — The Inside Bar False Breakout Strategy',
+    url: 'https://www.investopedia.com/terms/i/inside-day.asp',
+    evidence: 'Stop-hunt false-breakout playbook',
+    setup: 'Exploits smart-money liquidity sweeps where price forms an Inside Bar inside a Mother Bar, pokes below the Inside Bar low to trigger retail stops, and snaps back bullishly.',
+    entry: 'Buy on 4-hour bars when Inside Bar Fakey == 1, Close > EMA(21), and S/R Overhead Room(24) ≥ 2×.',
+    exit: 'Sell if a Bearish Pin Bar prints, Close < EMA(21), or via Pattern-Tail Stop below the sweep low and 3:1 R:R target.',
+    caution: 'Wait for the candle to fully close back inside the Mother/Inside Bar range before entering.',
+    adaptation: 'Evaluates 3-bar Mother + Inside + Liquidity-Sweep Fakey patterns on 4H candles with 1% risk sizing and Pattern-Tail Stop.',
+    draft: {
+      timeframe: '4Hour',
+      sizeMode: 'risk',
+      riskPct: 1,
+      candleStop: true,
+      stop: 3.5,
+      trailingStop: 0,
+      take: 10.5,
+      cooldown: 1,
+      rules: {
+        entryLogic: 'all', exitLogic: 'any',
+        entry: [
+          { left: { indicator: 'inside_bar_fakey' }, op: 'eq', right: { indicator: 'number', value: 1 } },
+          { left: { indicator: 'close' }, op: 'gt', right: { indicator: 'ema', period: 21 } },
+          { left: { indicator: 'sr_room_ratio', period: 24 }, op: 'gte', right: { indicator: 'number', value: 2 } }
+        ],
+        exit: [
+          { left: { indicator: 'bearish_pin_bar' }, op: 'eq', right: { indicator: 'number', value: 1 } },
+          { left: { indicator: 'close' }, op: 'lt', right: { indicator: 'ema', period: 21 } }
+        ]
+      }
+    }
+  },
+  'bible-bollinger-range-pin': {
+    name: 'Range Support + Bollinger Pin Bar',
+    category: 'Range reversal · Candlestick Bible',
+    author: 'Munehisa Homma · The Candlestick Trading Bible (pp. 71–78, 106–108)',
+    source: 'The Candlestick Trading Bible — Trading Pin Bars in Range-Bound Markets',
+    url: 'https://www.bollingerbands.com/bollinger-band-rules',
+    evidence: 'Horizontal support + band rejection',
+    setup: 'Trades clear horizontal range boundaries confirmed by lower Bollinger/RSI exhaustion and a long-wick Bullish Pin Bar rejection.',
+    entry: 'Buy on 1-hour bars when Bullish Pin Bar == 1, RSI(14) < 45, and S/R Overhead Room(30) ≥ 2× to range resistance.',
+    exit: 'Sell at the opposite Bollinger Upper Band(20), on a Bearish Pin Bar, or via Pattern-Tail Stop.',
+    caution: 'Skip range fades right before major macro news breakouts when bands squeeze tightly.',
+    adaptation: 'Combines Pin Bar tail rejection, RSI < 45 oversold confirmation, and ≥ 2:1 room to 30-bar resistance on 1H bars.',
+    draft: {
+      timeframe: '1Hour',
+      sizeMode: 'risk',
+      riskPct: 1,
+      candleStop: true,
+      stop: 2.5,
+      trailingStop: 0,
+      take: 6,
+      cooldown: 2,
+      rules: {
+        entryLogic: 'all', exitLogic: 'any',
+        entry: [
+          { left: { indicator: 'bullish_pin_bar' }, op: 'eq', right: { indicator: 'number', value: 1 } },
+          { left: { indicator: 'rsi', period: 14 }, op: 'lt', right: { indicator: 'number', value: 45 } },
+          { left: { indicator: 'sr_room_ratio', period: 30 }, op: 'gte', right: { indicator: 'number', value: 2 } }
+        ],
+        exit: [
+          { left: { indicator: 'close' }, op: 'gte', right: { indicator: 'bb_upper', period: 20 } },
+          { left: { indicator: 'bearish_pin_bar' }, op: 'eq', right: { indicator: 'number', value: 1 } }
+        ]
+      }
+    }
   }
 };

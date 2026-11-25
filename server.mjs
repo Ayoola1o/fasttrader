@@ -2,7 +2,7 @@ import { replayPortfolio, createPaperPortfolio, stepPaperPortfolio, paperPortfol
 import { createServer } from 'node:http';
 import { readFile, mkdir, writeFile, rename } from 'node:fs/promises';
 import { randomUUID, createHash, createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
-import { instruments, defaults, strategy, decision, replay, downsampleCurve, synthetic, botLedger, isCrypto, cryptoReplayRules, roundDown, strategyWindow, entrySignal, evaluateRuleSet, aggregateBars, closedStrategyBars, computeATR, computeRSI, computeADX, computeVWAP, classifyRegime, indicatorValue, timeframes, ruleWarmupBars, shouldWakeAutonomousAI } from './engine.mjs';
+import { instruments, defaults, strategy, decision, replay, downsampleCurve, synthetic, botLedger, isCrypto, cryptoReplayRules, roundDown, strategyWindow, entrySignal, evaluateRuleSet, aggregateBars, closedStrategyBars, computeATR, computeRSI, computeADX, computeVWAP, classifyRegime, detectCandlestickPatterns, indicatorValue, timeframes, ruleWarmupBars, shouldWakeAutonomousAI } from './engine.mjs';
 import { assessSignal, signalProvider, testProviderKey, defaultGeminiModel } from './signal-ai.mjs';
 import { createAuth, sameSecret } from './auth.mjs';
 import { createStore } from './store.mjs';
@@ -661,12 +661,16 @@ function orderContext(bot, s, bars, series = strategyBars(s, bars)) {
   } else {
     bot.highWater = null;
     bot.holdBars = 0;
+    bot.candleStopPct = null;
   }
-  const htfBars = s.htfEma > 0 ? strategyBars({ symbol: s.symbol, timeframe: '1Hour' }, bars) : undefined;
+  const htfTf = ['4Hour', '1Day'].includes(tf) ? tf : '1Hour';
+  if (s.htfEma > 0 && htfTf !== tf) void loadTimeframe({ symbol: s.symbol, timeframe: htfTf });
+  const htfBars = s.htfEma > 0 ? strategyBars({ symbol: s.symbol, timeframe: htfTf }, bars) : undefined;
   return {
     position, price, ledger, cash, rules, warmedUp, warmupCount: window.length, warmupNeeded, cooldown, volume, atr, timeframe: tf,
     proposal: decision(s, window.map(b => b.c), account, position, price, rules, {
-      warmedUp, cooldown, volume, atr, bars: window, htfBars, highWater: bot.highWater, holdBars: bot.holdBars ?? 0
+      warmedUp, cooldown, volume, atr, bars: window, htfBars, highWater: bot.highWater, holdBars: bot.holdBars ?? 0,
+      stopPct: bot.candleStopPct, budget: hasBudget(bot.budget) ? bot.budget : undefined
     })
   };
 }
@@ -699,15 +703,19 @@ async function completeAI(job) {
   try {
     const headlines = await recentNews(s.symbol);
     const rich = s.mode === 'ai_notepad' || s.mode === 'ai_autonomous';
+    const candle = detectCandlestickPatterns(bars);
+    const patterns = { active: candle.active, anatomy: candle.anatomy, setupLow: candle.setupLow };
     const indicators = rich ? {
       sma12: indicatorValue(bars, { indicator: 'sma', period: 12 }),
-      ema9: indicatorValue(bars, { indicator: 'ema', period: 9 }),
-      ema20: indicatorValue(bars, { indicator: 'ema', period: 20 }),
+      ema8: indicatorValue(bars, { indicator: 'ema', period: 8 }),
+      ema21: indicatorValue(bars, { indicator: 'ema', period: 21 }),
       ema50: indicatorValue(bars, { indicator: 'ema', period: 50 }),
       rsi14: computeRSI(bars.map(b => b.c), 14),
       adx14: computeADX(bars, 14),
       vwap: computeVWAP(bars),
       rvol20: indicatorValue(bars, { indicator: 'rvol', period: 20 }),
+      fibRetracement50: indicatorValue(bars, { indicator: 'fib_retracement', period: 50 }),
+      srRoomRatio40: indicatorValue(bars, { indicator: 'sr_room_ratio', period: 40 }),
       macd: indicatorValue(bars, { indicator: 'macd' }),
       macdSignal: indicatorValue(bars, { indicator: 'macd_signal' }),
       bbUpper: indicatorValue(bars, { indicator: 'bb_upper', period: 20 }),
@@ -723,6 +731,7 @@ async function completeAI(job) {
     const knowledge = proposal.aiAutonomous ? strategyKnowledge(s, proposal.side, proposal.aiFreeRoam) : [];
     model = await assessSignal(provider, s.symbol, proposal.side, bars, fetch, {
       price, rationale: proposal.rationale, period: s.period, mode: s.mode ?? 'momentum', timeframe: s.timeframe ?? '1Min',
+      patterns,
       ...(proposal.aiAutonomous ? { aiAutonomous: true, aiNotes: s.aiNotes, indicators, regime } : {}),
       ...(proposal.aiFreeRoam ? {
         aiFreeRoam: true, aiRiskProfile: s.aiRiskProfile ?? 'balanced', aiSizing: s.aiSizing ?? 'dynamic',
@@ -964,6 +973,7 @@ async function applySignal(candidate, model = null) {
     order.filledAt = time();
     state.cash += qty * latest * (execSide === 'buy' ? -1 : 1);
     if (execSide === 'buy') {
+      if (Number.isFinite(proposal.stopPct) && proposal.stopPct > 0) bot.candleStopPct = proposal.stopPct;
       const existingPos = state.positions.find(p => p.symbol === s.symbol);
       if (existingPos) {
         const totalQty = existingPos.qty + qty;
@@ -974,6 +984,7 @@ async function applySignal(candidate, model = null) {
         state.positions.push({ symbol: s.symbol, qty, entry: latest, price: latest, strategy: s.name });
       }
     } else {
+      bot.candleStopPct = null;
       order.pnl = qty * (latest - position.entry);
       if (proposal.stopLoss) bot.cooldownBars = s.cooldown ?? 0;
       if (position.qty - qty > 1e-9) position.qty = Number((position.qty - qty).toFixed(9));
@@ -996,6 +1007,8 @@ async function applySignal(candidate, model = null) {
       })
     });
     updateOrder(normalize(submitted));
+    if (execSide === 'buy' && Number.isFinite(proposal.stopPct) && proposal.stopPct > 0) bot.candleStopPct = proposal.stopPct;
+    if (execSide === 'sell') bot.candleStopPct = null;
     if (proposal.stopLoss) bot.cooldownBars = s.cooldown ?? 0;
   } catch (error) {
     if ([400, 403, 422].includes(error.status)) {
@@ -1041,7 +1054,7 @@ function loadTimeframe(s) {
   const duration = timeframes[s.timeframe];
   const end = Math.floor(Date.now() / duration) * duration;
   const days = demo || isCrypto(s.symbol) ? 1 + Math.ceil(maxStrategyBars * duration / 86400000) :
-    { '5Min': 10, '15Min': 25, '1Hour': 65 }[s.timeframe];
+    ({ '5Min': 10, '15Min': 25, '1Hour': 65, '4Hour': 180, '1Day': 400 }[s.timeframe] ?? 65);
   const load = history(s.symbol, end - days * 86400000, end - 1, s.timeframe)
     .then(bars => {
       const closed = closedStrategyBars(bars, s.timeframe, end).slice(-maxStrategyBars);
@@ -1582,8 +1595,33 @@ async function change(path, input) {
     return { running: true };
   }
   if (path === '/api/knowledge') {
-    const name = typeof input.name === 'string' ? input.name.trim() : '';
-    const text = typeof input.text === 'string' ? input.text.replace(/^\uFEFF/, '').trim() : '';
+    const bibleGuide = `# The Candlestick Trading Bible — Price Action & Risk Playbook
+
+## Core Philosophy & Timeframe Discipline
+- Never trade candlestick patterns in isolation. Require **Trend + Key Level (Support/Resistance, 8/21 EMA, or 50%–61.8% Fibonacci) + Candlestick Signal** confluence.
+- Focus on higher timeframes (**1Hour, 4Hour, 1Day**) where institutional order flow dominates; avoid 1m/5m noise and high fee drag.
+- Always demand at least **2:1 to 3:1 Reward-to-Risk** overhead room before resistance; never buy directly beneath major resistance.
+
+## High-Probability Entry Setups (Buy When Flat)
+1. **Trend Pullback + Golden Fib Pin Bar**:
+   - Setup: Confirmed uptrend (higher highs/lows, Close above 50/100 MA or 8/21 EMA).
+   - Entry: Buy when price pulls back into dynamic EMA(21) or the **50%–61.8% Fibonacci retracement** zone and closes a **Bullish Pin Bar** (lower rejection tail >= 60% of range, small body/nose in upper third).
+2. **Dynamic 8 & 21 EMA Bullish Engulfing**:
+   - Setup: Clear uptrend with EMA(8) > EMA(21) and ADX >= 20.
+   - Entry: Buy when a pullback into the 8/21 EMA pocket closes a **Bullish Engulfing** bar whose real body completely engulfs the prior red body.
+3. **Inside Bar Breakout & "Fakey" Stop-Hunt**:
+   - Setup: A small **Inside Bar** forms completely inside a prior **Mother Bar** high-to-low range.
+   - Entry (Fakey): Buy when price sweeps below the Inside Bar low to hunt retail stop-losses, then snaps back to close above the Inside Bar low with >= 2x room to resistance.
+4. **Range Support + Lower Bollinger Pin Bar / Morning Star / Tweezer Bottom**:
+   - Setup: Well-defined horizontal range support aligned with Lower Bollinger Band(20) and oversold RSI (< 45).
+   - Entry: Buy on a closed Bullish Pin Bar, Tweezer Bottom, or 3-bar Morning Star rejecting the support floor.
+
+## Exit & Money Management Rules (Sell / Risk Control)
+- **Stop-Loss**: Place protective stop just below the **Pin Bar tail, Engulfing low, or Fakey sweep low** (with a small ATR buffer), risking strictly **1% to 2%** of capital per trade.
+- **Exit / Take-Profit**: Exit at major overhead resistance, opposite Bollinger Band, or when a **Bearish Pin Bar, Bearish Engulfing, or Evening Star** prints against the position.`;
+    const isPreset = input.preset === 'candlestick-bible';
+    const name = isPreset ? 'Candlestick-Trading-Bible-Rules.md' : (typeof input.name === 'string' ? input.name.trim() : '');
+    const text = isPreset ? bibleGuide : (typeof input.text === 'string' ? input.text.replace(/^\uFEFF/, '').trim() : '');
     if (name.length > 120 || /[\\/\x00-\x1f]/.test(name) || !/\.(txt|md|markdown)$/i.test(name)) {
       throw Error('Upload a .txt or .md strategy document with a filename up to 120 characters.');
     }
@@ -1927,6 +1965,7 @@ async function change(path, input) {
       lastHoldBar: previous?.symbol === s.symbol ? previous.lastHoldBar : undefined,
       holdBars: previous?.symbol === s.symbol ? previous.holdBars : undefined,
       highWater: previous?.symbol === s.symbol ? previous.highWater : undefined,
+      candleStopPct: previous?.symbol === s.symbol ? previous.candleStopPct : undefined,
       cooldownBars: previous?.symbol === s.symbol ? previous.cooldownBars : undefined,
       lastEvaluation: previous?.version === s.version && previous?.symbol === s.symbol ? previous.lastEvaluation : undefined
     };
@@ -2071,10 +2110,11 @@ async function backtest(input) {
   const hasBudget = input.budget !== undefined && input.budget !== null && input.budget !== '';
   const budget = hasBudget ? Number(input.budget) : undefined;
   const start = Date.parse(input.start), end = Math.min(Date.parse(input.end) + 86400000 - 1, Date.now() - 60000);
+  const tf = s.timeframe ?? '1Min';
+  const maxDays = ['1Hour', '4Hour', '1Day'].includes(tf) ? 180 : 31;
   if (![capital, fees, slippage, start, end].every(Number.isFinite) || capital < 100 || capital > 1e9 ||
     (hasBudget && (!Number.isFinite(budget) || budget < 1 || budget > 1e9)) ||
-    Math.min(fees, slippage) < 0 || Math.max(fees, slippage) > 500 || end <= start || end - start > 31 * 86400000) throw Error('Use a valid date range up to 31 days and valid execution costs.');
-  const tf = s.timeframe ?? '1Min';
+    Math.min(fees, slippage) < 0 || Math.max(fees, slippage) > 500 || end <= start || end - start > maxDays * 86400000) throw Error(`Use a valid date range up to ${maxDays} days and valid execution costs.`);
   const bars = await history(s.symbol, start, end, tf);
   const series = aggregateBars(bars, tf);
   const warmup = ruleWarmupBars(s);
