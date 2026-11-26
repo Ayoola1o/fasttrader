@@ -483,7 +483,7 @@ async function withWorker(run, mockAI, env = {}, preloadSource = '') {
   const preload = mockAI ? ['--import=data:text/javascript,' + encodeURIComponent(`
     const request = globalThis.fetch;
     globalThis.fetch = (url, options) => String(url).startsWith('https://generativelanguage.googleapis.com/')
-      ? request(process.env.MOCK_GEMINI_URL, { ...options, headers: { 'Content-Type': 'application/json' } })
+      ? request(process.env.MOCK_GEMINI_URL, { ...options, headers: { ...(options?.headers ?? {}), 'Content-Type': 'application/json' } })
       : request(url, options);
   `)] : [];
   if (preloadSource) preload.push('--import=data:text/javascript,' + encodeURIComponent(preloadSource));
@@ -891,6 +891,47 @@ test('the hosted bridge and worker enforce owner sign-up, authentication and sig
   }, null, { FASTTRADER_SIGNUP_CODE: setup, WORKER_SHARED_SECRET: shared });
 });
 
+
+test('personal bot API keys override main AI key on the wire, support model-only updates, and clean up with bot deletion', { timeout: 35000 }, async () => {
+  const seenKeys = [];
+  const gemini = createServer(async (req, res) => {
+    seenKeys.push(req.headers['x-goog-api-key']);
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ candidates: [{ finishReason: 'STOP', content: { parts: [
+      { text: JSON.stringify({ side: 'hold', allocationPct: 100, rationale: 'Verified personal bot key.' }) }
+    ] } }] }));
+  });
+  await new Promise(resolve => gemini.listen(0, '127.0.0.1', resolve));
+  try {
+    await withWorker(async (api, until) => {
+      const s = await api('strategy', { ...defaults, name: 'Key Bot', symbol: 'QQQ', mode: 'ai_autonomous', aiNotes: 'Hold unless pullback confirms.', period: 2 });
+      await assert.rejects(api('settings', { botAiKey: { botId: s.id, provider: 'Gemini', key: '' } }), /valid Gemini or OpenAI/);
+      const saved = await api('settings', { botAiKey: { botId: s.id, provider: 'Gemini', model: 'gemini-3.5-flash', key: 'AIzaPersonalKey1234567890' } });
+      assert.equal(saved.provider, 'Gemini');
+      assert.equal(saved.masked, 'AIza…7890');
+      const updated = await api('settings', { botAiKey: { botId: s.id, provider: 'Gemini', model: 'gemini-3.5-flash-lite', key: '' } });
+      assert.equal(updated.model, 'gemini-3.5-flash-lite');
+      assert.equal(updated.masked, 'AIza…7890');
+      await assert.rejects(api('settings', { botAiKey: { botId: s.id, provider: 'OpenAI', key: '' } }), /valid Gemini or OpenAI/);
+      await api('bot', { id: s.id, version: s.version, action: 'running', budget: 2000 });
+      const signal = await until(async () => (await api('state')).signals.find(item => item.strategyId === s.id));
+      assert.equal(signal.keySource, 'Personal Bot Key');
+      assert.ok(seenKeys.includes('AIzaPersonalKey1234567890'), `Expected personal key header, saw: ${seenKeys.join(', ')}`);
+      let state = await api('state');
+      assert.deepEqual(state.botAiKeys[s.id], { provider: 'Gemini', model: 'gemini-3.5-flash-lite', masked: 'AIza…7890' });
+      assert.ok(!JSON.stringify(state).includes('AIzaPersonalKey1234567890'));
+      assert.ok(state.logs.some(l => l.botId === s.id && /Personal Bot API Key saved/.test(l.message)));
+      await api('bot', { delete: true, id: s.id, liquidate: false });
+      state = await api('state');
+      assert.equal(state.botAiKeys[s.id], undefined);
+    }, 'http://127.0.0.1:' + gemini.address().port);
+  } finally {
+    gemini.closeAllConnections();
+    await new Promise(resolve => gemini.close(resolve));
+  }
+});
 
 test('Alpaca catalog supports eligible assets and deletion waits for liquidation', async () => {
   await withWorker(async (api, until) => {

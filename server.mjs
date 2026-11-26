@@ -86,10 +86,15 @@ async function saveBotAiProvider(provider) {
   botAiProvider = provider;
   await saveAiSecrets();
 }
-const providerFor = (s, botId = s?.id) => (botId && perBotAiProviders.get(botId)) || (s?.mode === 'ai_autonomous' && botAiProvider) || aiProvider;
+const providerFor = (s, botId = s?.id) =>
+  (botId && perBotAiProviders.get(botId)) ||
+  (s?.sourceStrategy?.id && perBotAiProviders.get(s.sourceStrategy.id)) ||
+  botAiProvider ||
+  aiProvider;
 const keySourceFor = (s, botId = s?.id) =>
-  (botId && perBotAiProviders.has(botId)) ? 'Personal Bot Key' :
-    (s?.mode === 'ai_autonomous' && botAiProvider) ? 'Dedicated Bot Key' : 'Main .env Key';
+  ((botId && perBotAiProviders.has(botId)) || (s?.sourceStrategy?.id && perBotAiProviders.has(s.sourceStrategy.id)))
+    ? 'Personal Bot Key'
+    : botAiProvider ? 'Dedicated Bot Key' : 'Main .env Key';
 function describeAiError(error, provider, keySource) {
   const status = error?.status;
   const prov = provider ? `${provider.name} · ${provider.model}` : 'AI provider';
@@ -698,7 +703,8 @@ function drainAI() {
 
 async function completeAI(job) {
   const { bot, s, proposal, bars, price, position } = job;
-  const provider = providerFor(s);
+  const provider = providerFor(s, bot.id);
+  const usedKeySource = keySourceFor(s, bot.id);
   let model, error;
   try {
     const headlines = await recentNews(s.symbol);
@@ -757,17 +763,18 @@ async function completeAI(job) {
       if (error) {
         bot.status = error.message;
         bot.aiCallsToday = Math.max(0, (bot.aiCallsToday ?? 1) - 1);
-        const keySource = keySourceFor(s, bot.id);
-        const detail = describeAiError(error, provider, keySource);
+        const detail = describeAiError(error, provider, usedKeySource);
         if (error.status === 429 || error.message.includes('(429)')) bot.aiBackoffUntil = Date.now() + 5 * 60000;
-        bot.lastAiError = { t: time(), status: error.status ?? null, message: error.message, detail, keySource, provider: provider?.name ?? null, model: provider?.model ?? null };
+        bot.lastAiError = { t: time(), status: error.status ?? null, message: error.message, detail, keySource: usedKeySource, provider: provider?.name ?? null, model: provider?.model ?? null };
         logEntry('ai', 'error', `${bot.name} · ${error.message}`, { botId: bot.id, bot: bot.name, symbol: s.symbol, detail });
       } else {
         bot.status = 'Running';
         bot.aiBackoffUntil = 0;
         bot.lastAiError = null;
         if (s.mode === 'ai_autonomous') bot.lastAiWakeAt = Date.now();
-        logEntry('ai', model.side === 'hold' ? 'info' : 'good', `${bot.name} AI → ${model.side.toUpperCase()}${proposal.aiFreeRoam && model.side !== 'hold' ? ` (${model.allocationPct ?? 100}%)` : ''}`, { botId: bot.id, bot: bot.name, symbol: s.symbol, detail: `${model.rationale} [${keySourceFor(s, bot.id)}]` });
+        model.providerName = provider?.name ?? 'AI';
+        model.keySource = usedKeySource;
+        logEntry('ai', model.side === 'hold' ? 'info' : 'good', `${bot.name} AI → ${model.side.toUpperCase()}${proposal.aiFreeRoam && model.side !== 'hold' ? ` (${model.allocationPct ?? 100}%)` : ''}`, { botId: bot.id, bot: bot.name, symbol: s.symbol, detail: `${model.rationale} [${usedKeySource}]` });
         const shouldAct = proposal.aiFreeRoam ? model.side !== 'hold' : model.side === proposal.side;
         if (shouldAct && !unresolvedFor(s.symbol)) {
           try { await reconcile(); }
@@ -863,8 +870,8 @@ async function evaluate(bot) {
   const aiTtl = (s.timeframe ?? '1Min') === '1Min' ? 25000 : 45000;
   const candidate = { bot, s, bar, proposal, price: context.price, position: context.position, epoch, expires: Date.now() + aiTtl };
   if (s.ai && !proposal.protective) {
-    if (!providerFor(s)) {
-      bot.status = 'Configure an AI API key in Settings or .env';
+    if (!providerFor(s, bot.id)) {
+      bot.status = 'Configure an AI API key in Settings, Bot Session, or .env';
       return;
     }
     if (bot.aiBackoffUntil && Date.now() < bot.aiBackoffUntil) {
@@ -909,11 +916,12 @@ async function evaluate(bot) {
 
 async function applySignal(candidate, model = null) {
   const { bot, s, bar, proposal } = candidate;
-  const provider = providerFor(s);
+  const provider = providerFor(s, bot.id);
   const allocSuffix = proposal.aiFreeRoam && model && model.side !== 'hold' && s.aiSizing === 'dynamic' ? ` [${model.allocationPct ?? 100}% size]` : '';
   const signal = {
     t: time(), symbol: s.symbol, direction: model?.side ?? proposal.side, rationale: (model?.rationale ?? proposal.rationale) + allocSuffix,
-    strategyId: s.id, strategy: s.name, version: s.version, source: model ? (provider?.name ?? 'AI') : 'Strategy rules',
+    strategyId: s.id, strategy: s.name, version: s.version, source: model ? (model.providerName ?? provider?.name ?? 'AI') : 'Strategy rules',
+    ...(model ? { keySource: model.keySource ?? keySourceFor(s, bot.id) } : {}),
     ...(model?.knowledgeSources ? { knowledgeSources: model.knowledgeSources } : {})
   };
   state.signals.unshift(signal);
@@ -1571,9 +1579,15 @@ function setIdempotent(cacheKey, value) {
 }
 function testSavedAiKey(input) {
   const saved = typeof input.botId === 'string' && input.botId ? perBotAiProviders.get(input.botId) : botAiProvider;
-  const candidate = input.key?.trim()
-    ? { name: input.provider === 'OpenAI' ? 'OpenAI' : 'Gemini', key: input.key.trim(), model: input.model?.trim() || (input.provider === 'OpenAI' ? 'gpt-4.1-mini' : defaultGeminiModel) }
-    : saved;
+  const requestedName = input.provider === 'OpenAI' ? 'OpenAI' : input.provider === 'Gemini' ? 'Gemini' : null;
+  let candidate = null;
+  if (input.key?.trim()) {
+    const name = requestedName ?? 'Gemini';
+    candidate = validProvider({ name, key: input.key.trim(), model: input.model?.trim() || (name === 'OpenAI' ? 'gpt-4.1-mini' : defaultGeminiModel) });
+  } else if (saved) {
+    if (requestedName && requestedName !== saved.name) throw Error(`Paste a ${requestedName} API key to test switching providers.`);
+    candidate = validProvider({ ...saved, model: input.model?.trim() || saved.model });
+  }
   if (!candidate) throw Error('Save or enter an API key first.');
   return testProviderKey(candidate);
 }
@@ -1700,7 +1714,6 @@ async function change(path, input) {
       if (active) throw Error('Pause or stop the existing ' + symbol + ' bot before assigning this position.');
       if (!eligible.has(symbol)) throw Error('This instrument is awaiting Alpaca eligibility confirmation.');
       if (!demo && isCrypto(symbol) && !state.cryptoSessionOpen) throw Error('Crypto trading is unavailable on this Alpaca Paper account.');
-      if (source.ai && !providerFor(source)) throw Error('Configure a Gemini or OpenAI API key in Settings or .env before starting this bot.');
       let s = source;
       if (source.symbol !== symbol) {
         const rootId = source.sourceStrategy?.rootId ?? source.id;
@@ -1715,6 +1728,7 @@ async function change(path, input) {
           state.strategies.push(s);
         }
       }
+      if (s.ai && !providerFor(s, s.id)) throw Error('Configure a Gemini or OpenAI API key in Settings, Bot Session, or .env before starting this bot.');
       const adoptPrice = Number.isFinite(position.entry) && position.entry > 0 ? position.entry : position.price;
       if (!Number.isFinite(adoptPrice) || adoptPrice <= 0) throw Error('Position price is unavailable for adoption.');
       const priorLedger = botLedger(botOrders(s.id), symbol, null);
@@ -1964,7 +1978,7 @@ async function change(path, input) {
       }
       if (!eligible.has(s.symbol)) throw Error('This instrument is awaiting Alpaca eligibility confirmation.');
       if (!demo && isCrypto(s.symbol) && !state.cryptoSessionOpen) throw Error('Crypto trading is unavailable on this Alpaca Paper account.');
-      if (s.ai && !providerFor(s)) throw Error('Configure a Gemini or OpenAI API key in Settings or .env before starting this bot.');
+      if (s.ai && !providerFor(s, s.id)) throw Error('Configure a Gemini or OpenAI API key in Settings, Bot Session, or .env before starting this bot.');
       const active = Object.values(state.bots).find(bot => bot.id !== s.id && bot.desired === 'running' && bot.symbol === s.symbol);
       if (active) throw Error('Pause or stop the existing ' + s.symbol + ' bot before starting another for that instrument.');
       if (previous && previous.symbol !== s.symbol) {
@@ -2012,17 +2026,37 @@ async function change(path, input) {
     }
     if (input.botAiKey && typeof input.botAiKey === 'object') {
       const name = input.botAiKey.provider === 'OpenAI' ? 'OpenAI' : 'Gemini';
-      const key = String(input.botAiKey.key ?? '').trim();
+      const botId = typeof input.botAiKey.botId === 'string' && input.botAiKey.botId ? input.botAiKey.botId : null;
+      const existing = botId ? perBotAiProviders.get(botId) : botAiProvider;
+      const rawKey = String(input.botAiKey.key ?? '').trim();
+      const key = rawKey || (existing?.name === name ? existing.key : '');
       if (key.length < 10 || key.length > 300) throw Error('Enter a valid Gemini or OpenAI API key.');
-      const model = String(input.botAiKey.model ?? '').trim().slice(0, 80) || (name === 'OpenAI' ? 'gpt-4.1-mini' : defaultGeminiModel);
-      if (typeof input.botAiKey.botId === 'string' && input.botAiKey.botId) {
-        if (!state.bots[input.botAiKey.botId]) throw Error('Bot not found.');
-        perBotAiProviders.set(input.botAiKey.botId, { name, key, model });
+      const rawModel = String(input.botAiKey.model ?? '').trim().slice(0, 80) || (name === 'OpenAI' ? 'gpt-4.1-mini' : defaultGeminiModel);
+      const clean = validProvider({ name, key, model: rawModel });
+      const clearBotAiState = b => {
+        const hadAiIssue = Boolean(b.lastAiError || b.aiBackoffUntil || /AI|Configure an AI/i.test(b.status ?? ''));
+        b.aiBackoffUntil = 0;
+        b.lastAiError = null;
+        if (hadAiIssue) {
+          if (b.desired === 'running') b.status = 'Running';
+          if (!unresolvedFor(b.symbol)) b.lastBar = undefined;
+        }
+      };
+      if (botId) {
+        const targetBot = state.bots[botId];
+        if (!targetBot) throw Error('Bot not found.');
+        perBotAiProviders.set(botId, clean);
+        clearBotAiState(targetBot);
         await saveAiSecrets();
-        return { configured: true, botId: input.botAiKey.botId, provider: name, model, masked: maskKey(key) };
+        logEntry('ai', 'good', `${targetBot.name} · Personal Bot API Key saved (${clean.name} · ${clean.model})`, { botId, bot: targetBot.name, symbol: targetBot.symbol, detail: `Key ${maskKey(clean.key)} active immediately` });
+        return { configured: true, botId, provider: clean.name, model: clean.model, masked: maskKey(clean.key) };
       }
-      await saveBotAiProvider({ name, key, model });
-      return { configured: true, provider: name, model, masked: maskKey(key) };
+      await saveBotAiProvider(clean);
+      for (const b of Object.values(state.bots)) {
+        if (!perBotAiProviders.has(b.id)) clearBotAiState(b);
+      }
+      logEntry('ai', 'good', `Dedicated AI Trading Key saved (${clean.name} · ${clean.model})`, { detail: `Key ${maskKey(clean.key)} active immediately` });
+      return { configured: true, provider: clean.name, model: clean.model, masked: maskKey(clean.key) };
     }
     state.alerts = Object.fromEntries(['signals', 'fills', 'risk', 'connections', 'telegram', 'digest'].map(key => [key, input[key] === true]));
     return state.alerts;

@@ -111,9 +111,10 @@ export async function assessSignal(provider, symbol, side, bars, request = fetch
       } }
     };
   } else {
+    const modelName = provider.model?.trim() || 'gpt-4.1-mini';
     url = 'https://api.openai.com/v1/chat/completions';
     headers.Authorization = 'Bearer ' + provider.key;
-    body = { model: provider.model, response_format: { type: 'json_object' }, messages: [
+    body = { model: modelName, response_format: { type: 'json_object' }, messages: [
       { role: 'system', content: instruction }, { role: 'user', content: input }
     ] };
   }

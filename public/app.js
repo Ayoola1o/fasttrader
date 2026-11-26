@@ -349,7 +349,7 @@ function trading(){
  const groups=[['all','All bots'],['running','Active'],['paused','Paused'],['stopped','Stopped']];
  const counts=Object.fromEntries(groups.map(([k])=>[k,k==='all'?bots.length:bots.filter(b=>b.desired===k).length]));
  const filters=`<div class="tabs" role="group" aria-label="Filter bots">${groups.map(([k,label])=>btn(label+' '+counts[k],'bot-filter',k,false,`aria-pressed="${botFilter===k}"`)).join('')}</div>`;
- const options=state.strategies.slice().reverse().filter(s=>!s.ai||state.aiConfigured||(s.mode==='ai_autonomous'&&state.botAiConfigured)||Boolean(state.botAiKeys?.[s.id]))
+ const options=state.strategies.slice().reverse().filter(s=>!s.ai||state.aiConfigured||state.botAiConfigured||Boolean(state.botAiKeys?.[s.id]))
    .map(s=>[key(s),s.name+' · '+s.symbol+' · v'+s.version]);
  const requested=launchVersion??params().get('version');
  const chosen=options.some(([id])=>id===requested)?requested:'';
@@ -489,7 +489,7 @@ function session(){
    </dl>`+
    (!['ai_notepad','ai_autonomous'].includes(strategy.mode)?`<div class="session-card-foot">${link('Backtest v'+bot.version,'backtesting?version='+encodeURIComponent(key(bot)))}</div>`:''),'','session-guardrails'):'';
  const personalKey=state.botAiKeys?.[bot.id];
- const advKeyBox=`<details class="session-details"><summary><span>Personal Bot API Key</span>${badge(personalKey?personalKey.provider+' · '+personalKey.masked:'Main key',personalKey?'good':'')}</summary><div class="session-details-body"><small class="muted">Optional dedicated Gemini or OpenAI key so this bot never shares rate limits.</small><form id="per-bot-ai-key" data-bot="${esc(bot.id)}" class="form session-compact-form"><div class="fields session-key-fields">${select('Provider','provider',[['Gemini','Google Gemini'],['OpenAI','OpenAI']],personalKey?.provider??'Gemini',true)}${field('Model (optional)','model',personalKey?.model??'','maxlength="80" placeholder="e.g. gemini-3.5-flash"')}${field('Personal API Key','key','','type="password" autocomplete="off" maxlength="300" placeholder="'+(personalKey?'Enter new key to replace':'Paste dedicated API key')+'"')}</div><div class="actions">${submit('Save key',!online)}${btn('Test','test-per-bot-ai-key',bot.id,false,dis)}${personalKey?btn('Remove','remove-per-bot-ai-key',bot.id,false,`style="color:#ff8191;border-color:#592e42" ${dis}`):''}</div></form></div></details>`;
+ const advKeyBox=`<details class="session-details"><summary><span>Personal Bot API Key</span>${badge(personalKey?personalKey.provider+' · '+personalKey.masked:'Main key',personalKey?'good':'')}</summary><div class="session-details-body"><small class="muted">Optional dedicated Gemini or OpenAI key so this bot never shares rate limits.</small><form id="per-bot-ai-key" data-bot="${esc(bot.id)}" class="form session-compact-form"><div class="fields session-key-fields">${select('Provider','provider',[['Gemini','Google Gemini'],['OpenAI','OpenAI']],personalKey?.provider??'Gemini',true)}${field('Model (optional)','model',personalKey?.model??'','maxlength="80" placeholder="e.g. gemini-3.5-flash"')}${field('Personal API Key','key','','type="password" autocomplete="off" maxlength="300" placeholder="'+(personalKey?'Leave blank to keep saved key':'Paste dedicated API key')+'"')}</div><small class="muted">Active key for this bot: <b>${esc(personalKey?'Personal Bot Key ('+personalKey.provider+' · '+personalKey.model+')':state.botAiConfigured?'Dedicated Bot Key ('+state.botAiInfo.provider+')':state.aiConfigured?'Main .env Key ('+state.aiProvider+')':'None configured')}</b></small><div class="actions">${submit('Save key',!online)}${btn('Test','test-per-bot-ai-key',bot.id,false,dis)}${personalKey?btn('Remove','remove-per-bot-ai-key',bot.id,false,`style="color:#ff8191;border-color:#592e42" ${dis}`):''}</div></form></div></details>`;
  const deleteControl=`<div class="session-danger-zone"><div><b>Remove bot</b><small>Liquidate open ${esc(bot.symbol)} or leave it at the broker.</small></div>${btn('Delete bot','open-delete-bot',bot.id,false,`style="background:#39212e;color:#ff8191;border-color:#592e42" ${dis}`)}</div>`;
  const controlsPanel=panel('Budget & controls',`${open.length} open order${open.length===1?'':'s'} · Started ${stamp(bot.started)}`,
    fundForm+advKeyBox+deleteControl,'','session-controls-panel');
@@ -503,7 +503,7 @@ function session(){
  const signalsTable=table(['Time','Decision','Rationale','Source'],signals.map(signal=>[
    stamp(signal.t),badge(signal.direction),
    `<div class="session-rationale">${esc(signal.rationale)}${signal.knowledgeSources?.length?'<small>Refs: '+esc(signal.knowledgeSources.join(', '))+'</small>':''}</div>`,
-   esc(signal.source)
+   esc(signal.source)+(signal.keySource?`<small style="display:block;margin-top:3px">${esc(signal.keySource)}</small>`:'')
  ]),'No signals recorded for this bot yet.');
  const activityPanel=panel(sessionTab==='orders'?'Orders & executions':'Signal & AI decision log',
    sessionTab==='orders'?`${filled.length} filled · ${usd(book.bought)} bought · ${usd(book.sold)} sold`:'Closed-candle rule evaluations and AI rationale history',
@@ -791,8 +791,10 @@ function strategies(){
      select('Candle timeframe','timeframe',tfOptions,editor.timeframe??'15Min',true);
    const noteRisk=[['Risk per trade (% capital)','riskPct',.1,10,.1],['Position size (% equity)','size',.1,100],['Maximum exposure (% equity)','exposure',.1,100],['Stop-loss (%)','stop',.1,50],['Trailing stop (%, 0=off)','trailingStop',0,50,.1],['Take-profit (%)','take',.1,100],['Maximum daily loss (%)','dailyLoss',.1,50],['Stop-loss cooldown (bars)','cooldown',0,60,1],['Max hold (bars, 0=off)','maxHoldBars',0,1440,1]].map(([label,k,min,max,step])=>numeric(label,k,editor[k]??defaultParams[k],min,max,step)).join('');
    const hiddenDefaults=`<input type="hidden" name="mode" value="ai_notepad"><input type="hidden" name="period" value="${editor.period??12}"><input type="hidden" name="entry" value="${editor.entry??0.1}"><input type="hidden" name="exit" value="${editor.exit??-0.1}"><input type="hidden" name="atrStop" value="${editor.atrStop??0}"><input type="checkbox" name="ai" checked hidden>`;
-   const notepadBox=`<label class="field notepad-field"><span>Trading instructions (optional when a document is selected)</span><textarea name="aiNotes" class="ai-notepad" rows="12" maxlength="4000" placeholder="Example:\nBUY when price is above EMA 20 and RSI(14) pulls back below 40 with no bearish news.\nSELL when RSI(14) > 72 or price drops below EMA 20.\nOtherwise HOLD.">${esc(editor.aiNotes??'')}</textarea><small>${(editor.aiNotes??'').length} / 4000 characters · ${state.aiConfigured?esc(state.aiProvider)+' will read these notes + live candles, Candlestick Bible patterns, Fib/S&amp;R confluence, EMA/RSI/ATR, position P&amp;L, and Alpaca News on every bar.':'Configure GEMINI_API_KEY or OPENAI_API_KEY in server env to run AI Notepad bots.'}</small></label>`;
-   const guardCard=panel('AI Notepad guardrails','Hard risk limits always stay enforced in code',`<div class="bot-row"><span><b>AI engine</b><small>${state.aiConfigured?esc(state.aiProvider)+' active':'API key required'}</small></span>${badge(state.aiConfigured?'Ready':'Unconfigured',state.aiConfigured?'good':'bad')}</div><div class="bot-row"><span><b>Protective exits</b><small>Stop-loss ${editor.stop??2}% · Trail ${editor.trailingStop??0}% · Take-profit ${editor.take??4}%</small></span>${badge('Hard-coded','good')}</div><div class="bot-row"><span><b>Live context sent to AI</b><small>OHLCV, Pin/Engulfing/Fakey patterns, Fib50, S/R room, EMA8/21/50, RSI14, ATR14 &amp; News</small></span>${badge(editor.timeframe??'15Min')}</div>`);
+   const aiReady=state.aiConfigured||state.botAiConfigured||Boolean(editor.id&&state.botAiKeys?.[editor.id]);
+   const aiLabel=editor.id&&state.botAiKeys?.[editor.id]?`Personal key (${state.botAiKeys[editor.id].provider})`:state.botAiConfigured?`Dedicated key (${state.botAiInfo.provider})`:state.aiConfigured?`${state.aiProvider} (.env)`:'API key required';
+   const notepadBox=`<label class="field notepad-field"><span>Trading instructions (optional when a document is selected)</span><textarea name="aiNotes" class="ai-notepad" rows="12" maxlength="4000" placeholder="Example:\nBUY when price is above EMA 20 and RSI(14) pulls back below 40 with no bearish news.\nSELL when RSI(14) > 72 or price drops below EMA 20.\nOtherwise HOLD.">${esc(editor.aiNotes??'')}</textarea><small>${(editor.aiNotes??'').length} / 4000 characters · ${aiReady?esc(aiLabel)+' will read these notes + live candles, Candlestick Bible patterns, Fib/S&amp;R confluence, EMA/RSI/ATR, position P&amp;L, and Alpaca News on every bar.':'Configure a Gemini or OpenAI API key in Settings, Bot Session, or .env to run AI Notepad bots.'}</small></label>`;
+   const guardCard=panel('AI Notepad guardrails','Hard risk limits always stay enforced in code',`<div class="bot-row"><span><b>AI engine</b><small>${esc(aiLabel)}</small></span>${badge(aiReady?'Ready':'Unconfigured',aiReady?'good':'bad')}</div><div class="bot-row"><span><b>Protective exits</b><small>Stop-loss ${editor.stop??2}% · Trail ${editor.trailingStop??0}% · Take-profit ${editor.take??4}%</small></span>${badge('Hard-coded','good')}</div><div class="bot-row"><span><b>Live context sent to AI</b><small>OHLCV, Pin/Engulfing/Fakey patterns, Fib50, S/R room, EMA8/21/50, RSI14, ATR14 &amp; News</small></span>${badge(editor.timeframe??'15Min')}</div>`);
    return workspace(group('Strategy setup',noteBase)+group('Trading instructions',noteTemplates+notepadBox,'editor-flow')+group('Knowledge sources',knowledgePicker(),'editor-flow')+
      group('Position sizing and risk','<div class="fields">'+sizingMode+numeric('Fixed size (USD)','sizeUsd',editor.sizeUsd??500,1,1e9,1)+noteRisk+'</div>'+candleStopField,'editor-flow'),guardCard,hiddenDefaults);
  }
@@ -806,9 +808,10 @@ function strategies(){
  const indicators=numericFields(fields.filter(([,k])=>signalKeys.includes(k)));
  const riskInputs=numericFields(fields.filter(([,k])=>!signalKeys.includes(k)));
  const ruleBuilder=renderRuleGroup('entry','Entry Rules (Buy)')+renderRuleGroup('exit','Exit Rules (Sell)');
+ const anyAiReady=state.aiConfigured||state.botAiConfigured||Boolean(editor.id&&state.botAiKeys?.[editor.id]);
  const aiSection=check('Require AI confirmation for non-protective signals','ai',editor.ai)+
  field('Custom AI confirmation rule (optional)','aiPrompt',editor.aiPrompt??'','maxlength="300" placeholder="e.g. Veto buys if news is bearish or candle jumped >2%"')+
- '<small>'+(state.aiConfigured?esc(state.aiProvider ?? 'AI provider')+' configured (with live Alpaca News headlines). Historical replay uses deterministic rules.':'Configure a Gemini or OpenAI key in the server environment to enable AI confirmation.')+'</small>';
+ '<small>'+(anyAiReady?(editor.id&&state.botAiKeys?.[editor.id]?`Personal bot key (${esc(state.botAiKeys[editor.id].provider)})`:state.botAiConfigured?`Dedicated bot key (${esc(state.botAiInfo.provider)})`:esc(state.aiProvider ?? 'AI provider'))+' configured (with live Alpaca News headlines). Historical replay uses deterministic rules.':'Configure a Gemini or OpenAI key in Settings, Bot Session, or .env to enable AI confirmation.')+'</small>';
  const htfField=select('Higher-timeframe trend filter','htfEma',[['0','Off'],['20','HTF Close > HTF EMA(20)'],['50','HTF Close > HTF EMA(50)'],['100','HTF Close > HTF EMA(100)']],String(editor.htfEma??0))+
    select('ADX chop guard (min trend strength)','minAdx',[['0','Off'],['18','ADX(14) ≥ 18 (Skip dead chop)'],['22','ADX(14) ≥ 22 (Recommended for breakouts)'],['25','ADX(14) ≥ 25 (Strong trends only)']],String(editor.minAdx??0));
  return workspace(group('Strategy setup',baseInputs+htfField)+group('Signal rules',templatesBar+'<div class="fields">'+indicators+'</div>'+ruleBuilder,'editor-flow')+
@@ -2021,10 +2024,11 @@ document.addEventListener('submit',async event=>{
    }
    if(form.id==='per-bot-ai-key'){
      const botId=form.dataset.bot;
-     if(!data.key?.trim())throw Error('Paste a Gemini or OpenAI API key to save.');
-     await api('settings',{botAiKey:{botId,provider:data.provider,model:data.model,key:data.key.trim()}});
+     const existingKey=state.botAiKeys?.[botId];
+     if(!data.key?.trim()&&!(existingKey&&existingKey.provider===data.provider))throw Error('Paste a Gemini or OpenAI API key to save.');
+     const res=await api('settings',{botAiKey:{botId,provider:data.provider,model:data.model,key:(data.key??'').trim()}});
      form.reset();
-     toast('Personal API key saved for this bot.');
+     toast(`Personal ${res.provider} key (${res.model}) is now active for this bot.`);
    }
    if(form.id==='bot-ai-key'){
      if(!data.key?.trim())throw Error('Paste a Gemini or OpenAI API key to save.');
